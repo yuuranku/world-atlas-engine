@@ -19,7 +19,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $base = 'https://github.com/yuuranku/world-atlas-engine/releases/download/v1.2.0/'
+          $base = 'https://github.com/yuuranku/world-atlas-engine/releases/download/v1.2.1/'
           New-Item -ItemType Directory -Path release-check | Out-Null
           Invoke-WebRequest ($base + 'release-manifest.json') -OutFile release-check/release-manifest.json
           $manifest = Get-Content release-check/release-manifest.json -Raw | ConvertFrom-Json
@@ -31,12 +31,12 @@ jobs:
             Write-Output "Verified public download: $($asset.Name)"
           }
           $skillHash = (Get-FileHash release-check/generate-world-atlas-skill.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($skillHash -ne '303db478660f1f34a7bd498cd6165d03364168bc9374407877fd1ef7b92a6138') { throw 'Pinned skill hash mismatch' }
+          if ($skillHash -ne 'ee65076eb0eb6adc7383bf7182f3d8558c5741e1e5aa9ba0c94e81e74a66aac0') { throw 'Pinned skill hash mismatch' }
           Expand-Archive release-check/generate-world-atlas-skill.zip release-check/skill
       - name: Skill downloads and installs the engine into a fresh environment
         run: python release-check/skill/generate-world-atlas/scripts/install_engine.py --target release-check/runtime
       - name: Reuse verified wheel cache without an installation
-        run: python release-check/skill/generate-world-atlas/scripts/download_engine.py --cache release-check/.world-atlas-downloads/1.2.0
+        run: python release-check/skill/generate-world-atlas/scripts/download_engine.py --cache release-check/.world-atlas-downloads/1.2.1
       - name: Call installed engine and run contracts
         shell: pwsh
         run: |

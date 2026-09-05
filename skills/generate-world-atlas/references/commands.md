@@ -10,11 +10,11 @@
 
 `--check-only` 只检查本地清单，不联网也不创建运行目录。仅下载计算包：`python scripts/download_engine.py --cache <缓存目录>`。历史 v5 输入与其匹配引擎留在 1.1.0 Release，不混入新版安装流程。
 
-安装版本由资产清单 `engineVersion` 决定。1.2.0 配方必须明确两个极地选择，完整世界必须提供世界设置；复现历史世界使用其原版引擎。新版不自动迁移或猜测缺失参数。
+安装版本由资产清单 `engineVersion` 决定。1.2.1 配方必须明确两个极地选择，完整世界必须提供世界设置；复现历史世界使用其原版引擎。新版不自动迁移或猜测缺失参数。
 
 首次安装需要已有 Python 3.14、Node.js/npm 和网络；运行阶段离线，不需 API key。Mapshaper 0.7.56 是完整地图共享边界的实际依赖，不能漏列。
 
-分享 [完整轻量 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.2.0/generate-world-atlas-skill.zip)，不能只发 SKILL.md。安装到宿主 skills 目录后重新加载技能；首次新世界仍先问 17 题，确认有效参数后才自动下载。源代码和单独 wheel 见 [版本下载页](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.2.0)。不要使用原作者的盘符路径。`--target` 必须是全新目录，安装后使用返回的解释器/Mapshaper 路径。仅安装计算 wheel 时，地形模式只需 Python 及 wheel 声明的库；完整人文地图另需锁定的 Node/Mapshaper。
+分享 [完整轻量 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.2.1/generate-world-atlas-skill.zip)，不能只发 SKILL.md。安装到宿主 skills 目录后重新加载技能；首次新世界仍先问 17 题，确认有效参数后才自动下载。源代码和单独 wheel 见 [版本下载页](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.2.1)。不要使用原作者的盘符路径。`--target` 必须是全新目录，安装后使用返回的解释器/Mapshaper 路径。仅安装计算 wheel 时，地形模式只需 Python 及 wheel 声明的库；完整人文地图另需锁定的 Node/Mapshaper。
 
 ## 入口
 

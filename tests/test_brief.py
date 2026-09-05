@@ -32,6 +32,9 @@ class BriefTests(unittest.TestCase):
         instructions = (root/'SKILL.md').read_text(encoding='utf-8')
         self.assertIn('第一项行动', instructions)
         self.assertIn('只有玩家明确说', instructions)
+        launcher = (root/'agents/openai.yaml').read_text(encoding='utf-8')
+        self.assertIn('十七', launcher)
+        self.assertNotIn('十五', launcher)
 
     def test_brief_remains_unconfirmed_until_parameters_reviewed(self):
         with tempfile.TemporaryDirectory() as folder:
