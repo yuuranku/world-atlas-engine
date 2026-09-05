@@ -1,0 +1,17 @@
+{
+  "terrainId": "v38",
+  "status": "user-accepted",
+  "acceptedOn": "2026-09-05",
+  "scope": "terrain-only",
+  "engineVersion": "1.1.0",
+  "recipeFile": "terrain-v38.json",
+  "seed": 2116268501,
+  "width": 2176,
+  "height": 1088,
+  "fieldArrayDigest": "fb5685278d51fa2b0d3118d7d0492266472552c5b7d8351cb6938c290ef1dace",
+  "files": {
+    "source/physical-fields.npz": "17ef17f8db947e0dff4a35ae4e58449a17cf955680d84d1059f4c06cd9ab566d",
+    "review/terrain.png": "b3709bf21ec3f4ced0edfcadf75946b22cc33ed57b43503fc8e758082f735b9f",
+    "review/contours.svg": "febddda02cdd2086caffefe97fc9115e01701e05b3609cb47cb9c6d16cb48d96"
+  }
+}

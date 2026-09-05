@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.png binary
+*.npz binary
+*.zip binary
+*.whl binary
+skills/generate-world-atlas/assets/** -text

@@ -1,0 +1,267 @@
+[
+  {
+    "source": "scripts/generate_fictional_world.py",
+    "target": "src/world_atlas/inputs.py",
+    "sourceSha256": "b0c7b23c7f6fe173c0730a602de229160f4581f0a30eb692f781dbfacd9eeff6"
+  },
+  {
+    "source": "scripts/regenerate_accepted_world.py",
+    "target": "src/world_atlas/rebuild.py",
+    "sourceSha256": "978a1434566206fe9be6e726c5049c1757475b4ff1cc1abc07c0a4293faca7c3"
+  },
+  {
+    "source": "scripts/tectonic_foundation.py",
+    "target": "src/world_atlas/tectonic_foundation.py",
+    "sourceSha256": "dad4efaa75cb9bf952afb7427feb24acb2771ee9e0be1c3ae7c56ea79df8a4a0"
+  },
+  {
+    "source": "scripts/vector-atlas/boundary_chains.py",
+    "target": "src/world_atlas/physical/boundary_chains.py",
+    "sourceSha256": "941de78ab5a885d5cbcd321e1b974fbd26d4d935eebbdf8e2191c01b03aad50a"
+  },
+  {
+    "source": "scripts/vector-atlas/build_source.py",
+    "target": "src/world_atlas/physical/build_source.py",
+    "sourceSha256": "51915934603bd9848ffd448baac01a50f0384b03e2fd053bc7d28c5a490a8676"
+  },
+  {
+    "source": "scripts/vector-atlas/climate.py",
+    "target": "src/world_atlas/physical/climate.py",
+    "sourceSha256": "64dedd0a62aad4460dfc56390abeb02b72094b9bd121c6b56fd74d5ff067f706"
+  },
+  {
+    "source": "scripts/vector-atlas/hydrology.py",
+    "target": "src/world_atlas/physical/hydrology.py",
+    "sourceSha256": "c4e997ac3c7d37ca1a15a573d6eba634891f42814cad6f4f35f46c4581d8c915"
+  },
+  {
+    "source": "scripts/vector-atlas/island_generation.py",
+    "target": "src/world_atlas/physical/island_generation.py",
+    "sourceSha256": "24942d139e6cc7d2264563c5bd7b59f74091acf606829bcbbb07b8e0abc16229"
+  },
+  {
+    "source": "scripts/vector-atlas/ocean_floor.py",
+    "target": "src/world_atlas/physical/ocean_floor.py",
+    "sourceSha256": "e8858e046865a49e17bf0a74d667d426028060fbffab8570f61f01f5787e17ec"
+  },
+  {
+    "source": "scripts/vector-atlas/physiographic_provinces.py",
+    "target": "src/world_atlas/physical/physiographic_provinces.py",
+    "sourceSha256": "5b57cd1c36b8f6bbd8bf55f4df1080f83c1519e68787cb51eb5104af9abc8aa2"
+  },
+  {
+    "source": "scripts/vector-atlas/planetary_grid.py",
+    "target": "src/world_atlas/physical/planetary_grid.py",
+    "sourceSha256": "6e273811113906a7d3b4a7c0593ba42150269f5a3d337b3413027f3d604fb690"
+  },
+  {
+    "source": "scripts/vector-atlas/polar_terrain.py",
+    "target": "src/world_atlas/physical/polar_terrain.py",
+    "sourceSha256": "fdc08c9c37eea06b33953876a1f3381e1b2e4c62b30e6b26e58bf30821d078a9"
+  },
+  {
+    "source": "scripts/vector-atlas/procedural_landmass.py",
+    "target": "src/world_atlas/physical/procedural_landmass.py",
+    "sourceSha256": "42f5f20d199acbf5b9c8a55e97d6f569f529b1b5189023300d94474a8970770d"
+  },
+  {
+    "source": "scripts/vector-atlas/spherical_arc_distance.py",
+    "target": "src/world_atlas/physical/spherical_arc_distance.py",
+    "sourceSha256": "9824b56f33dca6ca27d3ca760b3a9fc60480295fecef2dfe91d26124972f066a"
+  },
+  {
+    "source": "scripts/vector-atlas/tectonic_potential.py",
+    "target": "src/world_atlas/physical/tectonic_potential.py",
+    "sourceSha256": "0635e657c93daf0dcf130ed6697c42895d2f1343ce577a8c428fc35e2ea718dd"
+  },
+  {
+    "source": "scripts/vector-atlas/tectonic_relief.py",
+    "target": "src/world_atlas/physical/tectonic_relief.py",
+    "sourceSha256": "6ae168f948a6cda56d23d7a4d7719afe5f266aefb314eb6f6d8082f8ddbfb271"
+  },
+  {
+    "source": "scripts/vector-atlas/tectonics.py",
+    "target": "src/world_atlas/physical/tectonics.py",
+    "sourceSha256": "88794ecd4d0ae14f97204a1e1c17caf6f516e0d718953290970606747ab84d21"
+  },
+  {
+    "source": "scripts/vector-atlas/terrain_refinement.py",
+    "target": "src/world_atlas/physical/terrain_refinement.py",
+    "sourceSha256": "c0ced72146ea39b4f324a5e001552b5350924bf229764503f8eed14843cd6579"
+  },
+  {
+    "source": "scripts/verify_accepted_release.py",
+    "target": "src/world_atlas/acceptance.py",
+    "sourceSha256": "f797243ee12a627a06129a82a963da9ff64833dbfc268a962ccbc7b46db29347"
+  },
+  {
+    "source": "scripts/worldgen/__init__.py",
+    "target": "src/world_atlas/core/__init__.py",
+    "sourceSha256": "41edaa57a55795499db515f01278d27038db03c13de32d200c23833f57a0895b"
+  },
+  {
+    "source": "scripts/worldgen/baseline.py",
+    "target": "src/world_atlas/core/baseline.py",
+    "sourceSha256": "c5f0de0beec3e98cc199f7e223f9f29efb73fa236e3d499f6a88759f5bccedc2"
+  },
+  {
+    "source": "scripts/worldgen/config.py",
+    "target": "src/world_atlas/core/config.py",
+    "sourceSha256": "3fb587ec668cd18f4a7a4bb5d0a60c05634cfffea2e3776f8647a1e6728503e8"
+  },
+  {
+    "source": "scripts/worldgen/geomorphology.py",
+    "target": "src/world_atlas/core/geomorphology.py",
+    "sourceSha256": "0aa3a0942aeff595f550b41fe7e614d3fa5f186a67e2de7ff12d654831b926dc"
+  },
+  {
+    "source": "scripts/worldgen/model.py",
+    "target": "src/world_atlas/core/model.py",
+    "sourceSha256": "cbf1d1204da00c2b6d98aeaf0bcc8ae9da35c22c0cadd9496f00462bb24548fd"
+  },
+  {
+    "source": "scripts/worldgen/planet_morphology.py",
+    "target": "src/world_atlas/core/planet_morphology.py",
+    "sourceSha256": "864cb6d4d35f4ad59d7dc1a5af1b7cebe8fb584b82d50449d9a3f414611a79f8"
+  },
+  {
+    "source": "scripts/worldgen/polar.py",
+    "target": "src/world_atlas/core/polar.py",
+    "sourceSha256": "fa1923d21740ec39de1153483e82ff737f51de48188cf568b2a2fbdce4965c48"
+  },
+  {
+    "source": "scripts/worldgen/preview_morphospace.py",
+    "target": "src/world_atlas/core/preview_morphospace.py",
+    "sourceSha256": "fd92c700b6a9c9f5de0c4c5b77d0942b4babcc744c411f617fa4efa6d06617a6"
+  },
+  {
+    "source": "scripts/worldgen/procedural_planet.py",
+    "target": "src/world_atlas/core/procedural_planet.py",
+    "sourceSha256": "59e570d4a6adc1bf2f2ed586f9760d23afeac2ed59fa8a96ecc467f76e7235d2"
+  },
+  {
+    "source": "scripts/worldgen/render.py",
+    "target": "src/world_atlas/core/render.py",
+    "sourceSha256": "72dd69a0c7fdfaafde4e6c6c6872f998695fbdc9e306804566b2670db692abb1"
+  },
+  {
+    "source": "scripts/worldgen/society/__init__.py",
+    "target": "src/world_atlas/core/society/__init__.py",
+    "sourceSha256": "0aaafa514e47e7671e0fd0d5d5b02d900a0a37858604e5ad68ea1552241d0065"
+  },
+  {
+    "source": "scripts/worldgen/society/administrative_centres.py",
+    "target": "src/world_atlas/core/society/administrative_centres.py",
+    "sourceSha256": "5e34c05514ccdfac83e223be8a015dd4d14bdf46cb58104b33d485b8fefb754d"
+  },
+  {
+    "source": "scripts/worldgen/society/culture.py",
+    "target": "src/world_atlas/core/society/culture.py",
+    "sourceSha256": "b0799797d796caf336b9cd9263950192555ad0bf4aca99d03b136261a82132b0"
+  },
+  {
+    "source": "scripts/worldgen/society/fictional_names.py",
+    "target": "src/world_atlas/core/society/fictional_names.py",
+    "sourceSha256": "748b128c2860556ea9af8189e0fc85cbc8ad2a7cd9f35ed10019fe938719b932"
+  },
+  {
+    "source": "scripts/worldgen/society/frontiers.py",
+    "target": "src/world_atlas/core/society/frontiers.py",
+    "sourceSha256": "4d74c4810481be79993610b67e50673919625abd1821ba1c337b1e0b8e4b025b"
+  },
+  {
+    "source": "scripts/worldgen/society/institutions.py",
+    "target": "src/world_atlas/core/society/institutions.py",
+    "sourceSha256": "4bb011b3a5aa9f984dfc7f6ed4584c6f5de99ddeefda873f8d6de6f8e7f340c7"
+  },
+  {
+    "source": "scripts/worldgen/society/model.py",
+    "target": "src/world_atlas/core/society/model.py",
+    "sourceSha256": "546fe8e0f2fe7d68e2fc6b0119def02ca66e7b6fb9ea4c011069483d634d9cb6"
+  },
+  {
+    "source": "scripts/worldgen/society/names.py",
+    "target": "src/world_atlas/core/society/names.py",
+    "sourceSha256": "60278f9b5e4352db4e9ce3162e1b9d19ab2f94a0f9080b541ec12fde9f88875b"
+  },
+  {
+    "source": "scripts/worldgen/society/onomastics.py",
+    "target": "src/world_atlas/core/society/onomastics.py",
+    "sourceSha256": "da7761b3d849b8eb26bef0769d8e651fead42a7c0e208312784906b7fa662ede"
+  },
+  {
+    "source": "scripts/worldgen/society/pipeline.py",
+    "target": "src/world_atlas/core/society/pipeline.py",
+    "sourceSha256": "615588493f8569549616275fee6201810d9e4019c5121e70c63387b6a876969c"
+  },
+  {
+    "source": "scripts/worldgen/society/politics.py",
+    "target": "src/world_atlas/core/society/politics.py",
+    "sourceSha256": "36e6f0df3ad868b15bdca5614e882b28d7984ce027557f6016f29a2716654f62"
+  },
+  {
+    "source": "scripts/worldgen/society/population.py",
+    "target": "src/world_atlas/core/society/population.py",
+    "sourceSha256": "e5892228700a06704c476f6fa4f75724754845970c1a903ddd5597820a69171d"
+  },
+  {
+    "source": "scripts/worldgen/society/provinces.py",
+    "target": "src/world_atlas/core/society/provinces.py",
+    "sourceSha256": "20e12bb23856be2f7d58030a5fb932c505b9ce7d93d61a38cfc44a58286b60f3"
+  },
+  {
+    "source": "scripts/worldgen/society/religion.py",
+    "target": "src/world_atlas/core/society/religion.py",
+    "sourceSha256": "11aa2a1978f332f5fd2da43903c96bace47ed0c5d78d0d96e1747839b6cf0736"
+  },
+  {
+    "source": "scripts/worldgen/society/spatial.py",
+    "target": "src/world_atlas/core/society/spatial.py",
+    "sourceSha256": "577fcef240ee8bd58ff6c9de5acd8bae69a4d43820f0c974d225c28886ed7977"
+  },
+  {
+    "source": "scripts/worldgen/society/state_formation.py",
+    "target": "src/world_atlas/core/society/state_formation.py",
+    "sourceSha256": "565f1bf392c1444220dd270a989dc76ef86a6ac2946c193ecdffbbb1e955bf9b"
+  },
+  {
+    "source": "scripts/worldgen/society/storage.py",
+    "target": "src/world_atlas/core/society/storage.py",
+    "sourceSha256": "45e658f05e70e674aca5d6e93650c0360fd1dd6f43be789a941297c3c0bda52c"
+  },
+  {
+    "source": "scripts/worldgen/society/strategic_sites.py",
+    "target": "src/world_atlas/core/society/strategic_sites.py",
+    "sourceSha256": "2f6b91dc6554a3d3e0fc7083a7ec2fec8f1ce27bb19f774fc0d7503e8aed2c4f"
+  },
+  {
+    "source": "scripts/worldgen/society/territorial_simulation.py",
+    "target": "src/world_atlas/core/society/territorial_simulation.py",
+    "sourceSha256": "5908a909f092f9b6bb5bb2f85f0b54d98e9ec710971dfb5c29891ff5dc8b2d9f"
+  },
+  {
+    "source": "scripts/worldgen/society/transport.py",
+    "target": "src/world_atlas/core/society/transport.py",
+    "sourceSha256": "c39e6c8182ec1666ebfdf29bc78c68f59ec3ff16036dec09c38c445728e649eb"
+  },
+  {
+    "source": "scripts/worldgen/society/world_identity.py",
+    "target": "src/world_atlas/core/society/world_identity.py",
+    "sourceSha256": "6883bf75eabae5b5e9c8862931de5a6b979e38b425e5154272b63b3c21bbe7b9"
+  },
+  {
+    "source": "scripts/worldgen/tectonic_review.py",
+    "target": "src/world_atlas/core/tectonic_review.py",
+    "sourceSha256": "05955e1274e1510ca7c80484fe8b46c85495c68fc36b895704a42d3178a7e356"
+  },
+  {
+    "source": "scripts/worldgen/terrain_review.py",
+    "target": "src/world_atlas/core/terrain_review.py",
+    "sourceSha256": "62cf0a3b7e2a566adf1b2718db478ca073185f2ad262cdd67e3abcf508e1d5b7"
+  },
+  {
+    "source": "scripts/worldgen/thematic.py",
+    "target": "src/world_atlas/core/thematic.py",
+    "sourceSha256": "b9300633fbe48fb292e9cc2698e2046c36d740252902ab84d7f6b845e0da566d"
+  }
+]

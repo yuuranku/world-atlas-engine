@@ -1,0 +1,16 @@
+{
+  "repository": "yuuranku/world-atlas-engine",
+  "engineVersion": "1.1.0",
+  "assets": {
+    "engine": {
+      "name": "world_atlas_engine-1.1.0-py3-none-any.whl",
+      "bytes": 491138,
+      "sha256": "ff14dba8df8e01b0bda06b76a6ab59380a5f85e90288c0d7f8e06b7b8cc9a313"
+    },
+    "accepted-v5": {
+      "name": "accepted-v5-inputs.zip",
+      "bytes": 32194252,
+      "sha256": "8129216ae74e77099c74d59e1695a70015a431b675548ef9f7cd1d6d3b1fe6fd"
+    }
+  }
+}

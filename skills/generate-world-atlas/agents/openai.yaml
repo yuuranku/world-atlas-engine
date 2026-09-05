@@ -1,0 +1,4 @@
+interface:
+  display_name: "架空世界地图工作流"
+  short_description: "先完成十五题世界设定，再用可复现引擎生成并审查地理与人文地图"
+  default_prompt: "使用 $generate-world-atlas，先向我一次性提出十五个世界设定问题，确认答案后再生成地图。"

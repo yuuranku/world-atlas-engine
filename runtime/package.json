@@ -1,0 +1,6 @@
+{
+  "name": "world-atlas-render-runtime",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": { "mapshaper": "0.7.56" }
+}

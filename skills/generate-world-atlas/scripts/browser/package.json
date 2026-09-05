@@ -1,0 +1,7 @@
+{
+  "name": "world-atlas-browser-verification",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": { "@playwright/test": "1.62.1" }
+}
