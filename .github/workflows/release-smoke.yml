@@ -1,0 +1,53 @@
+name: Public release download and install
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  fresh-install:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '22.21.0'
+      - name: Download public release without authentication
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'https://github.com/yuuranku/world-atlas-engine/releases/download/v1.1.0/'
+          New-Item -ItemType Directory -Path release-check | Out-Null
+          Invoke-WebRequest ($base + 'release-manifest.json') -OutFile release-check/release-manifest.json
+          $manifest = Get-Content release-check/release-manifest.json -Raw | ConvertFrom-Json
+          foreach ($asset in $manifest.files.PSObject.Properties) {
+            $target = Join-Path release-check $asset.Name
+            Invoke-WebRequest ($base + $asset.Name) -OutFile $target
+            $hash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne $asset.Value.sha256 -or (Get-Item -LiteralPath $target).Length -ne $asset.Value.bytes) { throw "Asset mismatch: $($asset.Name)" }
+            Write-Output "Verified public download: $($asset.Name)"
+          }
+          $skillHash = (Get-FileHash release-check/generate-world-atlas-skill.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($skillHash -ne 'f4825d75dbd751dd651b42ce59c50ba859f9ddbdf13485e2855698921d253a80') { throw 'Pinned skill hash mismatch' }
+          Expand-Archive release-check/generate-world-atlas-skill.zip release-check/skill
+      - name: Skill downloads and installs the engine into a fresh environment
+        run: python release-check/skill/generate-world-atlas/scripts/install_engine.py --target release-check/runtime
+      - name: Download optional replay input through the skill
+        run: python release-check/skill/generate-world-atlas/scripts/download_engine.py --asset accepted-v5 --cache release-check/optional-cache
+      - name: Reuse verified wheel cache without an installation
+        run: python release-check/skill/generate-world-atlas/scripts/download_engine.py --cache release-check/.world-atlas-downloads/1.1.0
+      - name: Call installed engine and run contracts
+        shell: pwsh
+        run: |
+          & release-check/runtime/python/Scripts/python.exe -I -m world_atlas seeds --root-seed 2116268501 --count 3
+          if ($LASTEXITCODE -ne 0) { throw 'Installed CLI failed' }
+          Push-Location runtime
+          npm ci --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'Renderer test dependencies failed' }
+          Pop-Location
+          $env:WORLD_ATLAS_SKILL = (Resolve-Path release-check/skill/generate-world-atlas).Path
+          & release-check/runtime/python/Scripts/python.exe -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { throw 'Installed package tests failed' }
