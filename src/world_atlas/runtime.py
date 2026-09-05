@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 
-DEPENDENCIES = {"numpy": "2.3.5", "contourpy": "1.3.3", "Pillow": "12.3.0", "shapely": "2.1.2"}
+DEPENDENCIES = {"numpy": "2.3.5", "scipy": "1.17.1", "contourpy": "1.3.3", "Pillow": "12.3.0", "shapely": "2.1.2"}
 
 
 def require_renderer(mapshaper: str | Path | None = None) -> tuple[str, Path]:

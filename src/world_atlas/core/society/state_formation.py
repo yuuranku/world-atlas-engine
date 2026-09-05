@@ -364,6 +364,10 @@ def settle_state_boundaries(
         neighbors[edge.first].append((edge.second, edge))
         neighbors[edge.second].append((edge.first, edge))
 
+    members: dict[int, set[int]] = {}
+    for region in range(1, graph.region_count + 1):
+        members.setdefault(int(owners[region]), set()).add(region)
+
     def removal_keeps_state_connected(region: int, state: int) -> bool:
         """Return whether a whole hinterland can change hands safely.
 
@@ -374,11 +378,7 @@ def settle_state_boundaries(
         already border ``region``.
         """
 
-        remaining = {
-            candidate
-            for candidate in range(1, graph.region_count + 1)
-            if candidate != region and int(owners[candidate]) == state
-        }
+        remaining = members[state] - {region}
         if not remaining:
             return False
         start = min(remaining)
@@ -423,9 +423,6 @@ def settle_state_boundaries(
             if core_state_by_region[region] > 0:
                 continue
             defender = int(owners[region])
-            if not removal_keeps_state_connected(region, defender):
-                continue
-            current_energy = local_energy(region, defender)
             candidates = sorted(
                 {
                     int(owners[neighbor])
@@ -435,11 +432,16 @@ def settle_state_boundaries(
                     == graph.domain_by_region[region]
                 }
             )
-            for candidate in candidates:
-                candidate_energy = local_energy(region, candidate)
-                improvement = current_energy - candidate_energy
-                if improvement > 0.35:
-                    proposals.append((improvement, region, defender, candidate))
+            if not candidates:
+                continue
+            current_energy = local_energy(region, defender)
+            improvements = [(current_energy - local_energy(region, candidate), candidate)
+                            for candidate in candidates]
+            improvements = [(gain, candidate) for gain, candidate in improvements if gain > 0.35]
+            if not improvements or not removal_keeps_state_connected(region, defender):
+                continue
+            for improvement, candidate in improvements:
+                proposals.append((improvement, region, defender, candidate))
         if not proposals:
             break
         changed = False
@@ -459,6 +461,8 @@ def settle_state_boundaries(
             if local_energy(region, defender) - local_energy(region, candidate) <= 0.35:
                 continue
             owners[region] = candidate
+            members[defender].remove(region)
+            members[candidate].add(region)
             changed = True
         if not changed:
             break

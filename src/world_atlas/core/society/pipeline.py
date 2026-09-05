@@ -28,7 +28,7 @@ from .population import derive_population, derive_settlements
 from .provinces import derive_provinces
 from .religion import derive_religions
 from .strategic_sites import derive_strategic_sites, promote_border_settlements
-from .transport import conform_transport_to_politics, derive_transport
+from .transport import RoutingCache, conform_transport_to_politics, derive_transport
 from .world_identity import assign_world_identity
 
 
@@ -43,6 +43,7 @@ def derive_society_layers(
     language_count: int | None = None,
     religion_count: int | None = None,
     state_count: int | None = None,
+    frontier_target_share: float = 0.35,
     population_min: int = 450_000_000,
     population_max: int = 600_000_000,
 ) -> SocietyLayers:
@@ -106,7 +107,8 @@ def derive_society_layers(
             ),
         )
     progress.info("Society: initial transport, %d settlements", len(settlements))
-    transport = derive_transport(grid, thematic, population, settlements)
+    routing_cache = RoutingCache()
+    transport = derive_transport(grid, thematic, population, settlements, routing_cache=routing_cache)
     progress.info("Society: civilizations and languages")
     cultures = derive_cultures(
         grid,
@@ -134,7 +136,7 @@ def derive_society_layers(
     )
     # Holy-city identity is now part of route demand. Recompute the network
     # before states and provinces derive their expansion costs from it.
-    transport = derive_transport(grid, thematic, population, settlements)
+    transport = derive_transport(grid, thematic, population, settlements, routing_cache=routing_cache)
     state_formation_profiles = derive_state_formation_profiles(
         grid,
         thematic,
@@ -153,6 +155,7 @@ def derive_society_layers(
         transport,
         lexicon,
         state_count=state_count,
+        frontier_target_share=frontier_target_share,
         state_formation_profiles=state_formation_profiles,
     )
     transport = conform_transport_to_politics(
@@ -187,6 +190,7 @@ def derive_society_layers(
             thematic,
             population,
             settlements,
+            routing_cache=routing_cache,
         )
         state_formation_profiles = derive_state_formation_profiles(
             grid,
@@ -205,6 +209,7 @@ def derive_society_layers(
             transport,
             lexicon,
             state_count=len(politics.states),
+            frontier_target_share=frontier_target_share,
             state_formation_profiles=state_formation_profiles,
         )
         transport = conform_transport_to_politics(
@@ -239,6 +244,7 @@ def derive_society_layers(
             grid,
             thematic,
         )
+    progress.info("Society routing reuse: %d hits, %d computed paths", routing_cache.hits, routing_cache.misses)
     progress.info("Society: provinces")
     provinces = derive_provinces(
         grid,
@@ -264,6 +270,8 @@ def derive_society_layers(
     request = grid.metadata.get("societyGeneration", {})
     if isinstance(request, Mapping) and request.get("namingProfile") == "procedural":
         society = assign_world_identity(
-            society, seed=int(request["seed"]), forbidden=request.get("forbiddenNames", ()),
+            society,
+            seed=int(request["namingSeed"]),
+            forbidden=request.get("forbiddenNames", ()),
         )
     return society

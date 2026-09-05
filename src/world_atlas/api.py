@@ -8,6 +8,7 @@ from pathlib import Path
 from .core.procedural_planet import PlanetRecipe
 from .inputs import prepare_world_inputs
 from .runtime import require_renderer
+from .settings import load_world_settings
 
 
 def load_recipe(path: str | Path) -> PlanetRecipe:
@@ -17,6 +18,10 @@ def load_recipe(path: str | Path) -> PlanetRecipe:
         raise ValueError(f"recipe must contain exactly: {', '.join(sorted(names))}")
     integers = {"seed", "width", "height", "plate_count", "continent_count"}
     for name, value in record.items():
+        if name in {"north_polar_continent", "south_polar_continent"}:
+            if not isinstance(value, bool):
+                raise ValueError(f"recipe.{name} must be a boolean")
+            continue
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ValueError(f"recipe.{name} must be a finite number")
         if name in integers and not isinstance(value, int):
@@ -46,18 +51,29 @@ def generate_terrain(recipe_path: str | Path, output: str | Path) -> dict:
     return result
 
 
-def generate_world(terrain: str | Path, output: str | Path, *, seed: int, exclusions=(), mapshaper=None) -> dict:
+def generate_world(
+    terrain: str | Path,
+    settings: str | Path,
+    output: str | Path,
+    *,
+    exclusions=(),
+    mapshaper=None,
+) -> dict:
     from .rebuild import build_accepted_world
     root = _fresh_output(output)
-    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
-        raise ValueError("world seed must be an unsigned 32-bit integer")
+    world_settings = load_world_settings(settings)
     _node, entry = require_renderer(mapshaper)
     source = Path(terrain).resolve()
     previous = os.environ.get("WORLD_ATLAS_MAPSHAPER")
     os.environ["WORLD_ATLAS_MAPSHAPER"] = str(entry)
     try:
-        result = build_accepted_world(source / "worldgen.json", source / "source/provenance.json", root,
-                                      [Path(path) for path in exclusions], seed=seed)
+        result = build_accepted_world(
+            source / "worldgen.json",
+            source / "source/provenance.json",
+            root,
+            [Path(path) for path in exclusions],
+            settings=world_settings,
+        )
         from .checks import semantic_checks
         checks = semantic_checks(root)
         (root / "review/release-checks.json").write_text(json.dumps(checks, indent=2) + "\n", encoding="utf-8")
@@ -71,10 +87,19 @@ def generate_world(terrain: str | Path, output: str | Path, *, seed: int, exclus
 
 def reproduce_world(inputs: str | Path, output: str | Path, *, mapshaper=None) -> dict:
     from .checks import semantic_checks
+    from . import __version__
     source = Path(inputs).resolve()
     record = json.loads((source / "regeneration.json").read_text(encoding="utf-8"))
-    expected = json.loads((source / "release-checks.json").read_text(encoding="utf-8"))
-    result = generate_world(source, output, seed=record["namingSeed"], exclusions=[source / "naming-exclusions.json"], mapshaper=mapshaper)
+    if record['engineVersion'] != __version__:
+        raise ValueError('reproduction requires the original engine version')
+    expected = json.loads((source / "review/release-checks.json").read_text(encoding="utf-8"))
+    result = generate_world(
+        source,
+        source / "world-settings.json",
+        output,
+        exclusions=[source / "naming-exclusions.json"],
+        mapshaper=mapshaper,
+    )
     actual = semantic_checks(Path(output))
     comparison = {"ok": actual == expected, "expected": expected, "observed": actual}
     (Path(output) / "review/replay-check.json").write_text(json.dumps(comparison, indent=2) + "\n", encoding="utf-8")

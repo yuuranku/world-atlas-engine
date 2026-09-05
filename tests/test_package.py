@@ -11,6 +11,7 @@ import unittest
 class PackageContractTests(unittest.TestCase):
     def test_source_input_hash_check_rejects_tampered_bundle(self):
         from world_atlas.rebuild import prepare_regeneration
+        from world_atlas.settings import load_world_settings
         import hashlib
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -18,12 +19,20 @@ class PackageContractTests(unittest.TestCase):
             (root/'fields.npz').write_bytes(b'tampered')
             (root/'config.json').write_text(json.dumps({'source':{'path':'image.png','sha256':hashlib.sha256(b'not used as artwork').hexdigest(),'fieldBundle':{'path':'fields.npz','sha256':'0'*64}}}),encoding='utf-8')
             with self.assertRaisesRegex(ValueError,'physical field hash mismatch'):
-                prepare_regeneration(root/'config.json',root/'provenance.json',root/'output',[])
+                prepare_regeneration(
+                    root/'config.json',
+                    root/'provenance.json',
+                    root/'output',
+                    [],
+                    settings=load_world_settings(
+                        Path(__file__).resolve().parents[1]/'examples/world-settings.json'
+                    ),
+                )
             self.assertFalse((root/'output').exists())
 
     def test_invalid_recipe_numbers_rejected(self):
         from world_atlas.api import load_recipe
-        record = json.loads((Path(__file__).resolve().parents[1]/'examples/terrain-v38.json').read_text())
+        record = json.loads((Path(__file__).resolve().parents[1]/'examples/terrain.json').read_text())
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary)/'recipe.json'
             for field,value in [('seed',True),('seed',-1),('coastline_detail',float('nan')),('plate_count',7.5)]:
@@ -59,7 +68,7 @@ class PackageContractTests(unittest.TestCase):
             root = Path(temporary)
             marker = root / "keep.txt"
             marker.write_text("user data", encoding="utf-8")
-            result = subprocess.run([sys.executable, "-m", "world_atlas", "terrain", "--recipe", str(Path(__file__).resolve().parents[1] / "examples/terrain-v38.json"), "--output", str(root)], capture_output=True, text=True)
+            result = subprocess.run([sys.executable, "-m", "world_atlas", "terrain", "--recipe", str(Path(__file__).resolve().parents[1] / "examples/terrain.json"), "--output", str(root)], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("exists", result.stderr)
             self.assertEqual(marker.read_text(), "user data")

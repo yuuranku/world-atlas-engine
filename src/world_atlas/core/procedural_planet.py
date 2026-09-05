@@ -85,8 +85,13 @@ class PlanetRecipe:
     tectonic_activity: float
     mountain_density: float
     coastline_detail: float
+    north_polar_continent: bool
+    south_polar_continent: bool
 
     def __post_init__(self) -> None:
+        for name in ("north_polar_continent", "south_polar_continent"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean")
         if self.width < 32 or self.height < 16:
             raise ValueError("procedural planet grid is too small")
         if self.plate_count < 4:
@@ -165,6 +170,20 @@ def _normalise(values: np.ndarray) -> np.ndarray:
     if high <= low + 1.0e-12:
         return np.zeros(values.shape, dtype=np.float32)
     return np.clip((values - low) / (high - low), 0.0, 1.0).astype(np.float32)
+
+
+def _polar_crust_bias(field: np.ndarray, latitude: np.ndarray, recipe: PlanetRecipe) -> np.ndarray:
+    """Set each polar crust domain before sea level, preserving local relief.
+
+    A spherical cap has no longitude seam. The transition blends into the
+    existing tectonic field; it does not stamp a post-render ice continent.
+    """
+    latitude = np.asarray(latitude).reshape(-1, 1)
+    transition = np.clip((np.abs(latitude) - 58.0) / 26.0, 0.0, 1.0)
+    weight = transition * transition * (3.0 - 2.0 * transition)
+    positive = np.where(latitude >= 0, recipe.north_polar_continent, recipe.south_polar_continent)
+    span = float(np.ptp(field)) + 1.0
+    return (field + np.where(positive, 1.0, -1.0) * span * weight).astype(np.float32)
 
 
 def _box_blur_axis(values: np.ndarray, radius: int, axis: int) -> np.ndarray:
@@ -1712,6 +1731,7 @@ def _continental_crust(
     polar_excess = np.clip((absolute_latitude_grid - 0.76) / 0.24, 0.0, 1.0)
     polar_strength = 3.8 * (1.0 - 0.82 * max(morphology.latitude_bias, 0.0))
     potential_grid -= polar_strength * np.power(polar_excess, 2.2)
+    potential_grid = _polar_crust_bias(potential_grid, grid.latitude_degrees[:, 0], recipe)
 
     latitude_weight = np.cos(np.radians(grid.latitude_degrees[:, 0]))[:, None]
     field = potential_grid.astype(np.float32)
@@ -3340,7 +3360,14 @@ def generate_planet_surface(recipe: PlanetRecipe) -> ProceduralSurface:
         low_relief_support,
     )
 
-    seam_column, seam_width = _ocean_map_seam(land)
+    # Pole-spanning land necessarily touches every longitude in Plate Carree;
+    # choose the rectangular seam using the inhabited/non-polar continents.
+    seam_land = land.copy()
+    polar_rows = np.abs(np.degrees(latitude[:, 0])) >= 58.0
+    selected_polar_rows = polar_rows & np.where(latitude[:, 0] >= 0,
+        recipe.north_polar_continent, recipe.south_polar_continent)
+    seam_land[selected_polar_rows] = False
+    seam_column, seam_width = _ocean_map_seam(seam_land)
     longitude_roll = -seam_column
     signed_m = np.roll(signed_m, longitude_roll, axis=1)
     relative_m = np.roll(relative_m, longitude_roll, axis=1)
@@ -3475,6 +3502,7 @@ def generate_planet_surface(recipe: PlanetRecipe) -> ProceduralSurface:
     quiet_land = land & (boundary_class == BOUNDARY_INTERIOR)
     diagnostics = {
         "seed": recipe.seed,
+        "polarContinents": {"north": recipe.north_polar_continent, "south": recipe.south_polar_continent},
         "stageSeeds": stage_seeds,
         "plateCount": recipe.plate_count,
         "effectivePlateCount": int(len(np.unique(plate_id))),

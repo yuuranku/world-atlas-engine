@@ -30,12 +30,9 @@ def polar_continent_mask(grid: Any) -> np.ndarray:
         return np.zeros(grid.shape, dtype=bool)
     arctic = polar.get("arctic", {})
     antarctic = polar.get("antarctic", {})
-    if not (
-        isinstance(arctic, Mapping)
-        and isinstance(antarctic, Mapping)
-        and arctic.get("surface") == "continental-land"
-        and antarctic.get("surface") == "continental-land"
-    ):
+    north_continent = isinstance(arctic, Mapping) and arctic.get("surface") == "continental-land"
+    south_continent = isinstance(antarctic, Mapping) and antarctic.get("surface") == "continental-land"
+    if not north_continent and not south_continent:
         return np.zeros(grid.shape, dtype=bool)
     planet = grid.metadata.get("planet", {})
     tilt = float(planet.get("axialTiltDegrees", 23.44))
@@ -46,7 +43,10 @@ def polar_continent_mask(grid: Any) -> np.ndarray:
     latitude = north - (np.arange(grid.shape[0], dtype=np.float64) + 0.5) * (
         north - south
     ) / grid.shape[0]
-    return (grid.water == 0) & (np.abs(latitude)[:, None] >= polar_circle)
+    return (grid.water == 0) & (
+        ((latitude[:, None] >= polar_circle) & north_continent)
+        | ((latitude[:, None] <= -polar_circle) & south_continent)
+    )
 
 
 def _hash_unit(index: int, seed: int) -> float:
@@ -102,8 +102,10 @@ def _coast_latitudes(
             np.full(width, 90.0, dtype=np.float64),
             np.full(width, -90.0, dtype=np.float64),
         )
-    north = np.min(np.where(north_land, latitude_grid, np.inf), axis=0)
-    south = np.max(np.where(south_land, latitude_grid, -np.inf), axis=0)
+    north = (np.min(np.where(north_land, latitude_grid, np.inf), axis=0)
+             if north_land.any() else np.full(north_land.shape[1], 90.0))
+    south = (np.max(np.where(south_land, latitude_grid, -np.inf), axis=0)
+             if south_land.any() else np.full(south_land.shape[1], -90.0))
     if not np.all(np.isfinite(north)) or not np.all(np.isfinite(south)):
         raise ValueError("each polar continent must cross every longitude at the pole")
     return north, south

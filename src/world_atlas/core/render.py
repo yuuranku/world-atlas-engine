@@ -221,7 +221,7 @@ class WorldGridRenderError(ValueError):
 
 def _society_generation_request(
     grid: WorldGrid,
-) -> tuple[str | Path | NameLexicon, dict[str, int]]:
+) -> tuple[str | Path | NameLexicon, dict[str, int | float]]:
     """Resolve the society profile carried by this world's immutable metadata."""
 
     raw = grid.metadata.get("societyGeneration")
@@ -229,10 +229,10 @@ def _society_generation_request(
         raise WorldGridRenderError("world_atlas requires an explicit procedural societyGeneration profile")
     profile = str(raw.get("namingProfile", ""))
     if profile == "procedural":
-        seed = raw.get("seed")
+        seed = raw.get("namingSeed")
         if isinstance(seed, bool) or not isinstance(seed, int):
             raise WorldGridRenderError(
-                "procedural societyGeneration.seed must be an integer"
+                "procedural societyGeneration.namingSeed must be an integer"
             )
         lexicon = procedural_name_lexicon(seed)
     else:
@@ -240,7 +240,12 @@ def _society_generation_request(
             f"unknown society naming profile: {profile}"
         )
 
-    options: dict[str, int] = {}
+    human_seed = raw.get("humanSeed")
+    if isinstance(human_seed, bool) or not isinstance(human_seed, int):
+        raise WorldGridRenderError(
+            "procedural societyGeneration.humanSeed must be an integer"
+        )
+    options: dict[str, int | float] = {}
     keys = {
         "settlementCount": "settlement_count",
         "civilizationCount": "civilization_count",
@@ -260,6 +265,16 @@ def _society_generation_request(
                 f"societyGeneration.{metadata_key} must be a positive integer"
             )
         options[argument_key] = value
+    frontier_share = raw.get("frontierTargetShare")
+    if (
+        isinstance(frontier_share, bool)
+        or not isinstance(frontier_share, (int, float))
+        or not 0.0 <= float(frontier_share) < 1.0
+    ):
+        raise WorldGridRenderError(
+            "societyGeneration.frontierTargetShare must lie in [0, 1)"
+        )
+    options["frontier_target_share"] = float(frontier_share)
     return lexicon, options
 
 
@@ -602,6 +617,35 @@ def _seasonal_precipitation_pixels(grid: WorldGrid, season_index: int) -> np.nda
     if (display_width, display_height) == (grid.shape[1], grid.shape[0]):
         return rgba
     return np.repeat(np.repeat(rgba, scale_y, axis=0), scale_x, axis=1)
+
+
+def _categorical_overlay_pixels(
+    values: np.ndarray,
+    active_mask: np.ndarray,
+    zones: Sequence[tuple[str, str]],
+    *,
+    opacity: float,
+) -> np.ndarray:
+    """Render an exact full-resolution categorical overlay without SVG path noise."""
+
+    categories = np.asarray(values)
+    active = np.asarray(active_mask, dtype=bool)
+    if categories.shape != active.shape:
+        raise WorldGridRenderError("categorical values and mask must share a shape")
+    if not 0.0 <= float(opacity) <= 1.0:
+        raise WorldGridRenderError("categorical overlay opacity must lie in [0, 1]")
+    if np.any(categories[active] < 0) or np.any(categories[active] >= len(zones)):
+        raise WorldGridRenderError("categorical overlay value exceeds its zone palette")
+    palette = np.asarray(
+        [
+            (*_parse_hex_color(color), round(float(opacity) * 255.0))
+            for _name, color in zones
+        ],
+        dtype=np.uint8,
+    )
+    image = np.zeros((*categories.shape, 4), dtype=np.uint8)
+    image[active] = palette[categories[active].astype(np.int64)]
+    return image
 
 
 def _wind_arrow_groups(grid: WorldGrid) -> tuple[str, dict[str, int]]:
@@ -4792,7 +4836,7 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, society: SocietyLa
     biome_path = output_dir / "biome.svg"
     watersheds_path = output_dir / "watersheds.svg"
     land_potential_path = output_dir / "land-potential.svg"
-    population_path = output_dir / "population.svg"
+    population_path = output_dir / "population.png"
     civilizations_path = output_dir / "civilizations.svg"
     languages_path = output_dir / "languages.svg"
     religions_path = output_dir / "religions.svg"
@@ -4908,10 +4952,14 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, society: SocietyLa
         land_mask,
         category_count=len(_LAND_POTENTIAL_ZONES),
     )
-    population_zone_paths = _categorical_partition_paths(
+    population_band_count = int(
+        np.unique(society.population.population_band[land_mask]).size
+    )
+    population_pixels = _categorical_overlay_pixels(
         society.population.population_band,
         land_mask,
-        category_count=len(_POPULATION_ZONES),
+        _POPULATION_ZONES,
+        opacity=0.74,
     )
     civilization_zones = _culture_zones(society)
     civilization_display = _civilization_display_values(grid, thematic, society)
@@ -5119,7 +5167,6 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, society: SocietyLa
         biome_zone_paths,
         watershed_zone_paths,
         potential_zone_paths,
-        population_zone_paths,
         civilization_zone_paths,
         language_zone_paths,
         religion_zone_paths,
@@ -5175,15 +5222,6 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, society: SocietyLa
         data_attribute="potential-band",
         zones=_LAND_POTENTIAL_ZONES,
         fill_opacity=0.76,
-    )
-    population_svg = _partition_overlay_svg_document(
-        grid,
-        population_zone_paths,
-        title="世界人口分布图",
-        partition_id="population-bands",
-        data_attribute="population-band",
-        zones=_POPULATION_ZONES,
-        fill_opacity=0.74,
     )
     civilizations_svg = _partition_overlay_svg_document(
         grid,
@@ -5254,7 +5292,6 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, society: SocietyLa
         biome_path.name: biome_svg,
         watersheds_path.name: watersheds_svg,
         land_potential_path.name: land_potential_svg,
-        population_path.name: population_svg,
         civilizations_path.name: civilizations_svg,
         languages_path.name: languages_svg,
         religions_path.name: religions_svg,
@@ -5550,6 +5587,12 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, society: SocietyLa
         temporary_files.append((temporary_index, _file_identity(temporary_index)))
         temporary_qa = _temporary_file(output_dir, qa_path.name, ".json")
         temporary_files.append((temporary_qa, _file_identity(temporary_qa)))
+        temporary_population = _temporary_file(
+            output_dir, population_path.name, ".png"
+        )
+        temporary_files.append(
+            (temporary_population, _file_identity(temporary_population))
+        )
         temporary_climate = _temporary_file(output_dir, climate_path.name, ".svg")
         temporary_files.append((temporary_climate, _file_identity(temporary_climate)))
         temporary_thematic: dict[Path, Path] = {climate_path: temporary_climate}
@@ -5558,7 +5601,6 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, society: SocietyLa
             biome_path,
             watersheds_path,
             land_potential_path,
-            population_path,
             civilizations_path,
             languages_path,
             religions_path,
@@ -5583,6 +5625,9 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, society: SocietyLa
 
         Image.fromarray(_terrain_pixels(grid)).save(
             temporary_terrain, format="PNG", optimize=True
+        )
+        Image.fromarray(population_pixels, mode="RGBA").save(
+            temporary_population, format="PNG", optimize=True
         )
         for season_index, temporary_path in enumerate(temporary_precipitation):
             Image.fromarray(
@@ -5736,9 +5781,7 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, society: SocietyLa
                 "land-potential-bands": int(
                     sum(bool(paths) for paths in potential_zone_paths)
                 ),
-                "population-bands": int(
-                    sum(bool(paths) for paths in population_zone_paths)
-                ),
+                "population-bands": population_band_count,
                 "civilization-regions": len(society.cultures.civilizations),
                 "language-regions": len(society.cultures.languages),
                 "religion-regions": len(society.religions.religions),
@@ -5882,6 +5925,7 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, society: SocietyLa
             "artifacts": {
                 "terrain.png": temporary_terrain.stat().st_size,
                 "index.html": temporary_index.stat().st_size,
+                population_path.name: temporary_population.stat().st_size,
                 **{
                     final_path.name: temporary_path.stat().st_size
                     for final_path, temporary_path in temporary_thematic.items()
@@ -5905,6 +5949,7 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, society: SocietyLa
                 (temporary_terrain, terrain_path),
                 (temporary_index, index_path),
                 (temporary_qa, qa_path),
+                (temporary_population, population_path),
                 (temporary_society_npz, society_npz_path),
                 (temporary_society_json, society_json_path),
                 *((temporary_path, final_path) for final_path, temporary_path in temporary_thematic.items()),

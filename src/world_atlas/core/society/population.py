@@ -6,6 +6,7 @@ import hashlib
 import math
 
 import numpy as np
+from scipy import ndimage
 
 from ..model import WorldGrid
 from ..thematic import ThematicLayers, smooth_field
@@ -14,6 +15,7 @@ from .spatial import (
     connected_components,
     reduce_field,
     select_spaced_seeds,
+    select_spaced_candidates,
     society_domain_mask,
 )
 
@@ -72,18 +74,15 @@ def _settlement_layout_variation(
 
 def _proximity(mask: np.ndarray, radius: int) -> np.ndarray:
     active = np.asarray(mask, dtype=bool)
-    score = active.astype(np.float64)
-    frontier = active.copy()
-    for distance in range(1, radius + 1):
-        padded = np.pad(frontier, ((1, 1), (0, 0)), mode="constant")
-        frontier = (
-            np.roll(frontier, 1, axis=1)
-            | np.roll(frontier, -1, axis=1)
-            | padded[:-2]
-            | padded[2:]
-        )
-        score = np.maximum(score, frontier * (1.0 - distance / (radius + 1.0)))
-    return score
+    if radius <= 0 or not active.any():
+        return active.astype(np.float64)
+    # The former radius rounds of four-neighbour dilation are exactly the
+    # taxicab distance transform. Only the queried longitude halo is needed.
+    padded = np.pad(~active, ((0, 0), (radius, radius)), mode="wrap")
+    distance = ndimage.distance_transform_cdt(padded, metric="taxicab")[:, radius:-radius]
+    scores = np.maximum(0.0, 1.0 - np.arange(radius + 2) / (radius + 1.0))
+    distance = np.where(distance < 0, radius + 1, np.minimum(distance, radius + 1))
+    return scores[distance]
 
 
 def _latitude_area_weights(grid: WorldGrid) -> np.ndarray:
@@ -256,7 +255,6 @@ def _select_spaced_additions(
     values = np.asarray(score, dtype=np.float64)
     allowed = np.asarray(valid, dtype=bool)
     flat = np.flatnonzero(allowed & np.isfinite(values))
-    width = values.shape[1]
     rows, columns = np.unravel_index(flat, values.shape)
     # Stable spatial hash breaks equal-score plateaus without the old
     # row-major bias that packed every plain town into one side of a uniform
@@ -274,20 +272,8 @@ def _select_spaced_additions(
             )
         )
     ]
-    chosen: list[tuple[int, int]] = []
-    for index in order:
-        row, column = np.unravel_index(int(index), values.shape)
-        if all(
-            math.hypot(
-                row - other_row,
-                min(abs(column - other_column), width - abs(column - other_column)),
-            )
-            >= minimum_distance
-            for other_row, other_column in (*occupied, *chosen)
-        ):
-            chosen.append((int(row), int(column)))
-            if len(chosen) == count:
-                break
+    chosen = select_spaced_candidates(order, values.shape, count=count,
+        minimum_distance=minimum_distance, occupied=occupied)
     occupied.extend(chosen)
     return tuple(chosen)
 
@@ -480,7 +466,8 @@ def derive_settlements(
         # File locations and build provenance belong in the integrity digest,
         # not in random world decisions. Moving the replay bundle must not
         # move its cities and consequently change every human layer.
-        "world-seed:" + str(grid.metadata.get("societyGeneration", {}).get("seed", 0)),
+        "world-seed:"
+        + str(grid.metadata.get("societyGeneration", {}).get("humanSeed", 0)),
     )
     site_score[~land | grid.snow] = -np.inf
     step = 1

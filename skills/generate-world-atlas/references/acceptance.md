@@ -24,7 +24,7 @@
 
 ## 记录与工具
 
-每轮保留配方、15 答/确认参数、种子、代码/依赖版本、输入指纹、QA、命名审计、语义检查和截图。
+每轮保留配方、17 答/确认参数、种子、代码/依赖版本、输入指纹、QA、命名审计、语义检查和截图。
 
 `node scripts/capture_review.mjs <世界输出> [msedge|chrome|chromium]` 检查全部主题并截图；先在 `scripts/browser` 执行 `npm ci --ignore-scripts`。默认使用已有 Edge；选择 chromium 时需在该目录先 `npx playwright install chromium`。没有浏览器就说明，不造截图。
 

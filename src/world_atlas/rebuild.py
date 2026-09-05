@@ -18,13 +18,23 @@ from world_atlas.core.thematic import derive_thematic_layers
 from world_atlas.core.society.pipeline import derive_society_layers
 from world_atlas.core.society.storage import load_society, save_society
 from world_atlas.core.society.world_identity import collect_proper_names, naming_audit
+from world_atlas.settings import WorldSettings
+from world_atlas.timing import elapsed_seconds, measure_stage
+from world_atlas import __version__
 
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest().upper()
 
 
-def prepare_regeneration(config_path: Path, provenance_path: Path, output: Path, exclusions: list[Path]) -> dict:
+def prepare_regeneration(
+    config_path: Path,
+    provenance_path: Path,
+    output: Path,
+    exclusions: list[Path],
+    *,
+    settings: WorldSettings,
+) -> dict:
     """Validate first; copy inputs exactly into a fresh, self-contained run."""
     config_path, provenance_path, output = config_path.resolve(), provenance_path.resolve(), output.resolve()
     if output.exists():
@@ -52,30 +62,54 @@ def prepare_regeneration(config_path: Path, provenance_path: Path, output: Path,
     config["source"]["path"] = "source/physical-reference.png"
     config["source"]["fieldBundle"]["path"] = "source/physical-fields.npz"
     config["output"]["directory"] = "."
+    config["planet"].update(settings.planet)
     write_json(output / "worldgen.json", config)
+    write_json(output / "world-settings.json", settings.document())
     write_json(output / "naming-exclusions.json", {"forbidden": sorted(forbidden), "sources": inventory})
-    return {"config": output / "worldgen.json", "provenance": provenance, "forbidden": tuple(sorted(forbidden))}
+    return {
+        "config": output / "worldgen.json",
+        "provenance": provenance,
+        "forbidden": tuple(sorted(forbidden)),
+        "settings": settings,
+    }
 
 
 def write_json(path: Path, document: dict) -> None:
     path.write_text(json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def build_accepted_world(config_path: Path, provenance_path: Path, output: Path, exclusions: list[Path], *, seed: int) -> dict:
+def build_accepted_world(
+    config_path: Path,
+    provenance_path: Path,
+    output: Path,
+    exclusions: list[Path],
+    *,
+    settings: WorldSettings,
+) -> dict:
     started = time.monotonic()
-    prepared = prepare_regeneration(config_path, provenance_path, output, exclusions)
+    prepared = prepare_regeneration(
+        config_path,
+        provenance_path,
+        output,
+        exclusions,
+        settings=settings,
+    )
     provenance = prepared["provenance"]
     recipe = PlanetRecipe(**provenance["recipe"])
     output = output.resolve()
-    write_json(output / "regeneration.json", {"schema": "accepted-world-v1", "namingSeed": seed,
+    write_json(output / "regeneration.json", {"schema": "accepted-world-v2",
+        "engineVersion": __version__,
+        "humanSeed": settings.human_seed, "namingSeed": settings.naming_seed,
         "terrainSeed": recipe.seed, "terrainSchema": provenance["schema"], "status": "building",
         "sourceSha256": sha256(output / "source/physical-reference.png"),
-        "fieldSha256": sha256(output / "source/physical-fields.npz")})
+        "fieldSha256": sha256(output / "source/physical-fields.npz"),
+        "settingsSha256": sha256(output / "world-settings.json")})
     print(f"Accepted terrain verified; {len(prepared['forbidden'])} old names excluded. Building climate and hydrology.", flush=True)
-    grid = attach_world_metadata(load_baseline(prepared["config"]), recipe, provenance,
-        bundle_path=output / "source/physical-fields.npz", bundle_sha256=sha256(output / "source/physical-fields.npz"),
-        naming_seed=seed, forbidden_names=prepared["forbidden"])
-    grid.save(output / "grid")
+    with measure_stage(output, "climate-hydrology"):
+        grid = attach_world_metadata(load_baseline(prepared["config"]), recipe, provenance,
+            bundle_path=output / "source/physical-fields.npz", bundle_sha256=sha256(output / "source/physical-fields.npz"),
+            settings=settings, forbidden_names=prepared["forbidden"])
+        grid.save(output / "grid")
     print(f"Physical grid saved ({time.monotonic() - started:.0f}s). Building society and review layers.", flush=True)
     return publish_accepted_world(output, started=started)
 
@@ -85,19 +119,30 @@ def publish_accepted_world(output: Path, *, started: float | None = None) -> dic
     started = time.monotonic() if started is None else started
     output = output.resolve()
     record = json.loads((output / "regeneration.json").read_text(encoding="utf-8"))
+    if record["engineVersion"] != __version__:
+        raise ValueError("checkpoint engine version differs from the running engine")
     if record["status"] != "building":
         raise ValueError("only an unfinished build can be published")
-    for key, relative in (("sourceSha256", "source/physical-reference.png"), ("fieldSha256", "source/physical-fields.npz")):
+    for key, relative in (
+        ("sourceSha256", "source/physical-reference.png"),
+        ("fieldSha256", "source/physical-fields.npz"),
+        ("settingsSha256", "world-settings.json"),
+    ):
         if sha256(output / relative) != record[key]:
             raise ValueError("accepted input changed after the physical checkpoint")
     forbidden = json.loads((output / "naming-exclusions.json").read_text(encoding="utf-8"))["forbidden"]
     grid = WorldGrid.load(output / "grid")
     request = grid.metadata["societyGeneration"]
-    if request["seed"] != record["namingSeed"] or sorted(request["forbiddenNames"]) != sorted(forbidden):
-        raise ValueError("naming contract changed after the physical checkpoint")
+    if (
+        request["humanSeed"] != record["humanSeed"]
+        or request["namingSeed"] != record["namingSeed"]
+        or sorted(request["forbiddenNames"]) != sorted(forbidden)
+    ):
+        raise ValueError("human generation contract changed after the physical checkpoint")
     name_source, generation_request = _society_generation_request(grid)
-    society = derive_society_layers(grid, derive_thematic_layers(grid), name_source, **generation_request)
-    save_society(society, output / "society", grid_digest=grid.content_digest())
+    with measure_stage(output, "society"):
+        society = derive_society_layers(grid, derive_thematic_layers(grid), name_source, **generation_request)
+        save_society(society, output / "society", grid_digest=grid.content_digest())
     logging.info("Society checkpoint saved; rendering all map views")
     return finish_accepted_world(output, started=started)
 
@@ -107,21 +152,27 @@ def finish_accepted_world(output: Path, *, started: float | None = None) -> dict
     started = time.monotonic() if started is None else started
     output = output.resolve()
     record = json.loads((output / "regeneration.json").read_text(encoding="utf-8"))
+    if record["engineVersion"] != __version__:
+        raise ValueError("checkpoint engine version differs from the running engine")
     if record["status"] != "building":
         raise ValueError("only an unfinished build can be published")
     grid = WorldGrid.load(output / "grid")
     society = load_society(output / "society", expected_grid_digest=grid.content_digest())
     forbidden = grid.metadata["societyGeneration"]["forbiddenNames"]
-    render_review(grid, output / "review", society=society)
+    with measure_stage(output, "render"):
+        render_review(grid, output / "review", society=society)
     society = load_society(output / "review", expected_grid_digest=grid.content_digest())
     audit = naming_audit(society, forbidden)
     write_json(output / "review/naming-audit.json", audit)
-    record = {"schema": "accepted-world-v1", "status": "complete", "worldName": grid.metadata["worldProfile"]["name"],
-        "namingSeed": record["namingSeed"], "terrainSeed": record["terrainSeed"], "gridDigest": grid.content_digest(),
+    record = {"schema": "accepted-world-v2", "status": "complete", "worldName": grid.metadata["worldProfile"]["name"],
+        "engineVersion": __version__,
+        "humanSeed": record["humanSeed"], "namingSeed": record["namingSeed"],
+        "terrainSeed": record["terrainSeed"], "gridDigest": grid.content_digest(),
         "sourceSha256": sha256(output / "source/physical-reference.png"),
         "fieldSha256": sha256(output / "source/physical-fields.npz"),
+        "settingsSha256": sha256(output / "world-settings.json"),
         "nameDigest": audit["nameDigest"], "excludedNameCount": len(forbidden),
-        "elapsedSeconds": round(time.monotonic() - started, 2)}
+        "elapsedSeconds": elapsed_seconds(output)}
     write_json(output / "regeneration.json", record)
     write_json(output / "review/world.json", record)
     print(json.dumps(record, ensure_ascii=False, indent=2), flush=True)
@@ -133,7 +184,7 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--provenance", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--settings", type=Path, required=True)
     parser.add_argument("--exclude", type=Path, nargs="*", default=[])
     parser.add_argument("--legacy-artifacts", type=Path)
     args = parser.parse_args()
@@ -141,7 +192,14 @@ def main() -> None:
     if args.legacy_artifacts:
         exclusions.extend(sorted(args.legacy_artifacts.glob("worldgrid*/review/society.json")))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    build_accepted_world(args.config, args.provenance, args.output, exclusions, seed=args.seed)
+    from world_atlas.settings import load_world_settings
+    build_accepted_world(
+        args.config,
+        args.provenance,
+        args.output,
+        exclusions,
+        settings=load_world_settings(args.settings),
+    )
 
 
 if __name__ == "__main__":

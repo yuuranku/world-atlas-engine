@@ -102,10 +102,9 @@ def fetch_asset(assets: Path, cache: Path, key: str) -> Path:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cache', required=True, type=Path)
-    parser.add_argument('--asset', choices=('engine', 'accepted-v5'), default='engine')
     args = parser.parse_args()
     try:
-        path = fetch_asset(Path(__file__).resolve().parents[1] / 'assets', args.cache, args.asset)
+        path = fetch_asset(Path(__file__).resolve().parents[1] / 'assets', args.cache, 'engine')
     except (OSError, ValueError, KeyError) as error:
         parser.exit(1, f'Download failed: {error}\nCheck network/release access; no unverified package was installed.\n')
     print(json.dumps({'path': str(path), 'sha256': digest(path), 'verified': True}))

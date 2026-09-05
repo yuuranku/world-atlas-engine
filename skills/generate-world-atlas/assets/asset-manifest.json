@@ -1,10 +1,12 @@
 {
-  "engineVersion": "1.1.0",
+  "engineVersion": "1.2.0",
   "files": {
-    "release.json": "65fa79edb6a8f8db5c632604acba3daf52c9ce1d2e2b399f484f904a918dab7c",
+    "release.json": "d845340f5fcdc7f39daa0b0ad05dc6b8746663048538a42053844e1576d90d7f",
     "renderer/package-lock.json": "36e78aa1f672ad8827dff3a8c2cfa447b4fdce3b47d18a9258b871e89bf3d389",
     "renderer/package.json": "bf8375e9e115c9bffee630911ae204a0430b0202a0167730828a3c197e03a792",
     "terrain-v38.acceptance.json": "9cab1f9f1a27b8e3868014c7c67246412412cfbdd35dda52f37e2c40e0800e06",
-    "terrain-v38.json": "a2044d47bd7069b6eaa0612f658f1b275fee42612d3296a39e5ea2c5f52f19c9"
+    "terrain-v38.json": "a2044d47bd7069b6eaa0612f658f1b275fee42612d3296a39e5ea2c5f52f19c9",
+    "terrain.json": "a441a9487e8aadab97f3608914fec37781378bf319f50ec8da90a19b68e4c32c",
+    "world-settings.json": "f04e50cf56fa40ae9f9e9add733dce79322147c43f8f01c5fec79ea30c115bc3"
   }
 }

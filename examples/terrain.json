@@ -1,0 +1,13 @@
+{
+  "seed": 2116268501,
+  "width": 2176,
+  "height": 1088,
+  "plate_count": 14,
+  "continent_count": 8,
+  "land_fraction": 0.35,
+  "tectonic_activity": 0.34,
+  "mountain_density": 0.82,
+  "coastline_detail": 0.28,
+  "north_polar_continent": false,
+  "south_polar_continent": true
+}

@@ -1,4 +1,4 @@
-"""Seal the versioned engine, replay data and lightweight download skill."""
+"""Seal the versioned engine and lightweight download skill."""
 import argparse
 import hashlib
 import json
@@ -29,8 +29,8 @@ def content_files(folder):
             and not {'__pycache__', 'node_modules'}.intersection(p.parts)]
 
 
-def seal(root: Path, inputs: Path) -> dict:
-    root, inputs = root.resolve(), inputs.resolve()
+def seal(root: Path) -> dict:
+    root = root.resolve()
     skill = root / 'skills/generate-world-atlas'
     assets = skill / 'assets'
     dist = root / 'dist'
@@ -38,19 +38,14 @@ def seal(root: Path, inputs: Path) -> dict:
     wheel = dist / f'world_atlas_engine-{version}-py3-none-any.whl'
     if not wheel.is_file() or not (skill / 'SKILL.md').is_file():
         raise ValueError('build the engine wheel first')
-    if not (inputs/'source/physical-fields.npz').is_file():
-        raise ValueError('extract accepted-v5-inputs.zip from the release and pass --inputs <directory>')
-    input_zip = dist / 'accepted-v5-inputs.zip'
-    write_zip(input_zip, {p.relative_to(inputs).as_posix(): p for p in content_files(inputs)})
-    for filename in ('terrain-v38.json', 'terrain-v38.acceptance.json'):
+    for filename in ('terrain.json', 'world-settings.json', 'terrain-v38.json', 'terrain-v38.acceptance.json'):
         (assets/filename).write_text((root/'examples'/filename).read_text(encoding='utf-8'), encoding='utf-8', newline='\n')
     (assets/'renderer').mkdir(exist_ok=True)
     for filename in ('package.json', 'package-lock.json'):
         (assets/'renderer'/filename).write_text((root/'runtime'/filename).read_text(encoding='utf-8'), encoding='utf-8', newline='\n')
     # No circular source/skill ZIP hash in the download descriptor.
     release = {'repository': REPOSITORY, 'engineVersion': version, 'assets': {
-        'engine': {'name': wheel.name, **fingerprint(wheel)},
-        'accepted-v5': {'name': input_zip.name, **fingerprint(input_zip)}}}
+        'engine': {'name': wheel.name, **fingerprint(wheel)}}}
     (assets/'release.json').write_text(json.dumps(release, indent=2)+'\n', encoding='utf-8', newline='\n')
     records = {p.relative_to(assets).as_posix(): fingerprint(p)['sha256']
                for p in sorted(content_files(assets)) if p.name != 'asset-manifest.json'}
@@ -65,12 +60,13 @@ def seal(root: Path, inputs: Path) -> dict:
             entries[path.relative_to(root).as_posix()] = path
     for name in ('pyproject.toml', 'MANIFEST.in', 'README.md', '.gitignore', '.gitattributes',
                  'runtime/package.json', 'runtime/package-lock.json',
+                 'examples/terrain.json', 'examples/world-settings.json',
                  'examples/terrain-v38.json', 'examples/terrain-v38.acceptance.json'):
         entries[name] = root/name
     source_zip = dist / f'world-atlas-engine-{version}-source.zip'
     write_zip(source_zip, entries)
     report = {'repository': REPOSITORY, 'version': version,
-              'files': {p.name: fingerprint(p) for p in (wheel, source_zip, input_zip, skill_zip)}}
+              'files': {p.name: fingerprint(p) for p in (wheel, source_zip, skill_zip)}}
     (dist/'release-manifest.json').write_text(json.dumps(report, indent=2)+'\n', encoding='utf-8', newline='\n')
     return report
 
@@ -78,6 +74,5 @@ def seal(root: Path, inputs: Path) -> dict:
 if __name__ == '__main__':
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--inputs', type=Path, default=root/'examples/accepted-v5')
-    args = parser.parse_args()
-    print(json.dumps(seal(root, args.inputs), indent=2))
+    parser.parse_args()
+    print(json.dumps(seal(root), indent=2))

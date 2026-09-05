@@ -1,10 +1,10 @@
 # 技术路线与实现边界
 
-本文描述 1.1.0 实际代码，不是未来功能清单。计算包不调用 AI；skill 调用计算包并承担需求解释、参考选择、结果判断和人工验收。
+本文描述 1.2.0 实际代码，不是未来功能清单。计算包不调用 AI；skill 调用计算包并承担需求解释、参考选择、结果判断和人工验收。
 
 ## 1. 输入与随机性
 
-`skills/generate-world-atlas/references/questionnaire.md` 定义 15 题；`prepare_brief.py` 保存答案、来源和待确认状态。问卷不是万能参数转换器；每个选项的支持状态须核对，再形成有效配方和 `worldgen.json`。
+`skills/generate-world-atlas/references/questionnaire.md` 定义 17 题；`prepare_brief.py` 保存答案、来源和待确认状态。问卷不是万能参数转换器；每个选项的支持状态须核对，再形成有效配方和 `worldgen.json`。
 
 `api.load_recipe` 严格检查字段、有限数值和 unsigned 32-bit 种子。地形种子决定构造/形态，人文种子决定下游身份与命名；冻结配置与输入 SHA-256。`api._fresh_output` 禁止生成时覆盖旧目录。
 
@@ -12,7 +12,9 @@
 
 主入口 `core/procedural_planet.py`，依赖 `tectonic_foundation.py`、`physical/tectonics.py`、`physical/tectonic_relief.py` 等。先构造板块归属、运动和边界，再建立地壳结构、抬升/裂解与大陆潜势。球面坐标模块承担距离和面积解释；展示采用经纬度展开图。
 
-同一种子对应连续参数化形态，不预置“固定五种大陆图片”。生成过程有启发式约束，并非运行数亿年的完整岩石圈动力学。上游构造参考场为 720×360，v38 最终物理字段为 2176×1088。把展示接缝放在海洋，保持地图左右海洋，不把同一大陆切在两边。
+同一种子对应连续参数化形态，不预置“固定五种大陆图片”。生成过程有启发式约束，并非运行数亿年的完整岩石圈动力学。上游构造参考场为 720×360，v38 最终物理字段为 2176×1088。普通大陆的展示接缝放在海洋。选中的极地大陆覆盖极点，在经纬展开投影中必然横贯所有经度；这一极地条带是左右海洋约束的明确例外。
+
+南北极分别用配方的 `north_polar_continent`、`south_polar_continent` 控制。选择先进入大陆地壳潜势，再进行共同海平面切分和地形计算；不是在成图后贴一块白色冰盖。海冰与陆地是不同字段。四种组合均保持独立选择和目标海陆面积。
 
 ## 3. 连续地表、海岸与海底
 
@@ -68,4 +70,14 @@ v38 样本有 450 个修改岸段，实际位移约 16.58–102.44 km；这是�
 
 下载使用 Python 标准库，不需要先安装下载框架。HTTPS 重定向限定 GitHub 资源域；下载临时文件经长度/哈希核对后才原子加入缓存。发布包哈希属于完整性检查，不是独立签名或第三方安全审计；使用者仍需信任获取的 skill 和发布者。
 
-Python 依赖：NumPy 2.3.5、ContourPy 1.3.3、Pillow 12.3.0、Shapely 2.1.2。完整地图用 Node + 锁定 Mapshaper 0.7.56；截图才需要 Playwright/浏览器。使用者须自行提供 Python/Node 系统程序。npm 锁文件保留传递依赖版本，部分传递包仍有上游弃用提示，本次没有宣称安全审计完成。
+Python 依赖：NumPy 2.3.5、SciPy 1.17.1、ContourPy 1.3.3、Pillow 12.3.0、Shapely 2.1.2。完整地图用 Node + 锁定 Mapshaper 0.7.56；截图才需要 Playwright/浏览器。使用者须自行提供 Python/Node 系统程序。npm 锁文件保留传递依赖版本，部分传递包仍有上游弃用提示，本次没有宣称安全审计完成。
+
+## 9. 生成计算加速
+
+保持生产网格、政治迭代次数和所有通行约束不变。用 [SciPy ndimage](https://docs.scipy.org/doc/scipy/reference/ndimage.html) 的连通标记与棋盘距离变换替换逐格 Python 洪泛和重复整图扩散，显式恢复经度环绕；聚落间距使用局部空间桶，但保留原来的候选顺序、平局规则与精确距离判断。
+
+交通缓存只在同一次世界生成中生效。键包含通行域、代价场和精细修正场的完整 SHA-256，以及有方向的起终点；新增城市不重算未改变的路线，地理代价改变则重新寻路。
+
+政治边界调整先筛选实际邻国与有收益的交换，再检查移走区域后的完整连通性；维护随领土转移同步更新的成员集合，避免每次扫描全世界。没有将“两个邻居”误当断点，也没有省去飞地检查。图连通性的概念参考 [NetworkX 割点说明](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.components.articulation_points.html)，实际这里保留精确遍历，不引入额外图框架。
+
+`tools/profile_generation.py` 定位真实世界热点；`benchmark_spatial.py`、`benchmark_state_boundaries.py` 与发布的 1.1.0 在同输入上比较速度和数组一致性。完整生成把物理、人文、渲染耗时写入 `timing.json`，续跑累计计算时间，不把人工等待算入耗时。

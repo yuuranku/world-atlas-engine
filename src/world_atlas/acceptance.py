@@ -18,7 +18,7 @@ def verify_release(output: Path) -> dict:
     grid = WorldGrid.load(output / "grid")
     society = load_society(output / "review", expected_grid_digest=grid.content_digest())
     forbidden = json.loads((output / "naming-exclusions.json").read_text(encoding="utf-8"))["forbidden"]
-    seed = grid.metadata["societyGeneration"]["seed"]
+    seed = grid.metadata["societyGeneration"]["namingSeed"]
     audit = naming_audit(society, forbidden)
     renamed = assign_world_identity(society, seed=seed, forbidden=forbidden)
     assert audit == naming_audit(renamed, forbidden), "canonical names must be idempotent"
@@ -45,11 +45,20 @@ def verify_release(output: Path) -> dict:
             (sea_crossings if route.mode == "sea" else road_crossings).append(
                 {"route": route.identifier, "count": len(invalid), "examples": invalid[:3]})
     land = grid.water == 0
+    provenance = json.loads((output / "source/provenance.json").read_text(encoding="utf-8"))
+    polar = provenance["recipe"]
+    latitude = 90.0 - (np.arange(land.shape[0]) + .5) * 180.0 / land.shape[0]
+    polar_projection_rows = ((latitude >= 58.0) & polar["north_polar_continent"]) | ((latitude <= -58.0) & polar["south_polar_continent"])
+    polar_errors = []
+    for name, row in (("north", 0), ("south", -1)):
+        if not np.all(land[row] == polar[f"{name}_polar_continent"]):
+            polar_errors.append(name)
     unpartitioned = int(np.count_nonzero((society.politics.state_id > 0) & (society.provinces.province_id == 0)))
     record = {"worldName": grid.metadata["worldProfile"]["name"], "counts": audit["counts"],
         "oldNameMatches": audit["oldNameMatches"] + extra_matches, "duplicateNames": audit["duplicateNames"],
         "coastlineCellMismatches": coastline_errors, "plateCellMismatches": plate_errors,
-        "plateNames": plate_names, "leftRightLandCells": int(land[:, [0, -1]].sum()),
+        "plateNames": plate_names, "leftRightLandCells": int(land[~polar_projection_rows][:, [0, -1]].sum()),
+        "polarProjectionEdgeLandCells": int(land[polar_projection_rows][:, [0, -1]].sum()), "polarChoiceMismatches": polar_errors,
         "unpartitionedStateCells": unpartitioned, "seaRoutesAcrossLand": sea_crossings,
         "roadsAcrossWater": road_crossings, "nameReplayIdentical": True,
         "htmlSha256": hashlib.sha256((output / "review/index.html").read_bytes()).hexdigest()}
@@ -58,6 +67,7 @@ def verify_release(output: Path) -> dict:
     assert not record["oldNameMatches"] and not record["duplicateNames"]
     assert not coastline_errors and not plate_errors and not unpartitioned and not record["leftRightLandCells"]
     assert not sea_crossings and not road_crossings, "transport must remain on its navigable surface"
+    assert not polar_errors, "polar land must match each independent choice"
     return record
 
 

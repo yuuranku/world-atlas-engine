@@ -1487,6 +1487,7 @@ def derive_politics(
     lexicon: NameLexicon,
     *,
     state_count: int | None = None,
+    frontier_target_share: float = 0.35,
     state_formation_profiles: dict[int, StateFormationProfile] | None = None,
 ) -> PoliticalLayers:
     """Grow geography-bounded states from civilization urban networks."""
@@ -1703,7 +1704,7 @@ def derive_politics(
         grid.river_order,
         native_transitions,
         governed_nuclei,
-        target_share=0.35,
+        target_share=frontier_target_share,
     )
     governed_land = coarse_land & ~frontier_reservation
     natural_compartments = natural_compartment_ids(

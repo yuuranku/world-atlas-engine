@@ -4201,6 +4201,12 @@ def prepare_physical_fields(
         context.elevation_levels - 1,
     ).astype(np.int16)
 
+    if procedural_surface is not None:
+        polar_choices = procedural_surface.diagnostics["polarContinents"]
+        generated_north_polar_land_mask = land & polar_latitude_mask & (latitude_rows[:, None] > 0) & polar_choices["north"]
+        generated_south_polar_land_mask = land & polar_latitude_mask & (latitude_rows[:, None] < 0) & polar_choices["south"]
+        generated_polar_land_mask = generated_north_polar_land_mask | generated_south_polar_land_mask
+
     return PhysicalFields(
         source_path=source_path,
         source_sha256=sha256(source_path),

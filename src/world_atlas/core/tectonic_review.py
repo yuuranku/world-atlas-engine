@@ -134,7 +134,9 @@ def derive_tectonic_review(grid: WorldGrid) -> TectonicReview:
             plate_count=requested_plate_count,
         )
     request = grid.metadata.get("societyGeneration", {})
-    registry = NameRegistry(request.get("seed", 0), request.get("forbiddenNames", ()))
+    registry = NameRegistry(
+        request.get("namingSeed", 0), request.get("forbiddenNames", ())
+    )
     plates: list[TectonicPlate] = []
     for plate in foundation.plates:
         name = registry.name(f"plate:{plate.identifier}", plate.identifier % 12, suffix="板块")

@@ -1,0 +1,25 @@
+{
+  "schema": "world-atlas-world-settings-v1",
+  "humanSeed": 445034353,
+  "namingSeed": 3188500066,
+  "planet": {
+    "solarConstantWm2": 1620.0,
+    "radiusKm": 6400.0,
+    "gravityMps2": 9.80665,
+    "rotationPeriodHours": 26.0,
+    "rotationDirection": "retrograde",
+    "orbitalPeriodDays": 420.0,
+    "axialTiltDegrees": 28.0
+  },
+  "society": {
+    "settlementCount": 720,
+    "civilizationCount": 14,
+    "minimumCivilizationCount": 14,
+    "languageCount": 24,
+    "religionCount": 10,
+    "stateCount": 45,
+    "populationMin": 100000000,
+    "populationMax": 160000000,
+    "frontierTargetShare": 0.25
+  }
+}

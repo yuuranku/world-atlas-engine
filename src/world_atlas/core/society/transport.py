@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import heapq
+import hashlib
 import math
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -35,6 +36,35 @@ _TIER_RANK = {"metropolis": 2, "city": 1, "town": 0, "site": 0}
 _ROAD_LOCAL_DEGREE = {"metropolis": 3, "city": 2, "town": 1, "site": 1}
 
 
+@dataclass
+class RoutingCache:
+    """Reuse exact routes within one human-world simulation, never across worlds."""
+
+    paths: dict = field(default_factory=dict)
+    hits: int = 0
+    misses: int = 0
+
+    @staticmethod
+    def signature(*arrays: np.ndarray) -> bytes:
+        digest = hashlib.sha256()
+        for array in arrays:
+            values = np.ascontiguousarray(array)
+            digest.update(str((values.shape, values.dtype.str)).encode())
+            digest.update(memoryview(values).cast("B"))
+        return digest.digest()
+
+    def route(self, signature, friction, valid, start, goal, refinement):
+        key = (signature, start, goal)
+        if key in self.paths:
+            self.hits += 1
+            return self.paths[key]
+        self.misses += 1
+        path = _least_cost_path(friction, valid, start, goal)
+        result = _terrain_safe_simplification(path, refinement, valid) if path else ()
+        self.paths[key] = result
+        return result
+
+
 def _wrapped_distance(
     first: tuple[int, int],
     second: tuple[int, int],
@@ -61,6 +91,10 @@ def _least_cost_path(
         1.0e-9,
         float(valid_friction.min(initial=1.0)),
     )
+    # Buffer access returns native scalars; avoid millions of NumPy scalar
+    # allocations while keeping costs, heap ordering and ties identical.
+    friction = memoryview(np.ascontiguousarray(friction, dtype=np.float64))
+    valid = memoryview(np.ascontiguousarray(valid, dtype=bool))
     costs = {start: 0.0}
     previous: dict[tuple[int, int], tuple[int, int]] = {}
     queue: list[tuple[float, float, int, int]] = [
@@ -522,6 +556,8 @@ def derive_transport(
     thematic: ThematicLayers,
     population: PopulationLayers,
     settlements: tuple[Settlement, ...],
+    *,
+    routing_cache: RoutingCache | None = None,
 ) -> TransportLayers:
     """Build roads and water routes before any state border is generated."""
 
@@ -532,6 +568,7 @@ def derive_transport(
             accessibility=np.zeros(grid.shape, dtype=np.float32),
             routes=(),
         )
+    routing_cache = routing_cache if routing_cache is not None else RoutingCache()
     # The old 360-cell analysis lattice was adequate for accessibility but
     # visibly bridged bays and rounded straight across mountain spurs.  Keep
     # roughly one route node per two authored map pixels instead.
@@ -616,17 +653,15 @@ def derive_transport(
             cell = origin
         cells[settlement.identifier] = cell
     components, _sizes = connected_components(coarse_land)
+    road_signature = routing_cache.signature(friction, coarse_land, full_friction)
     routes: list[TransportRoute] = []
     for source, target in _road_pairs(settlements, cells, components):
-        path = _least_cost_path(friction, coarse_land, cells[source.identifier], cells[target.identifier])
+        path = routing_cache.route(road_signature, friction, coarse_land,
+            cells[source.identifier], cells[target.identifier], full_friction)
         if not path:
             continue
         if step == 1:
-            exact_path = _terrain_safe_simplification(
-                path,
-                full_friction,
-                road_land,
-            )
+            exact_path = path
             world_path = _world_path(
                 exact_path,
                 1,
@@ -708,22 +743,20 @@ def derive_transport(
         )
         by_identifier = {item.identifier: item for item in ports}
         water_friction = np.ones(coarse_water.shape, dtype=np.float64)
+        water_signature = routing_cache.signature(water_friction, coarse_water, water_friction)
         for first, second in sorted(pairs):
             source = by_identifier[first]
             target = by_identifier[second]
-            path = _least_cost_path(
+            path = routing_cache.route(
+                water_signature,
                 water_friction,
                 coarse_water,
                 water_cell[first],
                 water_cell[second],
+                water_friction,
             )
             if not path:
                 continue
-            path = _terrain_safe_simplification(
-                path,
-                water_friction,
-                coarse_water,
-            )
             routes.append(
                 TransportRoute(
                     identifier=f"sea-{len([route for route in routes if route.mode == 'sea']) + 1:04d}",

@@ -2,19 +2,19 @@
 
 ## 安装
 
-本 skill 是轻量下载入口。`assets/release.json` 固定公开仓库、版本、文件长度和 SHA-256；`assets` 只保留它、本地资产清单、v38 配方/指纹与 renderer 的 npm 锁文件。
+本 skill 是轻量下载入口。`assets/release.json` 固定公开仓库、版本、文件长度和 SHA-256；`assets` 保留本地资产清单、当前配方/世界设置样例、历史 v38 配方/指纹与 renderer 的 npm 锁文件。
 
 用 Python 3.14 执行 `scripts/install_engine.py --target <全新独立运行目录>`。脚本核对本地资产，再自动从固定 GitHub Release 下载 wheel，检查长度/哈希后创建局部虚拟环境，安装 wheel 与锁定的 Mapshaper，报告 `runtime.json` 和执行路径。不修改全局 Python/npm，不启动可见后台窗口。
 
 默认缓存位于运行目录同级的 `.world-atlas-downloads/<版本>`；也可显式 `--cache <缓存目录>`。命中仍校验；损坏缓存保留并报错，让用户选新缓存目录，不强行覆盖。下载中断的临时文件不会变成可安装文件。缓存应放在支持硬链接的本地文件系统（已验证 NTFS）。不用 latest，不绕过 HTTPS/哈希，不把访问令牌写入 skill。
 
-`--check-only` 只检查本地清单，不联网也不创建运行目录。仅下载计算包：`python scripts/download_engine.py --cache <缓存目录>`。历史 v5 复现另执行 `python scripts/download_engine.py --asset accepted-v5 --cache <缓存目录>`，然后解压返回的 ZIP 到新目录。新世界不需要下载这份约 32 MB 的历史输入。
+`--check-only` 只检查本地清单，不联网也不创建运行目录。仅下载计算包：`python scripts/download_engine.py --cache <缓存目录>`。历史 v5 输入与其匹配引擎留在 1.1.0 Release，不混入新版安装流程。
 
-安装版本由资产清单 `engineVersion` 决定。1.1.0 修改了连续地表的海岸演化，同一种子/配方的地形将与 1.0.0 不同；复现原地形还必须冻结引擎版本。固定 v5 物理输入的下游复现不受这次地形生成改动影响。
+安装版本由资产清单 `engineVersion` 决定。1.2.0 配方必须明确两个极地选择，完整世界必须提供世界设置；复现历史世界使用其原版引擎。新版不自动迁移或猜测缺失参数。
 
 首次安装需要已有 Python 3.14、Node.js/npm 和网络；运行阶段离线，不需 API key。Mapshaper 0.7.56 是完整地图共享边界的实际依赖，不能漏列。
 
-分享 [完整轻量 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.1.0/generate-world-atlas-skill.zip)，不能只发 SKILL.md。安装到宿主 skills 目录后重新加载技能；首次新世界仍先问 15 题，确认有效参数后才自动下载。源代码和单独 wheel 见 [版本下载页](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.1.0)。不要使用原作者的盘符路径。`--target` 必须是全新目录，安装后使用返回的解释器/Mapshaper 路径。仅安装计算 wheel 时，地形模式只需 Python 及 wheel 声明的库；完整人文地图另需锁定的 Node/Mapshaper。
+分享 [完整轻量 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.2.0/generate-world-atlas-skill.zip)，不能只发 SKILL.md。安装到宿主 skills 目录后重新加载技能；首次新世界仍先问 17 题，确认有效参数后才自动下载。源代码和单独 wheel 见 [版本下载页](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.2.0)。不要使用原作者的盘符路径。`--target` 必须是全新目录，安装后使用返回的解释器/Mapshaper 路径。仅安装计算 wheel 时，地形模式只需 Python 及 wheel 声明的库；完整人文地图另需锁定的 Node/Mapshaper。
 
 ## 入口
 
@@ -24,20 +24,20 @@
 python -m world_atlas doctor --mapshaper <mapshaper>
 python -m world_atlas seeds --root-seed 2116268501 --count 6
 python -m world_atlas terrain --recipe <确认后的配方.json> --output <新地形目录>
-python -m world_atlas world --terrain <认可地形目录> --seed 260905418 --output <新世界目录> --exclude <旧名清单.json> --mapshaper <mapshaper>
-python -m world_atlas reproduce --inputs <解压后的accepted-v5> --output <新复现目录> --mapshaper <mapshaper>
+python -m world_atlas world --terrain <认可地形目录> --settings <确认后的世界设置.json> --output <新世界目录> --exclude <旧名清单.json> --mapshaper <mapshaper>
+python -m world_atlas reproduce --inputs <同版完整世界输入目录> --output <新复现目录> --mapshaper <mapshaper>
 python -m world_atlas verify <完整世界目录>
 ```
 
 `--exclude` 可重复，接受旧 `society.json` 或含 `forbidden` 数组的 JSON。排除已用专名，不全禁“河”“王国”等通称。
 
-`terrain` 产出 source NPZ/PNG、`worldgen.json` 及 `review/index.html`。地形认可后，在这个新目录的配置中修改已支持行星/气候参数并记录，再运行 `world`；不改已发布输入或 fieldBundle 哈希。
+`terrain` 产出 source NPZ/PNG、`worldgen.json` 及 `review/index.html`。地形认可后，把已确认的行星、人文、地形/人文/命名种子写进严格的世界设置 JSON，再运行 `world`；不改已发布输入或 fieldBundle 哈希。设置会复制进成品并参与 SHA-256 校验。
 
 `world` 重算物理网格和人文，保存 source、grid、society、review、命名及语义检查。`verify` 写检查报告，不修改计算数组。
 
 `reproduce` 固定地形，重建后续链路并比较三项语义指纹；这不代表“所有新种子均已验证”。
 
-复现当前地形时使用 `terrain-v38.json`，再对照 `terrain-v38.acceptance.json` 的三个文件哈希及数组指纹。不要使用旧 v5 的 `reproduce` 误称为 v38 地形复现。
+新地形配方参考 `assets/terrain.json`，人文设置参考 `assets/world-settings.json`，两个极地布尔字段必填。历史 v38 用固定 1.1.0 引擎与 `terrain-v38.json` 复现，并对照原 `terrain-v38.acceptance.json`，不能用新版改写旧指纹。
 
 Python API 与 CLI 共用实现：`from world_atlas import generate_terrain, generate_world, reproduce_world, verify_world`。
 

@@ -22,7 +22,7 @@ def main(argv=None) -> int:
     terrain.add_argument("--output", type=Path, required=True)
     world = sub.add_parser("world", help="Generate all downstream systems on an accepted terrain bundle")
     world.add_argument("--terrain", type=Path, required=True)
-    world.add_argument("--seed", type=int, required=True)
+    world.add_argument("--settings", type=Path, required=True)
     world.add_argument("--output", type=Path, required=True)
     world.add_argument("--exclude", type=Path, action="append", default=[])
     world.add_argument("--mapshaper", type=Path)
@@ -40,7 +40,13 @@ def main(argv=None) -> int:
         elif args.command == "terrain":
             result = generate_terrain(args.recipe, args.output)
         elif args.command == "world":
-            result = generate_world(args.terrain, args.output, seed=args.seed, exclusions=args.exclude, mapshaper=args.mapshaper)
+            result = generate_world(
+                args.terrain,
+                args.settings,
+                args.output,
+                exclusions=args.exclude,
+                mapshaper=args.mapshaper,
+            )
         elif args.command == "reproduce":
             result = reproduce_world(args.inputs, args.output, mapshaper=args.mapshaper)
         elif args.command == "verify":

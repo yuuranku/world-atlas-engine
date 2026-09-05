@@ -1,4 +1,4 @@
-"""Record all 15 answers; random choice requires explicit --random."""
+"""Record 17 answers, including independent north/south polar continents."""
 import argparse
 import hashlib
 import json
@@ -10,20 +10,28 @@ def build_brief(answers: str | None, *, randomize: bool, seed: int) -> dict:
     if isinstance(seed, bool) or not 0 <= seed < 2**32:
         raise ValueError("seed must be unsigned 32-bit")
     if randomize:
-        selected = {str(i): 'ABC'[int.from_bytes(hashlib.sha256(f'world-atlas-15-v1:{seed}:{i}'.encode()).digest()[:8], 'big') % 3] for i in range(1, 16)}
+        selected = {str(i): 'ABC'[int.from_bytes(hashlib.sha256(f'world-atlas-17-v1:{seed}:{i}'.encode()).digest()[:8], 'big') % 3] for i in range(1, 18)}
     else:
         parts = re.split(r'[\s,，;；]+', (answers or '').strip())
         selected = {}
         for part in parts:
-            match = re.fullmatch(r'(1[0-5]|[1-9])([ABCabc])', part)
+            match = re.fullmatch(r'(1[0-7]|[1-9])([ABCabc])', part)
             if not match or match[1] in selected:
-                raise ValueError("provide all 15 answers exactly once, e.g. 1B 2A ... 15C")
+                raise ValueError("provide all 17 answers exactly once, e.g. 1B 2A ... 17C")
             selected[match[1]] = match[2].upper()
-        if len(selected) != 15:
-            raise ValueError("all 15 answers are required; do not silently fill missing choices")
-    return {"schema": "world-atlas-15-v1", "questionnaireSeed": seed,
+        if len(selected) != 17:
+            raise ValueError("all 17 answers are required; do not silently fill missing choices")
+    polar = {}
+    for question, pole in (("1", "north"), ("2", "south")):
+        choice = selected[question]
+        enabled = choice == "A"
+        if choice == "C":
+            enabled = bool(hashlib.sha256(f'world-atlas-17-v1:{seed}:polar:{pole}'.encode()).digest()[0] & 1)
+        polar[f"{pole}_polar_continent"] = enabled
+    return {"schema": "world-atlas-17-v1", "questionnaireSeed": seed,
             "selection": "explicit-random-request" if randomize else "player-answers",
-            "answers": {str(i): selected[str(i)] for i in range(1, 16)},
+            "answers": {str(i): selected[str(i)] for i in range(1, 18)},
+            "terrainConstraints": polar,
             "status": "awaiting-parameter-confirmation", "effectiveParameters": {}, "unsupportedChoices": [],
             "instruction": "Confirm conflicts and engine support before generation. Empty unsupportedChoices is not a validation result."}
 

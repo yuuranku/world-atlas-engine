@@ -8,6 +8,7 @@ from collections import Counter, deque
 from collections.abc import Sequence
 
 import numpy as np
+from scipy import ndimage
 
 from ..model import WorldGrid
 from ..polar import polar_continent_mask
@@ -31,31 +32,26 @@ def connected_components(mask: np.ndarray) -> tuple[np.ndarray, tuple[int, ...]]
     allowed = np.asarray(mask, dtype=bool)
     if allowed.ndim != 2:
         raise ValueError("connected_components expects a two-dimensional mask")
-    labels = np.zeros(allowed.shape, dtype=np.int32)
-    sizes: list[int] = []
-    height, width = allowed.shape
-    label = 0
-    for row, column in zip(*np.nonzero(allowed), strict=True):
-        if labels[row, column] != 0:
-            continue
-        label += 1
-        size = 0
-        queue = deque([(int(row), int(column))])
-        labels[row, column] = label
-        while queue:
-            current_row, current_column = queue.popleft()
-            size += 1
-            for dy, dx in ((-1, 0), (0, -1), (0, 1), (1, 0)):
-                next_row = current_row + dy
-                if next_row < 0 or next_row >= height:
-                    continue
-                next_column = (current_column + dx) % width
-                if allowed[next_row, next_column] and labels[next_row, next_column] == 0:
-                    labels[next_row, next_column] = label
-                    queue.append((next_row, next_column))
-        sizes.append(size)
+    labels, count = ndimage.label(allowed, output=np.int32)
+    # Native four-neighbour labelling has finite edges. Merge only matching
+    # longitude edges, then keep the first row-major cell's numbering.
+    parents = np.arange(count + 1, dtype=np.int32)
+    if allowed.shape[1]:
+        for left, right in zip(labels[:, 0], labels[:, -1], strict=True):
+            if not left or not right:
+                continue
+            while parents[left] != left:
+                left = parents[left]
+            while parents[right] != right:
+                right = parents[right]
+            parents[max(left, right)] = min(left, right)
+    for identifier in range(1, count + 1):
+        parents[identifier] = parents[parents[identifier]]
+    roots, remap = np.unique(parents, return_inverse=True)
+    labels = remap[labels].astype(np.int32)
+    sizes = tuple(int(value) for value in np.bincount(labels.ravel(), minlength=len(roots))[1:])
     labels.setflags(write=False)
-    return labels, tuple(sizes)
+    return labels, sizes
 
 
 def society_domain_mask(grid: WorldGrid) -> np.ndarray:
@@ -125,12 +121,33 @@ def select_spaced_seeds(
         return ()
     flat = np.flatnonzero(allowed & np.isfinite(values))
     order = flat[np.lexsort((flat, -values.reshape(-1)[flat]))]
+    return select_spaced_candidates(order, values.shape, count=count, minimum_distance=minimum_distance)
+
+
+def select_spaced_candidates(order, shape, *, count, minimum_distance, occupied=()):
+    """Filter ranked cells by exact wrapped spacing using local buckets."""
+    if count < 1:
+        return ()
     chosen: list[tuple[int, int]] = []
-    width = values.shape[1]
+    width = shape[1]
+    bucket_size = max(float(minimum_distance), 1.0)
+    buckets: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for row, column in occupied:
+        buckets.setdefault((math.floor(row / bucket_size), math.floor(column / bucket_size)), []).append((row, column))
     for index in order:
-        row, column = np.unravel_index(int(index), values.shape)
+        row, column = np.unravel_index(int(index), shape)
+        row, column = int(row), int(column)
         separated = True
-        for other_row, other_column in chosen:
+        bucket_row = math.floor(row / bucket_size)
+        nearby = []
+        # Query all three longitude images; this also handles a partial bin
+        # at the seam, without changing the exact wrapped distance test.
+        column_bins = {math.floor((column + shift) / bucket_size) + offset
+                       for shift in (-width, 0, width) for offset in (-1, 0, 1)}
+        for bin_row in (bucket_row - 1, bucket_row, bucket_row + 1):
+            for bin_column in column_bins:
+                nearby.extend(buckets.get((bin_row, bin_column), ()))
+        for other_row, other_column in nearby:
             dx = abs(column - other_column)
             dx = min(dx, width - dx)
             if math.hypot(row - other_row, dx) < minimum_distance:
@@ -138,6 +155,7 @@ def select_spaced_seeds(
                 break
         if separated:
             chosen.append((int(row), int(column)))
+            buckets.setdefault((bucket_row, math.floor(column / bucket_size)), []).append((row, column))
             if len(chosen) == count:
                 break
     return tuple(chosen)

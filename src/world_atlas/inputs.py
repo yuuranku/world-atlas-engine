@@ -23,6 +23,7 @@ from world_atlas.core.procedural_planet import (
 )
 from world_atlas.core.render import render_review
 from world_atlas.core.society.world_identity import NameRegistry
+from world_atlas.settings import WorldSettings
 
 
 SEED = 2116268501
@@ -72,6 +73,8 @@ def default_recipe(*, width: int = 2176, height: int = 1088) -> PlanetRecipe:
         tectonic_activity=0.34,
         mountain_density=0.82,
         coastline_detail=0.28,
+        north_polar_continent=False,
+        south_polar_continent=False,
     )
 
 
@@ -257,10 +260,10 @@ def attach_world_metadata(
     *,
     bundle_path: str | Path,
     bundle_sha256: str,
-    naming_seed: int | None = None,
+    settings: WorldSettings,
     forbidden_names: tuple[str, ...] = (),
 ) -> WorldGrid:
-    naming_seed = recipe.seed if naming_seed is None else naming_seed
+    naming_seed = settings.naming_seed
     world_name = NameRegistry(naming_seed, forbidden_names).name("world", 9)
     metadata = dict(grid.metadata)
     coordinate_reference_system = dict(metadata["coordinateReferenceSystem"])
@@ -302,15 +305,9 @@ def attach_world_metadata(
     }
     metadata["societyGeneration"] = {
         "namingProfile": "procedural",
-        "seed": naming_seed,
-        "settlementCount": 720,
-        "civilizationCount": 14,
-        "minimumCivilizationCount": 14,
-        "languageCount": 24,
-        "religionCount": 10,
-        "stateCount": 80,
-        "populationMin": 100_000_000,
-        "populationMax": 160_000_000,
+        "humanSeed": settings.human_seed,
+        "namingSeed": settings.naming_seed,
+        **dict(settings.society),
     }
     if forbidden_names:
         metadata["societyGeneration"]["forbiddenNames"] = tuple(sorted(set(forbidden_names)))
