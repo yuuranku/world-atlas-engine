@@ -71,6 +71,6 @@ description: 用可复现的 world-atlas-engine 生成与迭代架空世界地�
 - 城市、交通、文化、宗教、政治、命名：`references/human-world.md`。
 - 对照、调试或交付：`references/acceptance.md`。
 
-当前引擎为 1.2.1，新增南北极独立大陆约束。历史认可地形基准 v38 固定在 1.1.0；配方与指纹见 `assets/terrain-v38.json` 和 `assets/terrain-v38.acceptance.json`。后续沿用其分段海岸生成逻辑，不退回旧平滑岸线。v5 输入仅用于历史人文复现；所有基准都不是新世界默认模板或专名词库。
+当前引擎为 1.3.0，新增断层段式宏观岸线、方向性褶皱山系和参考场群岛生成；南北极独立大陆约束继续保留。历史认可地形基准 v38 固定在 1.1.0；配方与指纹见 `assets/terrain-v38.json` 和 `assets/terrain-v38.acceptance.json`。后续沿用其分段海岸生成逻辑，不退回旧平滑岸线。v5 输入仅用于历史人文复现；所有基准都不是新世界默认模板或专名词库。
 
 源码与版本下载：[world-atlas-engine](https://github.com/yuuranku/world-atlas-engine)。本 skill 不内含计算 wheel 或历史物理数据；只下载当前任务需要的资源。不要求 GitHub 登录或 API key，不自动安装系统级 Python/Node。发布和安装维护任务不等于新建世界，不因此重新提问或重算地图。

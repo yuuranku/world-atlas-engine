@@ -1,11 +1,12 @@
 {
-  "engineVersion": "1.2.1",
+  "engineVersion": "1.3.0",
   "files": {
-    "release.json": "b911b9a70d69b8a553f75c5af9145b29a0810ddc9ba0a029354c1fdb0a1c0f11",
+    "release.json": "f57f462bc9be027e76d5db71e4a1716b8e82dbe296ccfb50913cdc7437ddab71",
     "renderer/package-lock.json": "36e78aa1f672ad8827dff3a8c2cfa447b4fdce3b47d18a9258b871e89bf3d389",
     "renderer/package.json": "bf8375e9e115c9bffee630911ae204a0430b0202a0167730828a3c197e03a792",
     "terrain-v38.acceptance.json": "9cab1f9f1a27b8e3868014c7c67246412412cfbdd35dda52f37e2c40e0800e06",
     "terrain-v38.json": "a2044d47bd7069b6eaa0612f658f1b275fee42612d3296a39e5ea2c5f52f19c9",
+    "terrain-v39.json": "44d3bf2cd065673c0dd9487494919920de6eaa85d781048b2d8d1af1117eb7be",
     "terrain.json": "a441a9487e8aadab97f3608914fec37781378bf319f50ec8da90a19b68e4c32c",
     "world-settings.json": "f04e50cf56fa40ae9f9e9add733dce79322147c43f8f01c5fec79ea30c115bc3"
   }

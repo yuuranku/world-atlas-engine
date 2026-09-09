@@ -2,16 +2,16 @@
 
 从板块、海陆与连续地形，到水系、城市、交通、文化、宗教、国家和省份的可复现世界生成器。计算代码与 AI 工作流分离：引擎离线计算，skill 负责先问 17 个世界设定问题、解释参数、参考研究和看图验收。
 
-当前版本 **1.2.1**，采用已认可的 **v38 分段海岸演化**，并把玩家确认的星球与人文参数写入严格的世界设置文件。新增南北极大陆独立选择和计算加速，问卷由 15 题扩展为 17 题。这不是地球地图换名，也不是调用生图模型画一张无法复算的图片。
+当前版本 **1.3.0**，在已认可的 **v38 分段海岸演化**基础上加入断层段式宏观岸线、方向性褶皱山系和参考场群岛生成；并把玩家确认的星球与人文参数写入严格的世界设置文件。南北极大陆独立选择和计算加速仍然保留，问卷由 15 题扩展为 17 题。这不是地球地图换名，也不是调用生图模型画一张无法复算的图片。
 
 ![v38 引擎实际生成的地形底图](docs/images/v38-terrain.png)
 
 ## 下载与开始
 
-- [下载 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.2.1/generate-world-atlas-skill.zip)：内含问卷、规则、下载与安装脚本。
-- [下载计算 wheel](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.2.1/world_atlas_engine-1.2.1-py3-none-any.whl)：供 Python/CLI 直接调用。
-- [下载独立源码包](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.2.1/world-atlas-engine-1.2.1-source.zip)。
-- [全部附件与 SHA-256 清单](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.2.1)。
+- [下载 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.3.0/generate-world-atlas-skill.zip)：内含问卷、规则、下载与安装脚本。
+- [下载计算 wheel](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.3.0/world_atlas_engine-1.3.0-py3-none-any.whl)：供 Python/CLI 直接调用。
+- [下载独立源码包](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.3.0/world-atlas-engine-1.3.0-source.zip)。
+- [全部附件与 SHA-256 清单](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.3.0)。
 
 ### 使用 skill
 
@@ -30,7 +30,7 @@ python scripts/install_engine.py --target ./atlas-runtime
 
 安装器仅创建本地虚拟环境和 renderer，不修改系统 Python/npm。输出 `atlas-runtime/runtime.json`，包含可直接调用的 Python 与 Mapshaper 绝对路径。已有环境沿用并运行 `doctor` 检查；不要对同一个目录重复安装。
 
-包按固定 tag + SHA-256 下载，不追踪 `latest`。成功下载缓存在 `.world-atlas-downloads/1.2.1`；使用前再次校验。网络中断、文件截断或哈希不符会停止，未经验证的 wheel 不会安装。缓存需支持硬链接的本地文件系统（已测 NTFS）。已安装成功的环境可离线计算；缓存 wheel 不等于缓存了全部第三方依赖。
+包按固定 tag + SHA-256 下载，不追踪 `latest`。成功下载缓存在 `.world-atlas-downloads/1.3.0`；使用前再次校验。网络中断、文件截断或哈希不符会停止，未经验证的 wheel 不会安装。缓存需支持硬链接的本地文件系统（已测 NTFS）。已安装成功的环境可离线计算；缓存 wheel 不等于缓存了全部第三方依赖。
 
 ### 直接使用计算包
 
@@ -81,13 +81,13 @@ flowchart TD
   M --> E[机器检查 + 复现检查 + 实际浏览器验收]
 ```
 
-详见 [技术路线与实现边界](docs/TECHNICAL_ROUTE.md)、[1.2.1 性能与两极设置实测](docs/performance-1.2.0.md)、[海岸改进记录](docs/coastline-1.1.0.md)、[历史抽取与验证](docs/VALIDATION.md)。
+详见 [技术路线与实现边界](docs/TECHNICAL_ROUTE.md)、[1.3.0 地形迭代记录](docs/terrain-1.3.0.md)、[1.2.1 性能与两极设置实测](docs/performance-1.2.0.md)、[海岸改进记录](docs/coastline-1.1.0.md)、[历史抽取与验证](docs/VALIDATION.md)。
 
 地形、水系和政区使用同源物理字段，不在 SVG 上另画一套地理；海岸修改发生在连续高度场的海平面切分之前。沿用现有 SVG/等高线画法。国家和省份受山地、河流、桥梁通达性、文化和实际交通网络影响；不是完整流域的机械套色。
 
 ## 可复现与限制
 
-保存 **引擎版本 + 依赖版本 + 配方 + 地形/人文/命名种子 + 输入哈希**，不只是一个 seed。1.2.1 的极地约束改变地形；1.1.0 与 1.0.0 的海岸实现不同。
+保存 **引擎版本 + 依赖版本 + 配方 + 地形/人文/命名种子 + 输入哈希**，不只是一个 seed。1.3.0 的岸线、褶皱山系和群岛适配改变地形；1.2.1 的极地约束也仍然影响输入；1.1.0 与 1.0.0 的海岸实现不同。
 
 - v38 生产地形 2176×1088；上游构造参考场仍为 720×360，不宣称全部阶段同分辨率。
 - 这是构造与地貌的程序化近似，不是标定过的地幔、地壳或历史政治求解器。

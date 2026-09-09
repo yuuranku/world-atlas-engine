@@ -38,7 +38,7 @@ def seal(root: Path) -> dict:
     wheel = dist / f'world_atlas_engine-{version}-py3-none-any.whl'
     if not wheel.is_file() or not (skill / 'SKILL.md').is_file():
         raise ValueError('build the engine wheel first')
-    for filename in ('terrain.json', 'world-settings.json', 'terrain-v38.json', 'terrain-v38.acceptance.json'):
+    for filename in ('terrain.json', 'world-settings.json', 'terrain-v38.json', 'terrain-v38.acceptance.json', 'terrain-v39.json'):
         (assets/filename).write_text((root/'examples'/filename).read_text(encoding='utf-8'), encoding='utf-8', newline='\n')
     (assets/'renderer').mkdir(exist_ok=True)
     for filename in ('package.json', 'package-lock.json'):
@@ -61,7 +61,8 @@ def seal(root: Path) -> dict:
     for name in ('pyproject.toml', 'MANIFEST.in', 'README.md', '.gitignore', '.gitattributes',
                  'runtime/package.json', 'runtime/package-lock.json',
                  'examples/terrain.json', 'examples/world-settings.json',
-                 'examples/terrain-v38.json', 'examples/terrain-v38.acceptance.json'):
+                 'examples/terrain-v38.json', 'examples/terrain-v38.acceptance.json',
+                 'examples/terrain-v39.json'):
         entries[name] = root/name
     source_zip = dist / f'world-atlas-engine-{version}-source.zip'
     write_zip(source_zip, entries)

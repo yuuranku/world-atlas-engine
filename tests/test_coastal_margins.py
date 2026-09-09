@@ -68,6 +68,31 @@ class CoastalMarginTests(unittest.TestCase):
         repeated, _ = planet._evolve_coastal_margins(relative, quiet, boundary, velocity, velocity, 819, .28)
         np.testing.assert_array_equal(delta, repeated)
 
+    def test_directional_orogen_is_seeded_and_has_parallel_variation(self):
+        from world_atlas.core import procedural_planet as planet
+        from world_atlas.physical.planetary_grid import build_lat_lon_grid
+
+        grid = build_lat_lon_grid(36, 72)
+        sources = np.zeros(grid.shape, dtype=bool)
+        sources[17:19, 12:60] = True
+        affinity = np.ones(grid.shape, dtype=np.float64)
+        first = planet._directional_orogenic_belt(
+            grid, sources, affinity, seed=819, width_km=260.0,
+            amplitude_m=2400.0,
+        )
+        repeated = planet._directional_orogenic_belt(
+            grid, sources, affinity, seed=819, width_km=260.0,
+            amplitude_m=2400.0,
+        )
+        other = planet._directional_orogenic_belt(
+            grid, sources, affinity, seed=820, width_km=260.0,
+            amplitude_m=2400.0,
+        )
+        np.testing.assert_array_equal(first, repeated)
+        self.assertGreater(float(np.max(first)), 100.0)
+        self.assertGreater(float(np.ptp(first[14:23, 12:60])), 200.0)
+        self.assertGreater(int(np.count_nonzero(first != other)), 100)
+
 
 if __name__ == '__main__':
     unittest.main()

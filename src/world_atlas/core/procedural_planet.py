@@ -19,6 +19,7 @@ from typing import Mapping, Sequence
 import numpy as np
 from PIL import Image
 from world_atlas.core.geomorphology import relax_hillslopes
+from world_atlas.core.coastal_margins import margin_motion
 
 from world_atlas.core.planet_morphology import (
     WorldMorphology,
@@ -30,6 +31,7 @@ from world_atlas.core.planet_morphology import (
 
 from world_atlas.physical.boundary_chains import merge_boundary_segments, smooth_boundary_chains  # noqa: E402
 from world_atlas.physical.hydrology import HydrologyConfig, compute_hydrology  # noqa: E402
+from world_atlas.physical.island_generation import generate_shelf_archipelagos  # noqa: E402
 from world_atlas.physical.planetary_grid import (  # noqa: E402
     LatLonGrid,
     build_lat_lon_grid,
@@ -1355,8 +1357,17 @@ def _crust_accommodation_footprint(along_km, across_km, length_km, half_width_km
     displacement = np.asarray(across_km) - axis
     tip = np.sqrt(np.clip(1.04 - t, 0.0, 1.0))
     phase_left, phase_right = rng.uniform(-math.pi, math.pi, 2)
-    left = half_width_km * tip * (0.88 + 0.26 * np.sin(7.0 * t + phase_left))
-    right = half_width_km * tip * (0.94 + 0.30 * np.sin(5.0 * t + phase_right))
+    # A fault block margin changes width at relay zones.  Interpolated seeded
+    # controls keep those changes broad and geologic instead of pixel-noisy.
+    block_t = np.linspace(0.0, 1.04, 9)
+    left_blocks = np.interp(
+        np.clip(t, 0.0, 1.04), block_t, rng.uniform(0.72, 1.26, len(block_t))
+    )
+    right_blocks = np.interp(
+        np.clip(t, 0.0, 1.04), block_t, rng.uniform(0.74, 1.28, len(block_t))
+    )
+    left = half_width_km * tip * left_blocks * (0.88 + 0.26 * np.sin(7.0 * t + phase_left))
+    right = half_width_km * tip * right_blocks * (0.94 + 0.30 * np.sin(5.0 * t + phase_right))
     bank = np.where(displacement < 0.0, left, right)
     boundary = np.minimum(bank - np.abs(displacement), (1.04 - t) * length_km)
     boundary = np.minimum(boundary, (t + 1.0) * length_km)
@@ -1495,9 +1506,39 @@ def _coastal_margin_field(
             minor_axis = float(rng.uniform(190.0, 520.0))
             amplitude = float(rng.uniform(0.50, 1.02))
 
+        # A coast is displaced by several fault blocks, not by a single
+        # ellipse.  Use the same piecewise motion model as the final margin
+        # evolution here, while the crust is still continuous.  The knot
+        # offsets make long shores change direction at structural relay zones
+        # instead of returning a round, radial bay.
+        motion_family = {
+            "rift-inlet": "rift",
+            "tectonic-cape": "active",
+            "embayment": "passive",
+            "peninsula": "transform",
+        }[family]
+        motion_normal, motion_tangent, _motion_support = margin_motion(
+            along if make_gulf else -along,
+            across,
+            major_axis,
+            max(minor_axis * 1.55, 180.0),
+            float(rng.uniform(135.0, 330.0)),
+            seed=int(rng.integers(0, 2**63)),
+            family=motion_family,
+        )
+        deformed_along = (
+            (along if make_gulf else -along)
+            + 0.74 * motion_tangent
+            + 155.0 * margin_shape
+        )
+        deformed_across = (
+            across
+            - 1.12 * motion_normal
+            + minor_axis * (0.42 * margin_shape + 0.24 * margin_fabric)
+        )
         footprint = _crust_accommodation_footprint(
-            (along if make_gulf else -along) + 95.0 * margin_shape,
-            across + minor_axis * (0.30 * margin_shape + 0.16 * margin_fabric),
+            deformed_along,
+            deformed_across,
             major_axis, minor_axis, int(rng.integers(0, 2**63)),
         )
         footprint[forward < 0.0] = 0.0
@@ -1518,6 +1559,12 @@ def _coastal_margin_field(
         else:
             result += amplitude * footprint
 
+    # A final low-amplitude grain follows the measured coast itself. It is
+    # deliberately confined to the outer few hundred kilometres, so the
+    # interior stays coherent while the shoreline gains alternating coves,
+    # headlands and fault-block notches at map scale.
+    coast_grain = np.exp(-0.5 * np.square(inside_distance_km / 320.0))
+    result += 0.18 * coast_grain * margin_fabric
     return _smooth_field(result.astype(np.float32), radius=1, passes=1), len(selected)
 
 
@@ -1632,7 +1679,44 @@ def _continental_crust(
         morphology,
         seed,
     )
-    potential_grid += margin_field
+    # Margin displacement is part of the pre-sea-level crust field. Give it a
+    # meaningful share of the continentality signal so capes and fault-block
+    # embayments survive the later weighted sea-level cut instead of being
+    # ironed back into circular travel-time coastlines.
+    potential_grid += (
+        1.34 + 0.72 * morphology.crust_fragmentation
+    ) * margin_field
+
+    # Continental shelves are not circular halos around a land seed.  They
+    # are broken into long structural blocks by passive-margin flexure,
+    # transform offsets and old rift scars.  Couple a broad multi-scale field
+    # to the measured coast distance so the sea-level contour gains real
+    # capes, hooked bays and offset shelves without painting lines into the
+    # open ocean or roughening the continental interior.
+    coast_distance_km = np.minimum(inside_distance, outside_distance)
+    shelf_macro = _spherical_band_noise(
+        grid.shape[0],
+        grid.shape[1],
+        seed ^ 0x4F1BBCDCBFA54001,
+        ((5.5, 0.46, 5), (9.0, 0.34, 5), (15.5, 0.24, 4), (27.0, 0.13, 4)),
+    ).astype(np.float64)
+    shelf_relay = _spherical_band_noise(
+        grid.shape[0],
+        grid.shape[1],
+        seed ^ 0x8D58AC26AFE12E47,
+        ((11.0, 0.42, 5), (23.0, 0.30, 5), (41.0, 0.18, 4)),
+    ).astype(np.float64)
+    shelf_blocks = np.tanh(1.72 * (0.72 * shelf_macro + 0.28 * shelf_relay))
+    shelf_support = np.exp(-0.5 * np.square(coast_distance_km / 560.0))
+    shelf_strength = 0.27 + 0.20 * morphology.crust_fragmentation
+    potential_grid += shelf_strength * shelf_support * shelf_blocks
+    # A second, narrower relay band adds asymmetrical notches at the edge of
+    # individual blocks while decaying before it can create visible ocean
+    # contour rings.
+    relay_support = np.exp(-0.5 * np.square(coast_distance_km / 265.0))
+    potential_grid += (
+        0.10 + 0.08 * morphology.crust_fragmentation
+    ) * relay_support * shelf_relay * np.sign(shelf_blocks)
     texture = _spherical_fbm(
         grid.shape[0],
         grid.shape[1],
@@ -1742,6 +1826,12 @@ def _continental_crust(
     return field > level, field, float(level), {
         "macroMarginFeatureCount": macro_margin_feature_count,
         "coastalRiftCount": coastal_rift_count,
+        "coastalShelfField": {
+            "model": "distance-coupled-fault-block-shelf",
+            "supportWidthKm": 560.0,
+            "relayWidthKm": 265.0,
+            "strength": float(shelf_strength),
+        },
         "crustTransport": transport_metrics,
     }
 
@@ -1866,7 +1956,10 @@ def _hotspot_uplift(
     uplift = np.zeros(grid.cell_count, dtype=np.float64)
     candidate_weight = np.cos(np.radians(grid.latitude_degrees.reshape(-1)[candidates]))
     candidate_weight /= np.sum(candidate_weight)
-    chain_count = 1 + int(round(3.0 * morphology.hotspot_activity))
+    # Several independent mantle tracks keep deep-ocean islands from
+    # collapsing into one decorative chain. Tracks are still seeded from
+    # plate motion, so their spacing and orientation remain reproducible.
+    chain_count = 2 + int(round(4.0 * morphology.hotspot_activity))
     for _ in range(chain_count):
         start_index = int(rng.choice(candidates, p=candidate_weight))
         start = vectors[start_index]
@@ -1876,13 +1969,13 @@ def _hotspot_uplift(
             direction = _tangent_direction(start, rng)
         else:
             direction /= np.linalg.norm(direction)
-        island_count = 5 + int(round(7.0 * morphology.hotspot_activity))
+        island_count = 7 + int(round(10.0 * morphology.hotspot_activity))
         for ordinal in range(island_count):
             age = ordinal / max(island_count - 1, 1)
-            angle = math.radians(ordinal * float(rng.uniform(1.4, 2.3)))
+            angle = math.radians(ordinal * float(rng.uniform(2.3, 3.8)))
             centre = math.cos(angle) * start - math.sin(angle) * direction
             centre /= np.linalg.norm(centre)
-            radius = math.radians(0.75 + 0.95 * (1.0 - age))
+            radius = math.radians(0.38 + 0.72 * (1.0 - age))
             separation = np.arccos(np.clip(vectors @ centre, -1.0, 1.0))
             amplitude = (3550.0 + 1150.0 * morphology.hotspot_activity) * (1.0 - 0.58 * age)
             # These profiles are complete edifice heights above the floor,
@@ -1891,6 +1984,190 @@ def _hotspot_uplift(
             uplift = np.maximum(uplift, amplitude * np.exp(-0.5 * np.square(separation / radius)))
     uplift[~oceanic] = 0.0
     return uplift.reshape(grid.shape)
+
+
+def _directional_orogenic_belt(
+    grid: LatLonGrid,
+    source_mask: np.ndarray,
+    land_affinity: np.ndarray,
+    *,
+    seed: int,
+    width_km: float,
+    amplitude_m: float,
+    age_factor: float = 1.0,
+) -> np.ndarray:
+    """Raise a broken, directional mountain belt from a tectonic seam.
+
+    Isotropic noise is good at making terrain look busy, but it makes every
+    mountain look like a rounded hill.  This field keeps the causal distance
+    to a convergent seam, then adds parallel sub-ranges, relay gaps and a
+    long-wavelength along-strike gate.  The result reads as an orogen with a
+    spine and foothills rather than a collection of radial blobs.
+    """
+
+    sources = np.asarray(source_mask, dtype=bool)
+    if not np.any(sources):
+        return np.zeros(grid.shape, dtype=np.float64)
+    distance = _distance_from_sources(sources, grid)
+    belt = np.exp(-0.5 * np.square(distance / max(width_km, 1.0)))
+    fold = _normalise(
+        1.0
+        - np.abs(
+            _spherical_band_noise(
+                grid.shape[0],
+                grid.shape[1],
+                seed ^ 0xA54FF53A5F1D36F1,
+                ((7.0, 0.46, 5), (13.0, 0.32, 5), (23.0, 0.22, 4)),
+            )
+        )
+    )
+    along = _normalise(
+        _smooth_field(
+            _spherical_fbm(
+                grid.shape[0],
+                grid.shape[1],
+                seed ^ 0x510E527FADE682D1,
+                detail=0.22,
+            ),
+            radius=4,
+            passes=2,
+        )
+    )
+    rng = np.random.Generator(np.random.PCG64(seed ^ 0x6A09E667F3BCC909))
+    phase = float(rng.uniform(-math.pi, math.pi))
+    # Alternating parallel ridges model folded bands and intervening valleys;
+    # their spacing changes with geological age instead of repeating globally.
+    subranges = 0.18 + 0.82 * (
+        0.5
+        + 0.5
+        * np.cos(
+            distance / max(width_km * (0.24 + 0.06 * age_factor), 1.0)
+            + phase
+        )
+    )
+    relay_gate = 0.20 + 0.80 * np.power(along, 0.78)
+    ridge = belt * (
+        0.16
+        + 0.84 * np.power(fold, 1.42)
+    ) * subranges * relay_gate
+    # Orogens weaken through old, eroded shoulders but still leave a broad
+    # foreland rise that links the belt to surrounding plateaus.
+    shoulder = np.exp(-0.5 * np.square(distance / max(width_km * 1.9, 1.0)))
+    relief = (
+        amplitude_m * age_factor * ridge
+        + amplitude_m * age_factor * 0.24 * shoulder * (0.35 + 0.65 * along)
+    )
+    return relief * np.power(np.clip(land_affinity, 0.0, 1.0), 1.52)
+
+
+def _shelf_archipelago_uplift(
+    grid: LatLonGrid,
+    continental_mask: np.ndarray,
+    signed_relief: np.ndarray,
+    crust: CrustFields,
+    *,
+    seed: int,
+    group_limit: int,
+    islands_per_group: int,
+) -> tuple[np.ndarray, Mapping[str, object]]:
+    """Return seeded uplift for shelf fragments, arcs and hotspot groups.
+
+    The existing island generator already models four geologic families and
+    produces organic, disconnected coasts.  This adapter feeds it the same
+    reference-grid crust and relief fields used by the planet surface, so
+    islands participate in the sea-level cut instead of being painted on top.
+    """
+
+    land = np.asarray(continental_mask, dtype=bool)
+    ocean = ~land
+    if not np.any(ocean):
+        return np.zeros(grid.shape, dtype=np.float64), {
+            "groupCount": 0,
+            "islandCount": 0,
+            "islandCellCount": 0,
+        }
+    ocean_depth = np.zeros(grid.shape, dtype=np.float64)
+    oceanic = np.asarray(crust.kind) == CRUST_OCEANIC
+    valid_age = ocean & oceanic & np.isfinite(crust.ocean_age_myr)
+    ocean_depth[valid_age] = np.clip(
+        -np.asarray(
+            ocean_depth_from_age(
+                crust.ocean_age_myr[valid_age],
+                -2100.0,
+                -5600.0,
+                64.0,
+            ),
+            dtype=np.float64,
+        )
+        / 5600.0,
+        0.0,
+        1.0,
+    )
+    ocean_depth[ocean & ~valid_age] = 0.82
+    relief_low, relief_high = np.quantile(
+        np.asarray(signed_relief, dtype=np.float64)[land],
+        (0.02, 0.98),
+    ) if np.any(land) else (0.0, 1.0)
+    land_relief = np.clip(
+        (np.asarray(signed_relief, dtype=np.float64) - relief_low)
+        / max(relief_high - relief_low, 1.0),
+        0.0,
+        1.0,
+    )
+    # Candidate search in the island module is intentionally geometric (it
+    # tests shore clearance and group spacing for every accepted island). Run
+    # that search on a dedicated half-reference work field, then resample the
+    # resulting causal uplift back to the 720x360 reference field. This keeps
+    # island *scale* geological while avoiding an O(N²) full-grid search.
+    work_height = min(grid.shape[0], 180)
+    work_width = min(grid.shape[1], 360)
+    work_land = _resize_nearest(land, work_height, work_width).astype(bool)
+    work_ocean = ~work_land
+    work_depth = _resize_periodic_float(ocean_depth, work_height, work_width)
+    work_relief = _resize_periodic_float(
+        land_relief.astype(np.float32), work_height, work_width
+    )
+    archipelagos = generate_shelf_archipelagos(
+        work_ocean,
+        work_land,
+        work_depth,
+        work_relief,
+        maximum_groups=max(4, int(group_limit)),
+        maximum_islands_per_group=max(4, int(islands_per_group)),
+        minimum_shore_distance=3,
+        maximum_shore_distance=44,
+        shallow_limit=0.74,
+    )
+    uplift_work = np.zeros((work_height, work_width), dtype=np.float64)
+    families = (
+        (archipelagos.large_island_mask, 2900.0, 3900.0),
+        (archipelagos.shelf_island_mask, 1700.0, 3600.0),
+        (archipelagos.island_arc_mask, 2800.0, 3600.0),
+        (archipelagos.hotspot_island_mask, 3450.0, 3700.0),
+    )
+    relative = np.asarray(archipelagos.relative_elevation, dtype=np.float64)
+    for mask, base, gain in families:
+        work_mask = np.asarray(mask, dtype=bool)
+        uplift_work[work_mask] = (
+            base + gain * np.clip(relative[work_mask], 0.0, 1.0)
+        )
+    uplift = _resize_periodic_float(
+        uplift_work.astype(np.float32), grid.shape[0], grid.shape[1]
+    ).astype(np.float64)
+    uplift[land] = 0.0
+    return uplift, {
+        "groupCount": int(archipelagos.group_count),
+        "islandCount": int(archipelagos.island_count),
+        "islandCellCount": int(np.count_nonzero(archipelagos.island_mask)),
+        "workingGrid": {"height": work_height, "width": work_width},
+        "largeIslandCellCount": int(np.count_nonzero(archipelagos.large_island_mask)),
+        "shelfIslandCellCount": int(np.count_nonzero(archipelagos.shelf_island_mask)),
+        "islandArcCellCount": int(np.count_nonzero(archipelagos.island_arc_mask)),
+        "hotspotIslandCellCount": int(np.count_nonzero(archipelagos.hotspot_island_mask)),
+        "seamountCellCount": int(np.count_nonzero(archipelagos.seamount_mask)),
+        "shelfCellCount": int(np.count_nonzero(archipelagos.shelf_mask)),
+        "model": "reference-grid-shelf-fragment-arc-hotspot-groups-v6",
+    }
 
 
 def _warp_periodic_field(
@@ -2709,6 +2986,55 @@ def _reference_relief(
             * np.power(land_affinity, 1.35)
         )
 
+    # Present-day convergent seams are the primary source of long mountain
+    # systems. The tectonic potential above supplies broad uplift, while this
+    # directional field restores a recognisable chain grammar: a broken spine,
+    # parallel foothills and relay gaps. Older seams get a lower, wider
+    # imprint, so a continent is not reduced to one rounded summit.
+    orogenic_belts: dict[str, object] = {}
+    current_convergent_land = continental & (
+        boundary_class == BOUNDARY_CONVERGENT
+    )
+    current_belt = _directional_orogenic_belt(
+        grid,
+        current_convergent_land,
+        land_affinity,
+        seed=seed ^ 0x243F6A8885A308D3,
+        width_km=230.0,
+        amplitude_m=1120.0 + 1850.0 * recipe.mountain_density,
+        age_factor=1.0,
+    )
+    signed += current_belt
+    orogenic_belts["active"] = {
+        "sourceCells": int(np.count_nonzero(current_convergent_land)),
+        "widthKm": 230.0,
+        "maximumAddedMeters": float(np.max(current_belt, initial=0.0)),
+    }
+    for snapshot_ordinal, (lookback_myr, paleo_boundary_class) in enumerate(
+        paleo_boundaries
+    ):
+        if snapshot_ordinal not in (1, 3, 4):
+            continue
+        old_sources = continental & (
+            np.asarray(paleo_boundary_class) == BOUNDARY_CONVERGENT
+        )
+        age_factor = math.exp(-float(lookback_myr) / 285.0)
+        old_belt = _directional_orogenic_belt(
+            grid,
+            old_sources,
+            land_affinity,
+            seed=seed ^ (0x13198A2E + 0x9E3779B9 * snapshot_ordinal),
+            width_km=350.0 + 1.10 * float(lookback_myr),
+            amplitude_m=760.0 + 980.0 * morphology.continental_aggregation,
+            age_factor=age_factor,
+        )
+        signed += old_belt
+        orogenic_belts[f"paleo-{int(round(lookback_myr))}Myr"] = {
+            "sourceCells": int(np.count_nonzero(old_sources)),
+            "widthKm": 350.0 + 1.10 * float(lookback_myr),
+            "maximumAddedMeters": float(np.max(old_belt, initial=0.0)),
+        }
+
     # Ocean-ocean convergence exposes only intermittent volcanic summits.  A
     # modulated corridor creates an island arc rather than another continuous
     # plate-coloured ribbon.
@@ -2754,6 +3080,16 @@ def _reference_relief(
         seed ^ 0xDB4F0B9175AE2165,
     )
     signed += hotspot * (0.58 + 0.30 * morphology.hotspot_activity)
+    archipelago_uplift, archipelago_diagnostics = _shelf_archipelago_uplift(
+        grid,
+        continental_mask,
+        signed,
+        crust,
+        seed=seed ^ 0xBB67AE8584CAA73B,
+        group_limit=10 + int(round(5.0 * morphology.hotspot_activity)),
+        islands_per_group=8 + int(round(3.0 * morphology.crust_fragmentation)),
+    )
+    signed += archipelago_uplift
     diagnostics = {
         "boundaryChainCount": len(chains),
         "tectonicPotential": dict(potential.diagnostics),
@@ -2765,6 +3101,8 @@ def _reference_relief(
         "ancientSutureFraction": float(np.mean(terrane_suture)),
         "reactivatedSutureFraction": float(np.mean(reactivated_union)),
         "reactivatedSutures": dict(reactivated_diagnostics),
+        "directionalOrogenicBelts": orogenic_belts,
+        "shelfArchipelagos": archipelago_diagnostics,
         "tectonicSaturationMeters": {
             "uplift": tectonic_uplift_ceiling_m,
             "subsidence": tectonic_subsidence_ceiling_m,
