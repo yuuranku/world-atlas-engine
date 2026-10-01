@@ -22,6 +22,60 @@ _NEIGHBORS = (
     (1, 1, math.sqrt(2.0)),
 )
 
+# The other vertex of each native right triangle, seen from its target.
+# Continuous updates become causal when its axial vertex is accepted after
+# the diagonal vertex. The complementary update has an endpoint minimum and
+# is already represented by the ordinary legal edge candidate.
+_FRONT_PEERS = {
+    1: ((5, 1, -1), (7, 1, 1)),
+    3: ((2, -1, 1), (7, 1, 1)),
+    4: ((0, -1, -1), (5, 1, -1)),
+    6: ((0, -1, -1), (2, -1, 1)),
+}
+
+
+def _continuous_front_time(
+    row, column, direction, owner, time, edge_slowness, strength,
+    friction, transitions, costs, labels, accepted, *, symmetric_crossings=False,
+):
+    """Return the causal arrival time from an accepted triangular front.
+
+    Arrival time varies linearly on the segment joining the accepted axial
+    and diagonal vertices. Minimizing travel from any point on that segment
+    to the target gives time + sqrt(slowness**2 - time_difference**2).
+    It is an interior minimum only below a 45-degree incidence angle.
+
+    The upper envelope of the two legal incoming edge slownesses bounds the
+    angular crossing cost. A cheap bridge edge therefore cannot discount its
+    unbridged neighbour; terrain barriers and owner domains retain their
+    authored meaning. The original edge candidates remain available.
+    """
+    best = time + edge_slowness
+    height, width = friction.shape
+    for peer_direction, dy, dx in _FRONT_PEERS[direction]:
+        peer_row = row + dy
+        if peer_row < 0 or peer_row >= height:
+            continue
+        peer_column = (column + dx) % width
+        if not accepted[peer_row, peer_column] or labels[peer_row, peer_column] != owner:
+            continue
+        peer_time = float(costs[peer_row, peer_column])
+        difference = time - peer_time
+        crossing = float(transitions[7-peer_direction, peer_row, peer_column])
+        if symmetric_crossings:
+            crossing = max(crossing, float(transitions[peer_direction, row, column]))
+        peer_slowness = (
+            .5 * (float(friction[peer_row, peer_column]) + float(friction[row, column])) / strength
+            + crossing
+        )
+        slowness = max(edge_slowness, peer_slowness)
+        if difference < 0.0 or difference >= slowness / math.sqrt(2.0):
+            continue
+        candidate = time + math.sqrt(slowness*slowness - difference*difference)
+        if candidate < best:
+            best = candidate
+    return best
+
 
 @dataclass(frozen=True, slots=True)
 class TerritorySeed:
@@ -151,6 +205,7 @@ def simulate_bounded_reach(
     )
     labels = np.zeros(simulation.valid.shape, dtype=np.int32)
     costs = np.full(simulation.valid.shape, np.inf, dtype=np.float64)
+    accepted = np.zeros(simulation.valid.shape, dtype=bool)
     heap: list[tuple[float, int, int, int]] = []
     for label, seed in enumerate(seeds, start=1):
         labels[seed.row, seed.column] = label
@@ -162,13 +217,16 @@ def simulate_bounded_reach(
         cost, label, row, column = heapq.heappop(heap)
         if cost != costs[row, column] or label != int(labels[row, column]):
             continue
+        if accepted[row, column]:
+            continue
+        accepted[row, column] = True
         seed = seeds[label - 1]
         for direction, (dy, dx, distance) in enumerate(_NEIGHBORS):
             next_row = row + dy
             if next_row < 0 or next_row >= height:
                 continue
             next_column = (column + dx) % width
-            if not bool(simulation.valid[next_row, next_column]):
+            if accepted[next_row, next_column] or not bool(simulation.valid[next_row, next_column]):
                 continue
             if simulation.owner_constraint is not None:
                 required = int(simulation.owner_constraint[next_row, next_column])
@@ -181,6 +239,11 @@ def simulate_bounded_reach(
                 cell_cost + float(transitions[direction, row, column])
             ) * distance
             next_cost = cost + edge_cost
+            if direction in _FRONT_PEERS:
+                next_cost = _continuous_front_time(
+                    next_row, next_column, direction, label, cost, edge_cost, seed.strength,
+                    friction, transitions, costs, labels, accepted,
+                )
             if next_cost > maximum_cost + 1.0e-12:
                 continue
             current_cost = float(costs[next_row, next_column])
@@ -199,7 +262,12 @@ def simulate_territories(
     simulation: TerritorySimulation,
     seeds: tuple[TerritorySeed, ...],
 ) -> TerritoryResult:
-    """Grow all owners across the authored grid without a coarse analysis lattice."""
+    """Grow owners using continuous triangular fronts on native observations.
+
+    Single-edge arrivals obey the authored eight directional crossing costs.
+    Causal same-owner triangle updates propagate between those directions,
+    removing the octile travel metric without perturbing displayed borders.
+    """
 
     if not seeds:
         owner = np.where(simulation.valid, 0, -1).astype(np.int32)
@@ -228,6 +296,7 @@ def simulate_territories(
     )
     labels = np.full(simulation.valid.shape, -1, dtype=np.int32)
     costs = np.full(simulation.valid.shape, np.inf, dtype=np.float64)
+    accepted = np.zeros(simulation.valid.shape, dtype=bool)
     heap: list[tuple[float, int, int, int]] = []
     seed_owner = {coordinate: index for index, coordinate in enumerate(coordinates, 1)}
     for index, seed in enumerate(seeds, start=1):
@@ -239,13 +308,16 @@ def simulate_territories(
         cost, label, row, column = heapq.heappop(heap)
         if cost != costs[row, column] or label != int(labels[row, column]):
             continue
+        if accepted[row, column]:
+            continue
+        accepted[row, column] = True
         seed = seeds[label - 1]
         for direction, (dy, dx, distance) in enumerate(_NEIGHBORS):
             next_row = row + dy
             if next_row < 0 or next_row >= height:
                 continue
             next_column = (column + dx) % width
-            if not bool(simulation.valid[next_row, next_column]):
+            if accepted[next_row, next_column] or not bool(simulation.valid[next_row, next_column]):
                 continue
             fixed_seed = seed_owner.get((next_row, next_column))
             if fixed_seed is not None and fixed_seed != label:
@@ -263,6 +335,11 @@ def simulate_territories(
             # applied only to their exact crossing edges above.
             edge_cost = cell_cost + float(transitions[direction, row, column])
             next_cost = cost + edge_cost * distance
+            if direction in _FRONT_PEERS:
+                next_cost = _continuous_front_time(
+                    next_row, next_column, direction, label, cost, edge_cost, seed.strength,
+                    friction, transitions, costs, labels, accepted,
+                )
             current_cost = float(costs[next_row, next_column])
             current_label = int(labels[next_row, next_column])
             if next_cost < current_cost - 1.0e-12 or (
@@ -445,7 +522,7 @@ def extreme_frontier_environment(
     elevation: np.ndarray,
     annual_precipitation: np.ndarray,
     land_potential: np.ndarray,
-    population_band: np.ndarray,
+    population_density: np.ndarray,
     river_order: np.ndarray,
 ) -> np.ndarray:
     """Identify land where permanent government may physically remain absent."""
@@ -458,16 +535,19 @@ def extreme_frontier_environment(
             elevation,
             annual_precipitation,
             land_potential,
-            population_band,
+            population_density,
             river_order,
         )
     )
     if allowed.ndim != 2 or any(field.shape != allowed.shape for field in fields):
         raise ValueError("extreme-frontier fields must align")
     snow_field, heights, annual, potential, population, rivers = fields
+    if (not np.issubdtype(population.dtype, np.floating)
+            or np.any(~np.isfinite(population)) or np.any(population < 0.0)):
+        raise ValueError("extreme-frontier density must contain finite non-negative floating persons/km²")
     return allowed & (
         snow_field.astype(bool)
-        | ((heights > 0.78) & (potential < 0.20) & (population <= 1))
+        | ((heights > 0.78) & (potential < 0.20) & (population <= 0.1))
         | (
             (annual < 0.025)
             & (potential < 0.15)
@@ -516,7 +596,21 @@ def bridge_transition_discounts(
             if cell == (bridge.row, bridge.column)
         ]
         if not indices:
-            raise ValueError("bridge coordinate must lie on its road route")
+            # A D8 flow segment may cross a road between samples: its nearest
+            # river-support sample need not be one of the road's raster cells.
+            # Such a geometrically verified bridge has no raster bank penalty
+            # to discount when the actual road cells contain no channel.
+            distances = []
+            for row, column in cells:
+                dx = abs(column-bridge.column)
+                dx = min(dx, rivers.shape[1]-dx)
+                distances.append((row-bridge.row)**2 + dx*dx)
+            nearest = int(np.argmin(distances)) if distances else -1
+            if nearest < 0 or distances[nearest] > 2:
+                raise ValueError("bridge river support must be adjacent to its road crossing")
+            if int(rivers[cells[nearest]]) == 0:
+                continue
+            indices = [nearest]
         centre = indices[len(indices) // 2]
         start = centre
         end = centre
@@ -529,6 +623,10 @@ def bridge_transition_discounts(
         for index in range(start - 1, end + 1):
             first = cells[index]
             second = cells[index + 1]
+            first_order, second_order = int(rivers[first]), int(rivers[second])
+            if all((first_order >= threshold) == (second_order >= threshold)
+                   for threshold in (2, 3)):
+                continue
             dy = second[0] - first[0]
             dx = second[1] - first[1]
             if dx > rivers.shape[1] * 0.5:

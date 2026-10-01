@@ -8,6 +8,7 @@ from collections import Counter, deque
 import numpy as np
 
 from ..model import WorldGrid
+from ..suitability import relative_land_slope
 from ..thematic import (
     BIOME_SAVANNA_DRY_GRASSLAND,
     BIOME_TEMPERATE_GRASSLAND,
@@ -30,6 +31,8 @@ from .institutions import (
     government_form_catalog,
 )
 from .frontiers import derive_frontier_groups, derive_stateless_frontier
+from .governance import control_region_reach, maritime_response_days
+from .population import cell_areas_km2, population_density
 from .onomastics import lineage_style_index
 from .spatial import (
     connected_components,
@@ -41,6 +44,8 @@ from .spatial import (
     society_domain_mask,
 )
 from .state_formation import (
+    attach_maritime_control_regions,
+    distribute_state_cores,
     build_control_region_graph,
     repair_same_land_state_fragments,
     simulate_state_formation,
@@ -49,7 +54,6 @@ from .territorial_simulation import (
     TerritorySeed,
     TerritorySimulation,
     bridge_transition_discounts,
-    fill_unassigned_territory,
     simulate_bounded_reach,
     simulate_territories,
 )
@@ -706,20 +710,21 @@ def _coarse_route_affinity(
 
 def _state_transition_penalties(
     elevation: np.ndarray,
-    basin: np.ndarray,
     river_order: np.ndarray,
     language: np.ndarray,
     route_affinity: np.ndarray,
+    *,
+    land_mask: np.ndarray,
 ) -> np.ndarray:
     """Combine physical frontiers, cultural seams, and real crossing routes."""
 
-    fields = (basin, river_order, language, route_affinity)
+    fields = (river_order, language, route_affinity)
     if any(np.asarray(field).shape != np.asarray(elevation).shape for field in fields):
         raise ValueError("state transition fields must align")
     physical = physical_transition_penalties(
         elevation,
-        basin,
         river_order,
+        land_mask=land_mask,
     )
     # Keep the already-accepted river strength unchanged while giving ridges,
     # steep slope breaks and drainage divides more authority.  Scaling the
@@ -887,304 +892,6 @@ def _settlement_protection_mask(
                 axis=1,
             )
     return protected
-
-
-def _intra_state_route_protection(
-    labels: np.ndarray,
-    settlements: tuple[Settlement, ...],
-    transport: TransportLayers,
-    *,
-    radius: int,
-) -> np.ndarray:
-    """Keep same-state road corridors from being erased as frontier."""
-
-    state_labels = np.asarray(labels, dtype=np.int16)
-    settlement_by_identifier = {item.identifier: item for item in settlements}
-    state_by_settlement = {
-        identifier: int(state_labels[item.row, item.column])
-        for identifier, item in settlement_by_identifier.items()
-    }
-    route_cells = np.zeros(state_labels.shape, dtype=bool)
-    radius = max(0, int(radius))
-    for route in transport.routes:
-        if route.mode != "road" or route.target_settlement_id is None:
-            continue
-        source_state = state_by_settlement.get(route.source_settlement_id, 0)
-        target_state = state_by_settlement.get(route.target_settlement_id, 0)
-        if source_state <= 0 or source_state != target_state:
-            continue
-        for row, column in _route_cells(route.path, state_labels.shape):
-            if state_labels[row, column] == source_state:
-                route_cells[row, column] = True
-    protected = route_cells
-    for _distance in range(radius):
-        padded = np.pad(protected, ((1, 1), (0, 0)), mode="constant")
-        protected = (
-            protected
-            | np.roll(protected, 1, axis=1)
-            | np.roll(protected, -1, axis=1)
-            | padded[:-2]
-            | padded[2:]
-        )
-    return protected & (state_labels > 0)
-
-
-def _smooth_state_boundaries(
-    labels: np.ndarray,
-    civilization: np.ndarray,
-    state_civilization: np.ndarray,
-    protected: np.ndarray,
-    *,
-    passes: int = 2,
-) -> np.ndarray:
-    """Remove one-cell teeth without crossing civilization boundaries."""
-
-    result = np.asarray(labels, dtype=np.int16).copy()
-    civilization_ids = np.asarray(civilization, dtype=np.int16)
-    protected_cells = np.asarray(protected, dtype=bool)
-    if result.shape != civilization_ids.shape or protected_cells.shape != result.shape:
-        raise ValueError("state smoothing fields must align")
-    for _pass in range(max(0, int(passes))):
-        north = np.zeros_like(result)
-        south = np.zeros_like(result)
-        north[1:] = result[:-1]
-        south[:-1] = result[1:]
-        west = np.roll(result, 1, axis=1)
-        east = np.roll(result, -1, axis=1)
-        vertical = (north == south) & ((north == east) | (north == west))
-        horizontal = (east == west) & ((east == north) | (east == south))
-        candidate = np.where(vertical, north, np.where(horizontal, east, 0)).astype(np.int16)
-        candidate_civilization = state_civilization[
-            np.clip(candidate, 0, len(state_civilization) - 1)
-        ]
-        change = (
-            ~protected_cells
-            & (candidate > 0)
-            & (candidate != result)
-            & (candidate_civilization == civilization_ids)
-        )
-        if not np.any(change):
-            break
-        result[change] = candidate[change]
-    return result
-
-
-def _naturalize_straight_state_boundaries(
-    labels: np.ndarray,
-    elevation: np.ndarray,
-    basin: np.ndarray,
-    river_order: np.ndarray,
-    civilization: np.ndarray,
-    state_civilization: np.ndarray,
-    protected: np.ndarray,
-    *,
-    minimum_run: int = 12,
-    search_radius: int = 5,
-) -> np.ndarray:
-    """Replace long surveyed-looking borders with nearby physical seams.
-
-    A dynamic program searches a narrow corridor around each long horizontal
-    or vertical state edge.  Drainage divides, river banks, local relief, and
-    ridge height lower the path cost; curvature and displacement raise it.
-    Endpoints stay fixed, urban cells are immutable, and a state can only move
-    into cells of its own civilization.
-    """
-
-    result = np.asarray(labels, dtype=np.int16).copy()
-    heights = np.asarray(elevation, dtype=np.float64)
-    basins = np.asarray(basin)
-    rivers = np.asarray(river_order)
-    civilizations = np.asarray(civilization, dtype=np.int16)
-    protected_cells = np.asarray(protected, dtype=bool)
-    fields = (heights, basins, rivers, civilizations, protected_cells)
-    if any(field.shape != result.shape for field in fields):
-        raise ValueError("straight-boundary geography must align with states")
-    minimum_run = max(4, int(minimum_run))
-    search_radius = max(1, int(search_radius))
-
-    def naturalize_horizontal(
-        active: np.ndarray,
-        local_heights: np.ndarray,
-        local_basins: np.ndarray,
-        local_rivers: np.ndarray,
-        local_civilizations: np.ndarray,
-        local_protected: np.ndarray,
-    ) -> np.ndarray:
-        output = active.copy()
-        height, width = output.shape
-        source = active.copy()
-        for boundary_row in range(height - 1):
-            upper = source[boundary_row]
-            lower = source[boundary_row + 1]
-            boundary = (upper > 0) & (lower > 0) & (upper != lower)
-            column = 0
-            while column < width:
-                if not boundary[column]:
-                    column += 1
-                    continue
-                upper_identifier = int(upper[column])
-                lower_identifier = int(lower[column])
-                end = column + 1
-                while (
-                    end < width
-                    and boundary[end]
-                    and int(upper[end]) == upper_identifier
-                    and int(lower[end]) == lower_identifier
-                ):
-                    end += 1
-                run_length = end - column
-                if run_length < minimum_run:
-                    column = end
-                    continue
-                owner_upper = int(state_civilization[upper_identifier])
-                owner_lower = int(state_civilization[lower_identifier])
-                candidates = np.arange(
-                    max(0, boundary_row - search_radius),
-                    min(height - 2, boundary_row + search_radius) + 1,
-                    dtype=np.int32,
-                )
-                count = len(candidates)
-                costs = np.full((run_length, count), np.inf, dtype=np.float64)
-                parent = np.full((run_length, count), -1, dtype=np.int16)
-                straight_index = int(np.flatnonzero(candidates == boundary_row)[0])
-
-                for offset in range(run_length):
-                    active_column = column + offset
-                    for candidate_index, candidate_row_value in enumerate(candidates):
-                        candidate_row = int(candidate_row_value)
-                        low = min(boundary_row, candidate_row) + 1
-                        high = max(boundary_row, candidate_row) + 1
-                        crossed = slice(low, high)
-                        if candidate_row > boundary_row:
-                            admissible = np.all(
-                                (source[crossed, active_column] == lower_identifier)
-                                & (local_civilizations[crossed, active_column] == owner_upper)
-                                & ~local_protected[crossed, active_column]
-                            )
-                        elif candidate_row < boundary_row:
-                            admissible = np.all(
-                                (source[crossed, active_column] == upper_identifier)
-                                & (local_civilizations[crossed, active_column] == owner_lower)
-                                & ~local_protected[crossed, active_column]
-                            )
-                        else:
-                            admissible = True
-                        if not admissible:
-                            continue
-                        first_height = local_heights[candidate_row, active_column]
-                        second_height = local_heights[candidate_row + 1, active_column]
-                        relief = abs(second_height - first_height)
-                        divide = (
-                            local_basins[candidate_row, active_column] >= 0
-                            and local_basins[candidate_row + 1, active_column] >= 0
-                            and local_basins[candidate_row, active_column]
-                            != local_basins[candidate_row + 1, active_column]
-                        )
-                        river_bank = (
-                            local_rivers[candidate_row, active_column] >= 2
-                        ) != (
-                            local_rivers[candidate_row + 1, active_column] >= 2
-                        )
-                        ridge_height = max(first_height, second_height)
-                        natural_strength = (
-                            9.0 * float(divide)
-                            + 8.0 * float(river_bank)
-                            + 52.0 * relief
-                            + 10.0 * max(0.0, ridge_height - 0.34)
-                        )
-                        displacement = candidate_row - boundary_row
-                        # Natural seams dominate.  On a genuinely open plain,
-                        # a slow two-frequency target prevents a surveyed
-                        # axis-aligned cut without adding pixel noise or
-                        # changing the broad political result.
-                        plain_target = boundary_row + float(
-                            np.clip(
-                                1.55
-                                * math.sin(active_column * 0.31 + boundary_row * 0.17)
-                                + 0.65
-                                * math.sin(active_column * 0.13 - boundary_row * 0.29),
-                                -search_radius + 1,
-                                search_radius - 1,
-                            )
-                        )
-                        plain_deviation = candidate_row - plain_target
-                        local_cost = (
-                            0.018 * displacement * displacement
-                            + 0.060 * plain_deviation * plain_deviation
-                            - natural_strength
-                        )
-                        if offset == 0 or offset == run_length - 1:
-                            if candidate_row != boundary_row:
-                                continue
-                        if offset == 0:
-                            costs[offset, candidate_index] = local_cost
-                            continue
-                        previous_start = max(0, candidate_index - 1)
-                        previous_end = min(count, candidate_index + 2)
-                        previous_costs = costs[offset - 1, previous_start:previous_end]
-                        if not np.any(np.isfinite(previous_costs)):
-                            continue
-                        transition_costs = previous_costs + 0.22 * np.abs(
-                            candidates[previous_start:previous_end] - candidate_row
-                        )
-                        local_parent = int(np.argmin(transition_costs))
-                        costs[offset, candidate_index] = (
-                            float(transition_costs[local_parent]) + local_cost
-                        )
-                        parent[offset, candidate_index] = previous_start + local_parent
-
-                if not np.isfinite(costs[-1, straight_index]):
-                    column = end
-                    continue
-                path = np.empty(run_length, dtype=np.int32)
-                active_index = straight_index
-                complete_path = True
-                for offset in range(run_length - 1, -1, -1):
-                    path[offset] = candidates[active_index]
-                    if offset:
-                        active_index = int(parent[offset, active_index])
-                        if active_index < 0:
-                            complete_path = False
-                            break
-                if not complete_path:
-                    column = end
-                    continue
-                if np.all(path == boundary_row):
-                    column = end
-                    continue
-                for offset, candidate_row_value in enumerate(path):
-                    active_column = column + offset
-                    candidate_row = int(candidate_row_value)
-                    if candidate_row > boundary_row:
-                        output[
-                            boundary_row + 1 : candidate_row + 1,
-                            active_column,
-                        ] = upper_identifier
-                    elif candidate_row < boundary_row:
-                        output[
-                            candidate_row + 1 : boundary_row + 1,
-                            active_column,
-                        ] = lower_identifier
-                column = end
-        return output
-
-    result = naturalize_horizontal(
-        result,
-        heights,
-        basins,
-        rivers,
-        civilizations,
-        protected_cells,
-    )
-    result = naturalize_horizontal(
-        result.T,
-        heights.T,
-        basins.T,
-        rivers.T,
-        civilizations.T,
-        protected_cells.T,
-    ).T
-    return result
 
 
 def _absorb_tiny_state_fragments(
@@ -1616,38 +1323,32 @@ def derive_politics(
     ).astype(np.float32)
     native_transitions = _state_transition_penalties(
         grid.elevation,
-        np.where(
-            thematic.drainage_basin >= 0,
-            thematic.drainage_basin.astype(np.int64) + 1,
-            0,
-        ),
         grid.river_order,
         cultures.language_id,
         native_route_affinity,
+        land_mask=grid.water == 0,
     )
     elevation = reduce_field(grid.elevation, step=step, mode="max")
     potential = reduce_field(thematic.land_potential, step=step, mode="mean")
-    dry = reduce_field(
-        thematic.climate.annual_precipitation < 0.05,
+    habitability = reduce_field(
+        thematic.habitability,
         step=step,
-        mode="max",
-    ).astype(bool)
+        mode="mean",
+    )
     river = reduce_field(grid.river_order > 0, step=step, mode="max").astype(bool)
-    population_support = reduce_field(population.population_weight, step=step, mode="max")
+    density_field = population_density(grid, population)
+    population_support = reduce_field(density_field, step=step, mode="max")
     accessibility = reduce_field(transport.accessibility, step=step, mode="mean")
     population_scale = population_support / max(
-        float(population_support.max(initial=1.0)),
+        float(population_support.max(initial=0.0)),
         1.0e-15,
     )
     friction = (
         1.0
         + 7.2 * np.square(np.clip(elevation, 0.0, 1.0))
-        + 18.0 * np.hypot(
-            np.gradient(elevation, axis=0),
-            (np.roll(elevation, -1, axis=1) - np.roll(elevation, 1, axis=1)) * 0.5,
-        )
+        + 18.0 * relative_land_slope(elevation, coarse_land)
         + 1.9 * (1.0 - np.clip(potential, 0.0, 1.0))
-        + 2.6 * dry
+        + 2.6 * (1.0 - np.clip(habitability, 0.0, 1.0))
         - 0.08 * river
         - 0.22 * population_scale
         - 0.68 * np.clip(accessibility, 0.0, 1.0)
@@ -1699,10 +1400,13 @@ def derive_politics(
         grid.elevation,
         thematic.climate.annual_precipitation,
         thematic.land_potential,
-        population.population_weight,
+        density_field,
+        cell_areas_km2(grid),
         transport.accessibility,
         grid.river_order,
         native_transitions,
+        # Roads change reach and crossing costs. A fixed raster shoulder
+        # cannot confer sovereignty on remote countryside along the route.
         governed_nuclei,
         target_share=frontier_target_share,
     )
@@ -1858,7 +1562,6 @@ def derive_politics(
         label_owner=control_domain,
         friction=friction.astype(np.float32),
         band_radius=12,
-        jitter_strength=0.16,
     ).astype(np.int32)
     effective_civilization = coarse_civilization.astype(np.int32, copy=True)
     neutral_control = (effective_civilization <= 0) & (control_labels > 0)
@@ -1877,9 +1580,9 @@ def derive_politics(
         domain=control_labels,
         barrier_threshold=14.0,
     ).astype(np.int32)
-    population_normalized = population.population_weight.astype(np.float64)
+    population_normalized = density_field.astype(np.float64)
     population_normalized /= max(
-        float(population_normalized.max(initial=1.0)),
+        float(population_normalized.max(initial=0.0)),
         1.0e-12,
     )
     local_resources = (
@@ -1895,20 +1598,39 @@ def derive_politics(
         effective_civilization,
         local_resources,
     )
+    core_by_identifier = distribute_state_cores(
+        control_graph, control_labels, core_by_identifier, control_settlements,
+        protected_settlement_ids=frozenset(civilization_core_by_identifier.values()),
+        routes=transport.routes,
+    )
     core_region_by_state = np.zeros(state_count + 1, dtype=np.int32)
     state_strength = np.zeros(state_count + 1, dtype=np.float32)
     for identifier in range(1, state_count + 1):
         core = core_by_identifier[identifier]
         core_region_by_state[identifier] = int(control_labels[core.row, core.column])
         state_strength[identifier] = strength_by_identifier[identifier]
+    control_graph, edge_days, response_budgets = control_region_reach(
+        grid, control_graph, control_labels, core_region_by_state, state_strength,
+        provinces=False, routes=transport.routes,
+    )
     formation = simulate_state_formation(
         control_graph,
         core_region_by_state=core_region_by_state,
         state_strength=state_strength,
+        travel_days_by_edge=edge_days,
+        maximum_response_days_by_state=response_budgets,
+    )
+    physical_land_components = connected_components(physical_land)[0]
+    region_owners = attach_maritime_control_regions(
+        control_graph, formation.region_owner, control_labels,
+        core_region_by_state, settlements, transport.routes,
+        travel_days_by_edge=edge_days,
+        maximum_response_days_by_state=response_budgets,
+        maritime_days_by_route=maritime_response_days(grid, transport.routes),
     )
     expanded = np.zeros(grid.shape, dtype=np.int16)
     controlled = control_labels > 0
-    expanded[controlled] = formation.region_owner[control_labels[controlled]].astype(
+    expanded[controlled] = region_owners[control_labels[controlled]].astype(
         np.int16
     )
     expanded[~physical_land] = -1
@@ -1929,37 +1651,8 @@ def derive_politics(
     # The pastoral and tribal domain was reserved before the political graph
     # was built.  States therefore stop at its physical edge instead of being
     # generated across the whole continent and punctured afterwards.
-    frontier = frontier_reservation.copy()
+    frontier = frontier_reservation | (land & (expanded <= 0))
     expanded = expanded.astype(np.int16)
-    for settlement in settlements:
-        if expanded[settlement.row, settlement.column] > 0:
-            continue
-        civilization_identifier = int(
-            cultures.civilization_id[settlement.row, settlement.column]
-        )
-        candidates = [
-            identifier
-            for identifier, state_civilization_identifier in civilization_by_identifier.items()
-            if state_civilization_identifier == civilization_identifier
-        ]
-        if not candidates:
-            continue
-        state_identifier = min(
-            candidates,
-            key=lambda identifier: (
-                math.hypot(
-                    core_by_identifier[identifier].row - settlement.row,
-                    min(
-                        abs(core_by_identifier[identifier].column - settlement.column),
-                        grid.shape[1]
-                        - abs(core_by_identifier[identifier].column - settlement.column),
-                    ),
-                ),
-                identifier,
-            ),
-        )
-        expanded[settlement.row, settlement.column] = state_identifier
-        frontier[settlement.row, settlement.column] = False
     # A political core is always the minimum protected control space.
     for identifier, core in core_by_identifier.items():
         expanded[core.row, core.column] = identifier
@@ -1989,44 +1682,36 @@ def derive_politics(
     expanded = repair_same_land_state_fragments(
         expanded,
         political_core_cells,
-        connected_components(land)[0],
+        physical_land_components,
+        state_domain=state_civilization,
+        maritime_routes=transport.routes,
+        settlements=settlements,
     )
-    accidental_frontier = land & (expanded <= 0) & ~frontier
-    expanded = fill_unassigned_territory(
-        TerritorySimulation(
-            valid=land,
-            friction=friction.astype(np.float32),
-            transition_penalty=native_transitions,
-            road_access=native_route_affinity,
-            bridge_edges=bridge_discounts,
-            owner_constraint=cultures.civilization_id.astype(np.int32),
-        ),
+    # Refine all shared seams using the same measured terrain and crossings
+    # as formation.  Outlet IDs and coordinate waves are not border evidence.
+    protected_rows, protected_columns = np.nonzero(
+        settlement_anchor_protection & (expanded > 0)
+    )
+    expanded = refine_partition_boundaries(
         expanded,
-        accidental_frontier,
-        state_civilization.astype(np.int32),
+        expanded > 0,
+        native_transitions * (1.0 - bridge_discounts),
+        {
+            (int(row), int(column)): int(expanded[row, column])
+            for row, column in zip(protected_rows, protected_columns, strict=True)
+        },
+        owner_field=cultures.civilization_id,
+        label_owner=state_civilization,
+        friction=np.maximum(friction, 0.25).astype(np.float32),
+        band_radius=8,
     ).astype(np.int16)
-    if np.any(accidental_frontier & (expanded <= 0)):
-        raise ValueError("ordinary land cannot remain an unexplained political vacuum")
-    # Solve the final open-plain seam on the ownership grid itself.  This is
-    # not display smoothing: candidate moves stay inside the two competing
-    # states' cultural parent, protect every settlement, and are scored first
-    # by watershed, river-bank and ridge evidence.  Only where that evidence
-    # is absent does the low-frequency plain target break a surveyed straight.
-    expanded = _naturalize_straight_state_boundaries(
-        expanded,
-        grid.elevation,
-        thematic.drainage_basin,
-        grid.river_order,
-        cultures.civilization_id,
-        state_civilization,
-        settlement_anchor_protection,
-        minimum_run=7,
-        search_radius=8,
-    )
     expanded = repair_same_land_state_fragments(
         expanded,
         political_core_cells,
-        connected_components(land)[0],
+        physical_land_components,
+        state_domain=state_civilization,
+        maritime_routes=transport.routes,
+        settlements=settlements,
     )
     frontier = land & (expanded <= 0)
 

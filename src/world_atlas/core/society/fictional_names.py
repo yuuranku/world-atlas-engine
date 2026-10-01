@@ -6,6 +6,7 @@ import hashlib
 from typing import Collection
 
 from .model import NameLexicon
+from .naming_profiles import profile_lineage
 from .onomastics import lineage_key, lineage_roots
 
 
@@ -25,6 +26,7 @@ def procedural_name_lexicon(
     seed: int,
     *,
     forbidden: Collection[str] = (),
+    profile_set: str = "mixed",
 ) -> NameLexicon:
     """Build country identities from fourteen repeatable naming languages."""
 
@@ -32,7 +34,8 @@ def procedural_name_lexicon(
     family_buckets: list[tuple[str, ...]] = []
     for family_identifier in range(1, 15):
         style = (family_identifier * 5 + seed) % 12
-        lineage = lineage_key(family_identifier, style_index=style)
+        lineage = profile_lineage(lineage_key(family_identifier, style_index=style),
+                                  seed=seed, profile_set=profile_set)
         roots = lineage_roots(lineage, count=128)
         digest = hashlib.sha256(f"{seed}:{family_identifier}".encode("utf-8")).digest()
         start = int.from_bytes(digest[:4], "big") % len(roots)

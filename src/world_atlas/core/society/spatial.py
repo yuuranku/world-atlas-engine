@@ -9,6 +9,8 @@ from collections.abc import Sequence
 
 import numpy as np
 from scipy import ndimage
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components as graph_connected_components
 
 from ..model import WorldGrid
 from ..polar import polar_continent_mask
@@ -24,6 +26,69 @@ _EIGHT_NEIGHBORS = (
     (1, 0),
     (1, 1),
 )
+
+
+def categorical_components(
+    values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Label equal positive values once, including the longitude seam.
+
+    ``scipy.ndimage.label`` labels any adjacent non-zero values as one feature,
+    which is unsuitable for an ownership raster.  Building only equal-owner
+    east/south edges creates a sparse graph over occupied cells instead.  This
+    is one native-resolution pass for the whole partition, not one full-grid
+    component pass per country or province.
+    """
+
+    labels = np.asarray(values)
+    if labels.ndim != 2:
+        raise ValueError("administrative ownership must be two-dimensional")
+    positive = labels > 0
+    nodes = np.flatnonzero(positive.ravel())
+    if nodes.size == 0:
+        return (
+            nodes.astype(np.int64, copy=False),
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.int32),
+        )
+
+    owner_by_node = labels.ravel()[nodes].astype(np.int32, copy=False)
+    node_lookup = np.full(labels.size, -1, dtype=np.int32)
+    node_lookup[nodes] = np.arange(nodes.size, dtype=np.int32)
+    node_lookup = node_lookup.reshape(labels.shape)
+
+    east_equal = positive & (labels == np.roll(labels, -1, axis=1))
+    east_source = node_lookup[east_equal]
+    east_target = np.roll(node_lookup, -1, axis=1)[east_equal]
+    south_equal = (
+        positive[:-1]
+        & positive[1:]
+        & (labels[:-1] == labels[1:])
+    )
+    south_source = node_lookup[:-1][south_equal]
+    south_target = node_lookup[1:][south_equal]
+    rows = np.concatenate((east_source, south_source)).astype(np.int32, copy=False)
+    columns = np.concatenate((east_target, south_target)).astype(
+        np.int32,
+        copy=False,
+    )
+    graph = coo_matrix(
+        (
+            np.ones(rows.size, dtype=np.uint8),
+            (rows, columns),
+        ),
+        shape=(nodes.size, nodes.size),
+    ).tocsr()
+    _count, component_by_node = graph_connected_components(
+        graph,
+        directed=False,
+        return_labels=True,
+    )
+    return (
+        nodes.astype(np.int64, copy=False),
+        np.asarray(component_by_node, dtype=np.int32),
+        owner_by_node,
+    )
 
 
 def connected_components(mask: np.ndarray) -> tuple[np.ndarray, tuple[int, ...]]:
@@ -450,22 +515,23 @@ def fill_unreachable_components(
 
 def physical_transition_penalties(
     elevation: np.ndarray,
-    basin: np.ndarray,
     river_order: np.ndarray,
+    *,
+    land_mask: np.ndarray,
 ) -> np.ndarray:
     """Return directional costs for crossing natural political frontiers.
 
     Travel *along* a valley or river stays comparatively cheap.  Crossing a
-    drainage divide, a high ridge, or either bank of a large river is costly.
+    measured crest, slope break, or either bank of a large river is costly.
     Keeping this as an edge field (rather than another per-cell terrain cost)
     is important: it lets a territory occupy a whole basin while placing its
     frontier on the basin rim instead of merely avoiding all rugged land.
     """
 
     heights = np.asarray(elevation, dtype=np.float64)
-    basins = np.asarray(basin)
     rivers = np.asarray(river_order)
-    if basins.shape != heights.shape or rivers.shape != heights.shape:
+    dry = np.asarray(land_mask, dtype=bool)
+    if rivers.shape != heights.shape or dry.shape != heights.shape:
         raise ValueError("physical boundary fields must have matching shapes")
     if heights.ndim != 2:
         raise ValueError("physical boundary fields must be two-dimensional")
@@ -477,31 +543,45 @@ def physical_transition_penalties(
     secondary_river = rivers >= 2
     for direction, (dy, dx) in enumerate(_EIGHT_NEIGHBORS):
         target_elevation = np.roll(heights, shift=(-dy, -dx), axis=(0, 1))
-        target_basin = np.roll(basins, shift=(-dy, -dx), axis=(0, 1))
+        target_dry = np.roll(dry, shift=(-dy, -dx), axis=(0, 1))
         target_river_order = np.roll(rivers, shift=(-dy, -dx), axis=(0, 1))
         target_major_river = target_river_order >= 3
         target_secondary_river = target_river_order >= 2
         relief = np.abs(target_elevation - heights)
         ridge = np.maximum(target_elevation, heights)
-        watershed_divide = (
-            (basins > 0)
-            & (target_basin > 0)
-            & (basins != target_basin)
-        )
+        # An outlet ID is a D8 routing result, not measured ridge height.  In
+        # particular, priority-flood flats can have long rectangular outlet
+        # partitions.  Require the terrain on BOTH sides of this crossing to
+        # descend away from the edge.  Two support distances distinguish a
+        # broad crest from a one-cell peak without introducing a wave field.
+        def terrain_neighbor(field: np.ndarray, steps: int) -> np.ndarray:
+            delta_y, delta_x = dy * steps, dx * steps
+            values = np.roll(field, shift=(-delta_y, -delta_x), axis=(0, 1))
+            if delta_y > 0:
+                values[-delta_y:, :] = np.roll(field[-1, :], -delta_x)
+            elif delta_y < 0:
+                values[:-delta_y, :] = np.roll(field[0, :], -delta_x)
+            return values
+
+        crest = np.zeros(heights.shape, dtype=np.float64)
+        for support in (1, 2):
+            before = terrain_neighbor(heights, -support)
+            after = terrain_neighbor(heights, support + 1)
+            supported = np.minimum(heights - before, target_elevation - after)
+            actual_land = dry & target_dry & terrain_neighbor(dry, -support) & terrain_neighbor(dry, support + 1)
+            crest = np.maximum(crest, np.where(actual_land, np.maximum(0.0, supported) / support, 0.0))
         river_bank = major_river ^ target_major_river
         secondary_bank = secondary_river ^ target_secondary_river
         river_strength = np.maximum(rivers, target_river_order).astype(np.float64)
         ridge_prominence = np.clip(ridge - 0.40, 0.0, 0.60)
-        high_saddle = np.clip(np.minimum(target_elevation, heights) - 0.56, 0.0, 0.44)
         penalties[direction] = (
             34.0 * np.power(relief, 1.20)
-            + watershed_divide
-            * (5.5 + 21.0 * ridge_prominence + 12.0 * relief)
+            + 52.0 * crest * (1.0 + 2.0 * ridge_prominence)
             + river_bank
             * (5.0 + 2.8 * np.clip(river_strength - 2.0, 0.0, 3.0))
             + secondary_bank * 1.8
-            + 15.0 * high_saddle
         )
+        penalties[direction, ~(dry & target_dry)] = 0.0
         if dy < 0:
             penalties[direction, 0, :] = 0.0
         elif dy > 0:
@@ -735,21 +815,21 @@ def refine_partition_boundaries(
     label_owner: np.ndarray | None = None,
     friction: np.ndarray | None = None,
     band_radius: int = 7,
-    jitter_strength: float = 0.18,
 ) -> np.ndarray:
     """Regrow only a partition's frontier on the full-resolution landscape.
 
-    Coarse society allocation is useful for choosing the broad extent of a
-    realm, but enlarging its cells creates surveyed rectangles.  This pass
-    freezes every interior, opens a narrow band on both sides of each border,
+    This pass freezes every interior, opens a narrow band on both sides of each border,
     and lets the neighbouring labels compete again at native resolution.
-    Directional river, watershed and ridge costs therefore decide the actual
-    seam.  A weak deterministic low-frequency field only breaks featureless
-    plain ties; it cannot outweigh a mapped natural barrier.
+    Directional river and ridge costs therefore decide the actual
+    seam. No independent coordinate noise changes administrative ownership.
 
     ``owner_field`` and ``label_owner`` constrain nested partitions: states
     cannot cross civilization domains and provinces cannot cross countries.
     """
+
+    # Local import avoids the spatial/component import cycle. Formation and
+    # its final seam regrowth share one continuous arrival-time primitive.
+    from .territorial_simulation import _continuous_front_time, _FRONT_PEERS
 
     source = np.asarray(labels)
     allowed = np.asarray(valid, dtype=bool)
@@ -763,8 +843,6 @@ def refine_partition_boundaries(
     band_radius = int(band_radius)
     if band_radius < 1:
         raise ValueError("band_radius must be positive")
-    if not math.isfinite(jitter_strength) or jitter_strength < 0.0:
-        raise ValueError("jitter_strength must be finite and non-negative")
 
     maximum_label = int(source.max(initial=0))
     if owner_field is None and label_owner is None:
@@ -842,19 +920,9 @@ def refine_partition_boundaries(
         seed_mask |= band & neighbor_frozen & (neighbor_label == result)
     seed_mask |= band & (anchor_labels > 0)
 
-    # Low-frequency tie-breaker: unlike pixel noise, these overlapping waves
-    # create gentle bends at the scale of valleys and local relief.  Its
-    # amplitude is deliberately tiny beside river/ridge transition penalties.
-    rows, columns = np.indices(source.shape, dtype=np.float32)
-    texture = (
-        0.52 * np.sin(columns * 0.173 + rows * 0.071)
-        + 0.31 * np.sin(columns * 0.067 - rows * 0.151 + 1.7)
-        + 0.17 * np.sin(columns * 0.293 + rows * 0.211 + 0.4)
-    ).astype(np.float32)
-    resistance = resistance * (1.0 + jitter_strength * (texture + 1.0) * 0.5)
-
     costs = np.full(source.shape, np.inf, dtype=np.float64)
     owners = np.zeros(source.shape, dtype=np.int32)
+    accepted = np.zeros(source.shape, dtype=bool)
     heap: list[tuple[float, int, int, int]] = []
     for row, column in zip(*np.nonzero(seed_mask), strict=True):
         identifier = int(anchor_labels[row, column] or result[row, column])
@@ -870,13 +938,16 @@ def refine_partition_boundaries(
         cost, identifier, row, column = heapq.heappop(heap)
         if cost != costs[row, column] or identifier != owners[row, column]:
             continue
+        if accepted[row, column]:
+            continue
+        accepted[row, column] = True
         label_domain = int(owner_by_label[identifier])
         for direction, dy, dx, distance in directions:
             next_row = row + dy
             if next_row < 0 or next_row >= height:
                 continue
             next_column = (column + dx) % width
-            if not band[next_row, next_column]:
+            if accepted[next_row, next_column] or not band[next_row, next_column]:
                 continue
             if int(cell_owner[next_row, next_column]) != label_domain:
                 continue
@@ -893,6 +964,11 @@ def refine_partition_boundaries(
                 + barrier
             ) * distance
             next_cost = cost + edge
+            if direction in _FRONT_PEERS:
+                next_cost = _continuous_front_time(
+                    next_row, next_column, direction, identifier, cost, edge, 1.,
+                    resistance, transitions, costs, owners, accepted, symmetric_crossings=True,
+                )
             current_cost = float(costs[next_row, next_column])
             current_owner = int(owners[next_row, next_column])
             if next_cost < current_cost - 1.0e-12 or (

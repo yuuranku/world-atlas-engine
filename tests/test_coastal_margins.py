@@ -7,6 +7,19 @@ import numpy as np
 
 
 class CoastalMarginTests(unittest.TestCase):
+    def test_short_high_slip_sectors_do_not_fold_surface(self):
+        from world_atlas.core.coastal_margins import margin_motion
+        coordinate = np.linspace(-650, 650, 301)
+        along, inland = np.meshgrid(coordinate, coordinate)
+        for family in ('rift', 'active', 'passive', 'transform'):
+            for seed in (12, 817, 819):
+                normal, tangent, _ = margin_motion(
+                    along, inland, 180, 210, 520, seed=seed, family=family)
+                dn_y, dn_x = np.gradient(normal, coordinate, coordinate)
+                dt_y, dt_x = np.gradient(tangent, coordinate, coordinate)
+                determinant = (1 + dt_x) * (1 + dn_y) - dt_y * dn_x
+                self.assertGreater(float(determinant.min()), 0.0)
+
     def test_motion_budget_does_not_collapse_plate_speeds_to_one_slip(self):
         from world_atlas.core import coastal_margins
         self.assertTrue(hasattr(coastal_margins, 'motion_budget_km'))
@@ -24,9 +37,11 @@ class CoastalMarginTests(unittest.TestCase):
                         'Macro coast needs structural displacement, not inlet stamps')
         along = np.linspace(-2400,2400,481)
         normal, tangent, support = coastal_margins.margin_motion(along, np.zeros_like(along), 2100, 1500, 520, seed=817, family='rift')
-        self.assertGreater(float(np.ptp(normal)), 650)
-        self.assertGreater(float(normal.max()), 200)
-        self.assertLess(float(normal.min()), -200)
+        # Absolute displacement used to be rewarded even when adjacent
+        # sectors folded. Preserve alternating motion and bound its strain.
+        self.assertGreater(float(normal.max()), 0)
+        self.assertLess(float(normal.min()), 0)
+        self.assertLess(float(np.max(np.abs(np.gradient(normal, along)))), 0.45)
         self.assertEqual(normal[0], 0)
         self.assertEqual(normal[-1], 0)
         interior, _, _ = coastal_margins.margin_motion(along, np.full_like(along,2000), 2100, 1500, 520, seed=817, family='rift')
@@ -65,6 +80,7 @@ class CoastalMarginTests(unittest.TestCase):
         np.testing.assert_array_equal(delta[protected], 0)
         self.assertGreater(np.count_nonzero((relative + delta > 0) != (relative > 0)), 10)
         self.assertGreater(metrics['modifiedShoreSegments'], 0)
+        self.assertLessEqual(metrics['maximumDisplacementGradient'], 0.650001)
         repeated, _ = planet._evolve_coastal_margins(relative, quiet, boundary, velocity, velocity, 819, .28)
         np.testing.assert_array_equal(delta, repeated)
 

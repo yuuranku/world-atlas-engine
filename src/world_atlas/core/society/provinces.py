@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from ..model import WorldGrid
+from ..suitability import relative_land_slope
 from ..thematic import ThematicLayers
 from .model import (
     CultureLayers,
@@ -21,12 +22,13 @@ from .model import (
     Settlement,
     TransportLayers,
 )
+from .administrative_topology import reconcile_partition_components
+from .governance import control_region_reach
 from .onomastics import lineage_roots, lineage_style_index
-from .politics import (
-    _naturalize_straight_state_boundaries,
-    _settlement_protection_mask,
-)
+from .population import cell_areas_km2, population_density
+from .politics import _settlement_protection_mask
 from .spatial import (
+    categorical_components,
     connected_components,
     natural_compartment_ids,
     physical_transition_penalties,
@@ -169,10 +171,12 @@ def _select_province_cores(
     route_group_by_identifier: Mapping[str, int] | None = None,
     required_identifiers: frozenset[str] = frozenset(),
     service_radius: float | None = None,
-    maximum_count: int = 18,
+    maximum_count: int | None = None,
 ) -> tuple[Settlement, ...]:
     if not candidates or count <= 0:
         return ()
+    if maximum_count is None:
+        maximum_count = len(candidates)
     by_identifier = {item.identifier: item for item in candidates}
     first = by_identifier.get(capital_identifier, candidates[0])
     chosen = [first]
@@ -238,48 +242,31 @@ def _select_province_cores(
 
 def _province_transition_penalties(
     grid: WorldGrid,
-    thematic: ThematicLayers,
     road_corridor: np.ndarray,
 ) -> np.ndarray:
     """Make administrative travel follow real landforms and drainage.
 
-    Province borders are a political result, but the cost of governing across
-    a watershed, ridge or river is physical.  Flow-linked cells remain cheap,
-    while movement across neighbouring valleys is more expensive.  This
-    prevents the Euclidean bisectors that formerly produced ruler-straight
-    divisions through otherwise legible terrain.
+    Crossings depend on measured terrain and mapped rivers.  A D8 outlet
+    label or the absence of a direct flow pointer is not a mountain barrier.
     """
 
     elevation = np.asarray(grid.elevation, dtype=np.float64)
-    basin = np.asarray(thematic.drainage_basin)
     river_order = np.asarray(grid.river_order)
     roads = np.asarray(road_corridor, dtype=np.float64)
     if roads.shape != grid.shape:
         raise ValueError("province road corridors must match the WorldGrid shape")
     physical = physical_transition_penalties(
         elevation,
-        basin,
         river_order,
+        land_mask=grid.water == 0,
     )
     terrain_scale = 4.05
     river_scale = 3.10
     penalties = terrain_scale * physical
-    height, width = grid.shape
-    cell_index = np.arange(height * width, dtype=np.int64).reshape(grid.shape)
-    downstream = np.asarray(grid.flow_to, dtype=np.int64)
+    height, _width = grid.shape
     for direction, (dy, dx, _distance) in enumerate(_NEIGHBORS):
         shift = (-dy, -dx)
-        target_index = np.roll(cell_index, shift=shift, axis=(0, 1))
-        target_downstream = np.roll(downstream, shift=shift, axis=(0, 1))
         target_order = np.roll(river_order, shift=shift, axis=(0, 1))
-        linked_by_flow = (downstream == target_index) | (
-            target_downstream == cell_index
-        )
-        flow_resolved = (downstream >= 0) & (target_downstream >= 0)
-        same_basin = (basin > 0) & (
-            basin == np.roll(basin, shift=shift, axis=(0, 1))
-        )
-        cross_valley = flow_resolved & same_basin & ~linked_by_flow
         stream_bank = (river_order > 0) ^ (target_order > 0)
         stream_strength = np.maximum(river_order, target_order).astype(np.float64)
         atlas_major_bank = (river_order >= 3) ^ (target_order >= 3)
@@ -293,8 +280,7 @@ def _province_transition_penalties(
         target_road = np.roll(roads, shift=shift, axis=(0, 1))
         crossing_road = np.minimum(roads, target_road)
         penalties[direction] += (
-            2.6 * cross_valley
-            + stream_bank * (3.0 + 2.4 * np.clip(stream_strength, 0.0, 4.0))
+            stream_bank * (3.0 + 2.4 * np.clip(stream_strength, 0.0, 4.0))
         )
         # An authored road is evidence of an administrable corridor or a real
         # pass.  It softens an ordinary ridge/valley boundary, but does not
@@ -316,46 +302,86 @@ def _repair_inland_province_fragments(
     state_id: np.ndarray,
     province_specs: Sequence[_ProvinceSeed],
 ) -> np.ndarray:
-    """Remove province flyovers while preserving real overseas dependencies."""
-
-    result = np.asarray(labels, dtype=np.int32).copy()
-    states = np.asarray(state_id, dtype=np.int16)
-    if result.shape != states.shape:
-        raise ValueError("province and state labels must align")
-    height, width = result.shape
+    """Repair provincial fragments after every merge, preserving island seats."""
+    states = np.asarray(state_id)
+    nodes, components, _owners = categorical_components(states)
+    state_components = np.zeros(states.shape, dtype=np.int32)
+    state_components.ravel()[nodes] = components + 1
+    domains = np.zeros(max(spec.identifier for spec in province_specs) + 1, dtype=np.int32)
+    seats = {}
     for spec in province_specs:
-        components, sizes = connected_components(result == spec.identifier)
-        core_component = int(components[spec.core.row, spec.core.column])
-        if core_component <= 0:
-            raise ValueError("province core must remain inside its province")
-        for component_identifier in range(1, len(sizes) + 1):
-            if component_identifier == core_component:
-                continue
-            rows, columns = np.nonzero(components == component_identifier)
-            boundary: Counter[int] = Counter()
-            for row, column in zip(rows, columns, strict=True):
-                for dy, dx in ((-1, 0), (0, -1), (0, 1), (1, 0)):
-                    next_row = int(row) + dy
-                    if next_row < 0 or next_row >= height:
-                        continue
-                    next_column = (int(column) + dx) % width
-                    neighbor = int(result[next_row, next_column])
-                    if (
-                        neighbor > 0
-                        and neighbor != spec.identifier
-                        and int(states[next_row, next_column]) == spec.state_identifier
-                    ):
-                        boundary[neighbor] += 1
-            if not boundary:
-                # No same-state land boundary means a genuine water-separated
-                # dependency.  Its main-route justification was checked when
-                # unreachable state components were attached above.
-                continue
-            replacement = min(
-                boundary,
-                key=lambda identifier: (-boundary[identifier], identifier),
-            )
-            result[rows, columns] = replacement
+        domains[spec.identifier] = spec.state_identifier
+        seats[spec.identifier] = (spec.core.row, spec.core.column)
+    return reconcile_partition_components(labels, seats, domains, state_components,
+                                          prefer_local_seats=True)
+
+
+def _assign_unseeded_province_islands(
+    labels: np.ndarray,
+    state_id: np.ndarray,
+    province_specs: Sequence[_ProvinceSeed],
+    *,
+    settlements: Sequence[Settlement] = (),
+    routes=(),
+) -> np.ndarray:
+    """Give an already-owned unseeded island its nearest same-country seat.
+
+    Unlike state formation this does not create a territorial claim: the
+    country's sea-route evidence has already established ownership. IDs carry
+    no spatial meaning, so attachment uses spherical distance to the island.
+    """
+    result = np.asarray(labels).copy()
+    states = np.asarray(state_id)
+    nodes, components, owners = categorical_components(states)
+    if not nodes.size:
+        return result
+    height, width = states.shape
+    order = np.argsort(components, kind="stable")
+    starts = np.r_[0, np.flatnonzero(np.diff(components[order])) + 1, len(order)]
+    settlement_by_id = {item.identifier: item for item in settlements}
+    route_cells = []
+    for route in routes:
+        if route.mode != "sea" or route.target_settlement_id is None:
+            continue
+        first = settlement_by_id.get(route.source_settlement_id)
+        second = settlement_by_id.get(route.target_settlement_id)
+        if first is not None and second is not None:
+            a, b = (first.row, first.column), (second.row, second.column)
+            if int(states[a]) > 0 and states[a] == states[b]:
+                route_cells.append((a, b))
+    for start, stop in zip(starts[:-1], starts[1:], strict=True):
+        local = order[start:stop]
+        cells = nodes[local]
+        values = result.ravel()[cells]
+        if np.all(values > 0):
+            continue
+        if np.any(values > 0):
+            raise ValueError("a seeded provincial land component was not fully reached")
+        state = int(owners[local[0]])
+        candidates = [spec for spec in province_specs if spec.state_identifier == state]
+        rows, columns = np.divmod(cells, width)
+        latitude = np.pi * (0.5 - (rows + 0.5) / height)
+        longitude = 2.0 * np.pi * (columns + 0.5) / width
+        centre = np.array([np.mean(np.cos(latitude) * np.cos(longitude)),
+                           np.mean(np.cos(latitude) * np.sin(longitude)),
+                           np.mean(np.sin(latitude))])
+
+        def distance_key(spec):
+            lat = np.pi * (0.5 - (spec.core.row + 0.5) / height)
+            lon = 2.0 * np.pi * (spec.core.column + 0.5) / width
+            vector = np.array([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)])
+            return (-float(centre @ vector), spec.identifier)
+
+        sea_connected = set()
+        component_cells = set(int(cell) for cell in cells)
+        for a, b in route_cells:
+            for source, destination in ((a, b), (b, a)):
+                if (destination[0] * width + destination[1] in component_cells
+                        and int(result[source]) > 0):
+                    sea_connected.add(int(result[source]))
+        maritime_candidates = [spec for spec in candidates if spec.identifier in sea_connected]
+        target = min(maritime_candidates or candidates, key=distance_key)
+        result.ravel()[cells] = target.identifier
     return result
 
 
@@ -505,11 +531,53 @@ def _institutional_division_multiplier(administrative_system: str) -> float:
     }[administrative_system]
 
 
+def _province_core_targets(
+    state_areas: Mapping[int, float],
+    density_ratios: Mapping[int, float],
+    administrative_systems: Mapping[int, str],
+    candidate_counts: Mapping[int, int],
+) -> dict[int, int]:
+    """Apportion administrative seats without forcing equal-sized countries.
+
+    The atlas aims for about 5.6 provinces per country overall. Small states
+    with only one real town consume one seat; their unused share goes to
+    larger, settled states. No town or population is invented to hit a count.
+    Area, population density and institutions determine governing workload,
+    while urban-network size represents the number of actual local centres.
+    """
+    identifiers = sorted(state_areas)
+    if not identifiers:
+        return {}
+    capacity = {identifier: max(1, candidate_counts[identifier]) for identifier in identifiers}
+    target = min(round(len(identifiers) * 5.6), sum(capacity.values()))
+    area_total = max(1, sum(state_areas.values()))
+    town_total = max(1, sum(capacity.values()))
+    workload = {
+        identifier: (
+            0.65 * state_areas[identifier] / area_total
+            * _province_density_multiplier(density_ratios[identifier])
+            + 0.35 * capacity[identifier] / town_total
+        ) * _institutional_division_multiplier(administrative_systems[identifier])
+        for identifier in identifiers
+    }
+    result = dict.fromkeys(identifiers, 1)
+    for _seat in range(target - len(identifiers)):
+        eligible = [identifier for identifier in identifiers if result[identifier] < capacity[identifier]]
+        if not eligible:
+            break
+        chosen = max(eligible, key=lambda identifier: (
+            workload[identifier] / (result[identifier] + 0.5), -identifier,
+        ))
+        result[chosen] += 1
+    return result
+
+
 def _local_state_metrics(
     settlement: Settlement,
     state_identifier: int,
     state_id: np.ndarray,
-    population_weight: np.ndarray,
+    density_field: np.ndarray,
+    cell_areas: np.ndarray,
     accessibility: np.ndarray,
     *,
     radius: int = 18,
@@ -530,7 +598,8 @@ def _local_state_metrics(
     local_state = local_labels == state_identifier
     if not bool(np.any(local_state)):
         return 0.0, 0.0, 1.0
-    density = float(np.mean(population_weight[np.ix_(rows, columns)][local_state]))
+    density = float(np.average(density_field[np.ix_(rows, columns)][local_state],
+                              weights=cell_areas[np.ix_(rows, columns)][local_state]))
     access = float(np.mean(accessibility[np.ix_(rows, columns)][local_state]))
     governable_land = local_labels >= 0
     border_exposure = 1.0 - float(
@@ -1006,14 +1075,13 @@ def derive_provinces(
 
     controlled_area = int(np.count_nonzero(controlled))
     population_weight = np.asarray(population.population_weight, dtype=np.float64)
+    density_field = population_density(grid, population)
+    cell_areas = cell_areas_km2(grid)
+    midpoint_population = (population.population_min + population.population_max) / 2.0
     accessibility = np.asarray(transport.accessibility, dtype=np.float64)
     road_corridor, road_junction = road_network_fields(grid.shape, transport.routes)
     controlled_population = float(np.sum(population_weight[controlled]))
-    world_controlled_density = controlled_population / max(1, controlled_area)
-    target_area = max(
-        48.0,
-        controlled_area / max(1.0, len(politics.states) * 3.15),
-    )
+    world_controlled_density = controlled_population * midpoint_population / float(np.sum(cell_areas[controlled]))
     province_specs: list[_ProvinceSeed] = []
     settlement_by_identifier = {item.identifier: item for item in settlements}
     civilization_by_identifier = {
@@ -1025,6 +1093,42 @@ def derive_provinces(
     entity_by_state = {
         item.country_identifier: item for item in politics.political_entities
     }
+    state_areas: dict[int, float] = {}
+    density_ratios: dict[int, float] = {}
+    administrative_systems: dict[int, str] = {}
+    candidates_by_state: dict[int, list[Settlement]] = {}
+    candidate_counts: dict[int, int] = {}
+    for state in politics.states:
+        state_region = state_id == state.identifier
+        area = int(np.count_nonzero(state_region))
+        if area <= 0:
+            continue
+        entity = entity_by_state.get(state.identifier)
+        if entity is None:
+            raise ValueError("province parent country requires a political entity")
+        government = government_by_identifier.get(entity.government_form_identifier)
+        if government is None:
+            raise ValueError("province parent country requires a government form")
+        candidates = _province_core_candidates(
+            state.identifier, state.core_settlement_id, settlements, state_id,
+        )
+        if not candidates:
+            core = settlement_by_identifier.get(state.core_settlement_id)
+            if core is None:
+                raise ValueError("province parent country requires a real capital")
+            candidates = [core]
+        state_areas[state.identifier] = float(np.sum(cell_areas[state_region]))
+        density_ratios[state.identifier] = (
+            float(np.sum(population_weight[state_region])) * midpoint_population / state_areas[state.identifier]
+            / max(world_controlled_density, 1.0e-12)
+        )
+        administrative_systems[state.identifier] = _administrative_system(government.key)
+        candidates_by_state[state.identifier] = candidates
+        candidate_counts[state.identifier] = max(1, sum(item.tier != "site" for item in candidates))
+    core_targets = _province_core_targets(
+        state_areas, density_ratios, administrative_systems, candidate_counts,
+    )
+    target_area = max(48.0, controlled_area / max(1, sum(core_targets.values())))
     route_group_by_identifier = _major_route_groups(
         settlements,
         transport,
@@ -1045,50 +1149,10 @@ def derive_provinces(
         government = government_by_identifier.get(entity.government_form_identifier)
         if government is None:
             raise ValueError("province parent country requires a government form")
-        administrative_system = _administrative_system(government.key)
-        candidates = _province_core_candidates(
-            state.identifier,
-            state.core_settlement_id,
-            settlements,
-            state_id,
-        )
-        if not candidates:
-            core = settlement_by_identifier.get(state.core_settlement_id)
-            if core is None:
-                continue
-            candidates = [core]
-        urban_candidates = [item for item in candidates if item.tier != "site"]
-        if not urban_candidates:
-            urban_candidates = candidates
-        state_density = float(np.sum(population_weight[state_region])) / state_area
-        density_ratio = state_density / max(world_controlled_density, 1.0e-12)
-        desired = min(
-            18,
-            len(urban_candidates),
-            max(
-                1,
-                int(
-                    round(
-                        state_area
-                        / target_area
-                        * _province_density_multiplier(density_ratio)
-                        * _institutional_division_multiplier(administrative_system)
-                    )
-                ),
-            ),
-        )
-        desired = max(
-            desired,
-            min(
-                len(urban_candidates),
-                max(1, int(round(math.sqrt(len(urban_candidates))))),
-            ),
-        )
-        if government.key == "city-republic":
-            desired = min(
-                desired,
-                {"small": 1, "medium": 2, "major": 3}[state.size_class],
-            )
+        administrative_system = administrative_systems[state.identifier]
+        candidates = candidates_by_state[state.identifier]
+        density_ratio = density_ratios[state.identifier]
+        desired = core_targets[state.identifier]
 
         component_id, component_sizes = connected_components(state_region)
         capital = settlement_by_identifier.get(state.core_settlement_id)
@@ -1156,7 +1220,8 @@ def derive_provinces(
                 core,
                 state.identifier,
                 state_id,
-                population_weight,
+                density_field,
+                cell_areas,
                 accessibility,
             )
             for core in cores
@@ -1232,11 +1297,11 @@ def derive_provinces(
         return ProvinceLayers(province_id=result, provinces=())
 
     elevation = np.asarray(grid.elevation, dtype=np.float64)
-    gradient_row, gradient_column = np.gradient(elevation)
-    slope = np.hypot(gradient_row, gradient_column)
-    neighbor_mean = sum(
-        np.roll(elevation, shift=(dy, dx), axis=(0, 1))
-        for dy, dx in (
+    slope = relative_land_slope(elevation, grid.water == 0)
+    neighbor_sum = np.zeros(grid.shape, dtype=np.float64)
+    neighbor_count = np.zeros(grid.shape, dtype=np.uint8)
+    land = grid.water == 0
+    for dy, dx in (
             (-1, -1),
             (-1, 0),
             (-1, 1),
@@ -1245,8 +1310,17 @@ def derive_provinces(
             (1, -1),
             (1, 0),
             (1, 1),
-        )
-    ) / 8.0
+        ):
+        valid_neighbor = np.roll(land, shift=(dy, dx), axis=(0, 1))
+        if dy < 0:
+            valid_neighbor[-1] = False
+        elif dy > 0:
+            valid_neighbor[0] = False
+        neighbor_sum += np.where(valid_neighbor,
+            np.roll(elevation, shift=(dy, dx), axis=(0, 1)), 0.0)
+        neighbor_count += valid_neighbor
+    neighbor_mean = np.divide(neighbor_sum, neighbor_count,
+                              out=elevation.copy(), where=neighbor_count > 0)
     ridge = np.clip((elevation - neighbor_mean) / 0.035, 0.0, 1.0)
     friction = (
         1.0
@@ -1256,7 +1330,7 @@ def derive_provinces(
         + 2.8 * ridge
     )
     friction = np.clip(friction, 0.55, None)
-    transitions = _province_transition_penalties(grid, thematic, road_corridor)
+    transitions = _province_transition_penalties(grid, road_corridor)
     road_access = np.clip(0.82 * road_corridor + 0.18 * road_junction, 0.0, 1.0)
     bridge_edges = bridge_transition_discounts(
         np.asarray(grid.river_order),
@@ -1338,7 +1412,6 @@ def derive_provinces(
         label_owner=control_domain,
         friction=friction.astype(np.float32),
         band_radius=10,
-        jitter_strength=0.15,
     ).astype(np.int32)
     control_labels = natural_compartment_ids(
         controlled & (control_labels > 0),
@@ -1346,9 +1419,9 @@ def derive_provinces(
         domain=control_labels,
         barrier_threshold=14.0,
     ).astype(np.int32)
-    population_normalized = population_weight.astype(np.float64)
+    population_normalized = density_field.astype(np.float64)
     population_normalized /= max(
-        float(population_normalized.max(initial=1.0)),
+        float(population_normalized.max(initial=0.0)),
         1.0e-12,
     )
     local_resources = (
@@ -1371,27 +1444,41 @@ def derive_provinces(
             control_labels[spec.core.row, spec.core.column]
         )
         province_strength[spec.identifier] = spec.growth_scale
+    control_graph, edge_days, response_budgets = control_region_reach(
+        grid, control_graph, control_labels, core_region_by_province, province_strength,
+        provinces=True, routes=transport.routes,
+    )
     formation = simulate_state_formation(
         control_graph,
         core_region_by_state=core_region_by_province,
         state_strength=province_strength,
+        travel_days_by_edge=edge_days,
+        maximum_response_days_by_state=response_budgets,
     )
     result = np.where(np.asarray(grid.water) == 0, 0, -1).astype(np.int32)
     result[controlled] = formation.region_owner[control_labels[controlled]]
+    result = _assign_unseeded_province_islands(
+        result, state_id, province_specs, settlements=settlements, routes=transport.routes,
+    )
 
     province_state = np.zeros(len(province_specs) + 1, dtype=np.int16)
     for spec in province_specs:
         province_state[spec.identifier] = spec.state_identifier
-    result = _naturalize_straight_state_boundaries(
+    protected_rows, protected_columns = np.nonzero(
+        _settlement_protection_mask(settlements, grid.shape, radius=1) & (result > 0)
+    )
+    result = refine_partition_boundaries(
         result,
-        grid.elevation,
-        thematic.drainage_basin,
-        grid.river_order,
-        state_id,
-        province_state,
-        _settlement_protection_mask(settlements, grid.shape, radius=1),
-        minimum_run=7,
-        search_radius=8,
+        controlled,
+        transitions * (1.0 - bridge_edges),
+        {
+            (int(row), int(column)): int(result[row, column])
+            for row, column in zip(protected_rows, protected_columns, strict=True)
+        },
+        owner_field=state_id,
+        label_owner=province_state,
+        friction=friction.astype(np.float32),
+        band_radius=8,
     ).astype(np.int32)
     result = _repair_inland_province_fragments(
         result,
@@ -1413,13 +1500,14 @@ def derive_provinces(
         for spec in (province_specs[old_identifier - 1],)
     )
 
+    result = _repair_inland_province_fragments(result, state_id, province_specs)
     if np.any(controlled & (result <= 0)):
         raise ValueError("every country cell must belong to a province")
     province_records: list[Province] = []
     for spec in province_specs:
         region = result == spec.identifier
         area_cells = int(np.count_nonzero(region))
-        density = float(np.sum(population_weight[region])) / max(1, area_cells)
+        density = float(np.sum(population_weight[region])) * midpoint_population / float(np.sum(cell_areas[region]))
         density_ratio = density / max(world_controlled_density, 1.0e-12)
         density_class = (
             "dense"

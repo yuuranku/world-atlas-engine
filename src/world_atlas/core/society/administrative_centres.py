@@ -7,13 +7,14 @@ import math
 import numpy as np
 
 from ..model import WorldGrid
+from ..suitability import relative_land_slope
 from ..thematic import (
     BIOME_SAVANNA_DRY_GRASSLAND,
     BIOME_TEMPERATE_GRASSLAND,
     ThematicLayers,
 )
 from .model import PoliticalLayers, PopulationLayers, Settlement, TransportLayers
-from .population import _river_bank_location
+from .population import _river_bank_location, cell_areas_km2, population_density
 from .transport import road_network_fields
 
 
@@ -71,15 +72,18 @@ def derive_administrative_centres(
 
     controlled_area = int(np.count_nonzero(controlled))
     mean_service_area = controlled_area / len(urban)
+    cell_areas = cell_areas_km2(grid)
+    physical_service_area = float(np.sum(cell_areas[controlled])) / len(urban)
+    density_field = population_density(grid, population)
     controlled_population = float(
         np.sum(population.population_weight[controlled], dtype=np.float64)
     )
-    world_density = controlled_population / max(1, controlled_area)
+    midpoint_population = (population.population_min + population.population_max) / 2.0
+    world_density = controlled_population * midpoint_population / float(np.sum(cell_areas[controlled]))
     ocean_coast = (grid.water == 0) & _adjacent(np.isin(grid.water, (1, 3)))
     lake_coast = (grid.water == 0) & _adjacent(grid.water == 2)
-    slope = np.hypot(*np.gradient(grid.elevation.astype(np.float64)))
-    population_weight = population.population_weight.astype(np.float64)
-    positive_population = population_weight[population_weight > 0.0]
+    slope = relative_land_slope(grid.elevation, grid.water == 0)
+    positive_population = density_field[density_field > 0.0]
     population_scale = (
         float(np.quantile(positive_population, 0.90))
         if positive_population.size
@@ -102,7 +106,8 @@ def derive_administrative_centres(
         local = state_settlements.get(state.identifier, [])
         if area <= 0 or not local:
             continue
-        density = float(np.sum(population_weight[region])) / area
+        physical_area = float(np.sum(cell_areas[region]))
+        density = float(np.sum(population.population_weight[region])) * midpoint_population / physical_area
         density_factor = float(
             np.clip(max(density / max(world_density, 1.0e-12), 1.0e-6) ** 0.34, 0.68, 1.72)
         )
@@ -131,8 +136,8 @@ def derive_administrative_centres(
         )
         desired = int(
             math.ceil(
-                area
-                / max(mean_service_area, 1.0)
+                physical_area
+                / max(physical_service_area, 1.0)
                 * density_factor
                 * (1.0 + 0.48 * commercial_support)
                 / geographic_capacity
@@ -162,13 +167,13 @@ def derive_administrative_centres(
             valid = (
                 region
                 & (grid.water == 0)
+                & (grid.river_order == 0)
                 & ~grid.snow
                 & (grid.elevation < 0.72)
                 & (slope < 0.11)
                 & (
-                    (population.population_band >= 1)
+                    (density_field > 0.0)
                     | (thematic.land_potential >= 0.30)
-                    | (grid.river_order > 0)
                     | (road_access >= 0.24)
                     | ocean_coast
                     | lake_coast
@@ -188,7 +193,7 @@ def derive_administrative_centres(
                 0.24 * np.clip(distance / (service_spacing * 2.8), 0.0, 1.0)
                 + 0.24
                 * np.clip(
-                    population_weight[rows, columns]
+                    density_field[rows, columns]
                     / max(population_scale, 1.0e-12),
                     0.0,
                     1.0,
@@ -196,7 +201,6 @@ def derive_administrative_centres(
                 + 0.18 * thematic.land_potential[rows, columns]
                 + 0.16 * road_access[rows, columns]
                 + 0.18 * road_junction[rows, columns]
-                + 0.03 * (grid.river_order[rows, columns] > 0)
                 + 0.05 * ocean_coast[rows, columns]
                 + 0.03 * lake_coast[rows, columns]
                 + 0.09 * transport.accessibility[rows, columns]
@@ -210,15 +214,11 @@ def derive_administrative_centres(
             column = int(columns[choice])
             chosen_score = float(score[choice])
             river_bank_city = False
-            if (
-                int(grid.river_order[row, column]) >= 2
-                and not ocean_coast[row, column]
-                and not lake_coast[row, column]
-            ):
+            if int(grid.river_order[row, column]) > 0:
                 bank_score = np.where(
                     region & (grid.water == 0) & ~grid.snow,
                     0.46 * np.clip(
-                        population_weight / max(population_scale, 1.0e-12),
+                        density_field / max(population_scale, 1.0e-12),
                         0.0,
                         1.0,
                     )
@@ -266,8 +266,8 @@ def derive_administrative_centres(
             )
             tier = (
                 "city"
-                if population.population_band[row, column] >= 4
-                or population_weight[row, column] >= population_scale
+                if density_field[row, column] >= 1.0
+                or density_field[row, column] >= population_scale
                 or road_junction[row, column] >= 0.48
                 else "town"
             )

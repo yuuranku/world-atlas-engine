@@ -12,6 +12,7 @@ from ..model import WorldGrid
 from ..thematic import ThematicLayers
 from .culture import align_culture_names, assign_culture_lineages, derive_cultures
 from .administrative_centres import derive_administrative_centres
+from .administrations import derive_administrations
 from .institutions import derive_state_formation_profiles
 from .model import (
     CultureLayers,
@@ -37,6 +38,7 @@ def derive_society_layers(
     thematic: ThematicLayers,
     name_source: str | Path | NameLexicon,
     *,
+    raw_elevation_m: np.ndarray,
     settlement_count: int | None = None,
     civilization_count: int | None = None,
     minimum_civilization_count: int | None = None,
@@ -108,7 +110,7 @@ def derive_society_layers(
         )
     progress.info("Society: initial transport, %d settlements", len(settlements))
     routing_cache = RoutingCache()
-    transport = derive_transport(grid, thematic, population, settlements, routing_cache=routing_cache)
+    transport = derive_transport(grid, thematic, population, settlements, routing_cache=routing_cache, raw_elevation_m=raw_elevation_m)
     progress.info("Society: civilizations and languages")
     cultures = derive_cultures(
         grid,
@@ -136,7 +138,7 @@ def derive_society_layers(
     )
     # Holy-city identity is now part of route demand. Recompute the network
     # before states and provinces derive their expansion costs from it.
-    transport = derive_transport(grid, thematic, population, settlements, routing_cache=routing_cache)
+    transport = derive_transport(grid, thematic, population, settlements, routing_cache=routing_cache, raw_elevation_m=raw_elevation_m)
     state_formation_profiles = derive_state_formation_profiles(
         grid,
         thematic,
@@ -164,6 +166,7 @@ def derive_society_layers(
         settlements,
         transport,
         politics,
+        raw_elevation_m=raw_elevation_m,
     )
     for refinement_pass in range(2):
         progress.info("Society: administrative network refinement %d", refinement_pass + 1)
@@ -191,6 +194,7 @@ def derive_society_layers(
             population,
             settlements,
             routing_cache=routing_cache,
+            raw_elevation_m=raw_elevation_m,
         )
         state_formation_profiles = derive_state_formation_profiles(
             grid,
@@ -218,7 +222,40 @@ def derive_society_layers(
             settlements,
             transport,
             politics,
+            raw_elevation_m=raw_elevation_m,
         )
+    # Discover frontier outposts before finalising administration. Any new
+    # permanent town changes real transport demand and must participate in
+    # country formation, rather than being added afterwards as an orphan.
+    frontier_sites = derive_strategic_sites(
+        grid, thematic, population, settlements, cultures, transport, politics,
+        border_count=0,
+    )
+    if frontier_sites:
+        settlements = name_settlements(
+            settlements + frontier_sites, cultures, lexicon, grid, thematic,
+        )
+        if any(item.tier != "site" for item in frontier_sites):
+            progress.info("Society: integrate new frontier towns into transport and countries")
+            transport = derive_transport(
+                grid, thematic, population, settlements, routing_cache=routing_cache,
+                raw_elevation_m=raw_elevation_m,
+            )
+            state_formation_profiles = derive_state_formation_profiles(
+                grid, thematic, population, settlements, cultures, transport,
+            )
+            politics = derive_politics(
+                grid, thematic, population, settlements, cultures, transport, lexicon,
+                state_count=len(politics.states),
+                frontier_target_share=frontier_target_share,
+                state_formation_profiles=state_formation_profiles,
+            )
+            transport = conform_transport_to_politics(
+                grid, thematic, settlements, transport, politics,
+                raw_elevation_m=raw_elevation_m,
+            )
+    # One bounded feedback pass is enough: remaining additions are strategic
+    # sites at the final border, never new towns requiring another iteration.
     settlements = promote_border_settlements(
         grid,
         thematic,
@@ -235,6 +272,7 @@ def derive_society_layers(
         cultures,
         transport,
         politics,
+        frontier_count=0,
     )
     if strategic_sites:
         settlements = name_settlements(
@@ -256,7 +294,9 @@ def derive_society_layers(
         politics,
     )
     progress.info("Society: geographic names and canonical world identity")
-    features = extract_geographic_features(grid, thematic, cultures, lexicon)
+    features = extract_geographic_features(
+        grid, thematic, cultures, lexicon, raw_elevation_m=raw_elevation_m,
+    )
     society = SocietyLayers(
         population=population,
         settlements=settlements,
@@ -267,6 +307,12 @@ def derive_society_layers(
         politics=politics,
         provinces=provinces,
     )
+    # Institutions form on the control graph; final ownership is the common
+    # settlement arrival lower envelope, shared by provinces and countries.
+    progress.info("Society: shared administrative arrival front")
+    society, _ = derive_administrations(grid, thematic, society)
+    from .urban_population import allocate_urban_population
+    society = allocate_urban_population(grid, society)
     request = grid.metadata.get("societyGeneration", {})
     if isinstance(request, Mapping) and request.get("namingProfile") == "procedural":
         society = assign_world_identity(

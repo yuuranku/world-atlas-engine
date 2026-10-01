@@ -8,6 +8,7 @@ import math
 import numpy as np
 
 from ..model import WorldGrid
+from ..suitability import relative_land_slope
 from ..thematic import ThematicLayers
 from .model import (
     CultureLayers,
@@ -195,11 +196,10 @@ def derive_religions(
 
     transitions = physical_transition_penalties(
         grid.elevation,
-        thematic.drainage_basin,
         grid.river_order,
+        land_mask=grid.water == 0,
     ) * np.float32(0.46)
-    row_gradient, column_gradient = np.gradient(grid.elevation.astype(np.float64))
-    slope = np.hypot(row_gradient, column_gradient)
+    slope = relative_land_slope(grid.elevation, grid.water == 0)
     friction = np.clip(
         1.0
         + 4.2 * slope

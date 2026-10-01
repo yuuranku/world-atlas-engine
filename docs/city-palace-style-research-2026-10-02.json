@@ -1,0 +1,60 @@
+[
+  {
+    "url": "https://whc.unesco.org/en/list/439/",
+    "read": false,
+    "error": "HTTP Error 403: Forbidden"
+  },
+  {
+    "url": "https://whc.unesco.org/en/list/314/",
+    "read": false,
+    "error": "HTTP Error 403: Forbidden"
+  },
+  {
+    "url": "https://whc.unesco.org/en/list/356/",
+    "read": false,
+    "error": "HTTP Error 403: Forbidden"
+  },
+  {
+    "url": "https://en.chateauversailles.fr/discover/estate/palace",
+    "read": true,
+    "title": "The Palace | Château de Versailles",
+    "excerpts": [
+      " The Palace | Château de Versailles Skip to main content Search Close search Close Menu burger (EN) Discover The Estate The Palace The Gardens The estate of Trianon The Great Stables The Small Stables The Park The Royal Tennis Court The estate of Marly Around the Palace The history Great Characters Key Dates Chronicles from Versailles The collections Resource",
+      "s Skip to main content Search Close search Close Menu burger (EN) Discover The Estate The Palace The Gardens The estate of Trianon The Great Stables The Small Stables The Park The Royal Tennis Court The estate of Marly Around the Palace The history Great Characters Key Dates Chronicles from Versailles The collections Resources Plan your visit Practical information Tickets and prices For families Visits and advice Facilities FAQ What’s on Exhi",
+      " Stables The Small Stables The Park The Royal Tennis Court The estate of Marly Around the Palace The history Great Characters Key Dates Chronicles from Versailles The collections Resources Plan your visit Practical information Tickets and prices For families Visits and advice Facilities FAQ What’s on Exhibitions Past exhibitions Shows Musical Fountains Shows and Musical Gardens Events Patronage Life on the estate Restoration of the Royal Chap",
+      "nals Associations Teachers Patrons Journalists Select your language fr en Open search The Palace From the seat of power to a museum of the history of France Share Share on Facebook Share on Twitter Print Resize Resize down Resize up Breadcrumb Home Discover The Estate The Palace Since 1979, the Palace of Versailles has been listed as a World Heritage and is one of the greatest achievements in French 17 th century art. Louis XIII 's old huntin",
+      "ain content Search Close search Close Menu burger (EN) Discover The Estate The Palace The Gardens The estate of Trianon The Great Stables The Small Stables The Park The Royal Tennis Court The estate of Marly Around the Palace The history Great Characters Key Dates Chronicles from Versailles The collections Resources Plan your visit Practical information Tickets and prices For families Visits and advice Facilities FAQ What’s on Exhibitions Pas",
+      "ties FAQ What’s on Exhibitions Past exhibitions Shows Musical Fountains Shows and Musical Gardens Events Patronage Life on the estate Restoration of the Royal Chapel Calendar Menu burger footer (EN) Homepage For families Accessibility for all Ticketing Interactive map Shop You are A family Subscribers Tourism professionals Associations Teachers Patrons Journalists Select your language fr en Support Versailles → Visit our Facebook (opens in ne",
+      " Palace now seems a far cry from the countryside residence it once was. Nevertheless, the garden end on the west side of the Estate of Versailles is still adjoined by woods and agriculture. Video : Versailles, from Louis XIII to the French Revolution Video : Louis XIV - The Sun King Interactive map Discover the interior of the Palace with the different rooms to visit thanks to the interactive map. Explore Buy your ticket Guided tours Louis XI",
+      "oms The Coronation Room The 1792 Room The Grand Commun Countess Du Barry's apartments The Gardens The art of perspective The estate of Trianon A place of intimacy News Show The 2026-2027 musical season The Palace of Versailles is hosting numerous operas, concerts, plays and ballets in some of its exceptional spaces, including the Royal Opera and the Royal Chapel. Check out the programme for the 2025–2026 music season at Versailles. From March",
+      "ateau\" was used to refer to the rural location of a luxurious residence, as opposed to an urban palace. It was thus common to speak of the Louvre \"Palais” in the heart of Paris, and the \"Château” of Versailles out in the country. Versailles was only a village at the time. It was destroyed in 1673 to make way for the new town Louis XIV wished to create. Currently the centrepiece of Versailles urban planning, the Palace now seems a far cry fro",
+      " way for the new town Louis XIV wished to create. Currently the centrepiece of Versailles urban planning, the Palace now seems a far cry from the countryside residence it once was. Nevertheless, the garden end on the west side of the Estate of Versailles is still adjoined by woods and agriculture. Video : Versailles, from Louis XIII to the French Revolution Video : Louis XIV - The Sun King Interactive map Discover the interior of the Palace "
+    ]
+  },
+  {
+    "url": "https://watabou.itch.io/medieval-fantasy-city-generator",
+    "read": false,
+    "error": "<urlopen error [WinError 10060] 由于连接方在一段时间后没有正确答复或连接的主机没有反应，连接尝试失败。>"
+  },
+  {
+    "url": "https://watabou.github.io/city-generator/",
+    "read": true,
+    "title": "Medieval Fantasy City Generator",
+    "excerpts": []
+  },
+  {
+    "url": "https://www.alhambra-patronato.es/en/edificios-lugares/nasrid-palaces",
+    "read": false,
+    "error": "<urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1077)>"
+  },
+  {
+    "url": "https://www.hrp.org.uk/hampton-court-palace/history-and-stories/the-story-of-hampton-court-palace/",
+    "read": false,
+    "error": "HTTP Error 403: Forbidden"
+  },
+  {
+    "url": "https://www.dpm.org.cn/king/8",
+    "read": false,
+    "error": "HTTP Error 404: Not Found"
+  }
+]

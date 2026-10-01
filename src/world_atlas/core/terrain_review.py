@@ -12,7 +12,9 @@ import shutil
 import numpy as np
 
 from world_atlas.core.procedural_planet import load_surface_bundle
-from world_atlas.core.render import _contour_segments, _path_data
+from world_atlas.core.continuous_terrain import PhysicalTerrainField
+from world_atlas.core.implicit_terrain import terrain_level_curves
+from world_atlas.core.svg_paths import COORDINATE_SCALE, integer_subpath_data
 
 
 def publish_terrain_review(
@@ -31,15 +33,24 @@ def publish_terrain_review(
     shutil.copy2(image_source, image_target)
     shutil.copy2(source / "provenance.json", output / "provenance.json")
 
-    # The existing atlas contour extractor interpolates continuous elevation.
-    # Masking water ensures no extra lines are introduced into the ocean.
-    elevation = np.ma.masked_where(~surface.land_mask, surface.elevation)
-    segments = _contour_segments(elevation, list(np.linspace(0.06, 0.96, 19)))
-    paths = [
-        f'<path d="{_path_data(points + 0.5)}"/>'
-        for points, _level in segments
-        if len(points) >= 6
-    ]
+    diagnostics = surface.diagnostics
+    terrain = PhysicalTerrainField(surface.relative_elevation_m,
+        land_mask=surface.land_mask, sea_level_m=diagnostics["seaLevelMeters"],
+        elevation_scale_m=diagnostics["elevationScaleMeters"],
+        elevation_exponent=diagnostics["elevationExponent"])
+    palette_levels = np.linspace(0.06, 0.96, 19)
+    metre_levels = terrain.contour_height_m(palette_levels)
+    curves = terrain_level_curves(terrain, metre_levels)
+    paths = []
+    for palette, metres, branches in zip(palette_levels, metre_levels, curves, strict=True):
+        for points in branches:
+            delivered = np.rint(points*COORDINATE_SCALE).astype(np.int64)
+            keep = np.r_[True, np.any(delivered[1:] != delivered[:-1], axis=1)]
+            data = integer_subpath_data(map(tuple, delivered[keep]),
+                closed=bool(np.array_equal(points[0], points[-1])))
+            if data:
+                paths.append(f'<path data-elevation-level="{palette:.17g}" '
+                    f'data-elevation-m="{metres:.17g}" d="{data}"/>')
     svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}">'
@@ -60,6 +71,7 @@ def publish_terrain_review(
         "height": height,
         "sourceSha256": image_digest,
         "contourCount": len(paths),
+        "contourModel": "source-tensor-pchip-native-roots-adaptive-curves",
         "contourBytes": len(svg.encode("utf-8")),
         "review": str(output / "index.html"),
     }

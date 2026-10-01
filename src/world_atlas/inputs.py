@@ -28,28 +28,28 @@ from world_atlas.settings import WorldSettings
 
 SEED = 2116268501
 LAND_PALETTE = (
-    (0x69, 0xBD, 0xA9),
-    (0x8F, 0xD2, 0xA4),
-    (0xB6, 0xE2, 0xA1),
-    (0xD7, 0xEF, 0x9F),
-    (0xEE, 0xF8, 0xA8),
-    (0xFB, 0xF8, 0xB0),
-    (0xFE, 0xEB, 0x9F),
-    (0xFE, 0xD4, 0x83),
-    (0xFD, 0xB7, 0x6A),
-    (0xF9, 0x94, 0x56),
-    (0xF0, 0x70, 0x4A),
-    (0xE0, 0x50, 0x4A),
+    (0x7B, 0xB6, 0x6D),
+    (0x98, 0xC5, 0x7C),
+    (0xBA, 0xD2, 0x8C),
+    (0xD8, 0xDA, 0x9A),
+    (0xEE, 0xDC, 0xA3),
+    (0xED, 0xCC, 0x88),
+    (0xDF, 0xB2, 0x71),
+    (0xCD, 0x98, 0x63),
+    (0xB7, 0x81, 0x58),
+    (0xA2, 0x70, 0x56),
+    (0x92, 0x71, 0x5F),
+    (0xB2, 0xA4, 0x97),
 )
 BATHYMETRY_PALETTE = (
-    (0x9F, 0xB8, 0xE7),
-    (0x99, 0xB3, 0xE4),
-    (0x91, 0xAD, 0xE1),
-    (0x99, 0xAF, 0xD1),
-    (0x8C, 0xA5, 0xCB),
-    (0x7C, 0x98, 0xC3),
-    (0x6B, 0x8B, 0xBC),
-    (0x67, 0x87, 0xB8),
+    (0xEF, 0xFC, 0xFA),
+    (0xDA, 0xF2, 0xF5),
+    (0xC3, 0xE9, 0xF3),
+    (0xAD, 0xDF, 0xEE),
+    (0x94, 0xCD, 0xE4),
+    (0x76, 0xB4, 0xD1),
+    (0x61, 0x99, 0xBC),
+    (0x48, 0x74, 0x9B),
 )
 
 
@@ -137,7 +137,7 @@ def _config_document(
         "palettes": {
             "land": _hex_palette(LAND_PALETTE),
             "bathymetry": _hex_palette(BATHYMETRY_PALETTE),
-            "levels": {"elevation": 16, "bathymetry": 8},
+            "levels": {"elevation": 24, "bathymetry": 8},
         },
         "elevationRegularization": {"sigmaGridUnits": 1.5, "passes": 2},
         "hydrology": {
@@ -219,7 +219,7 @@ def prepare_world_inputs(
         "fieldBundle": {
             "file": bundle_path.name,
             "sha256": bundle_sha256,
-            "schema": "procedural-surface-bundle-v2",
+            "schema": "procedural-surface-bundle-v3",
         },
     }
     provenance_path = source_directory / "provenance.json"
@@ -269,22 +269,41 @@ def attach_world_metadata(
     coordinate_reference_system = dict(metadata["coordinateReferenceSystem"])
     coordinate_reference_system["referenceBody"] = world_name
     metadata["coordinateReferenceSystem"] = coordinate_reference_system
+    era_profiles = {
+        "tribal": {"technology": "部落", "populationPattern": "小规模聚落与季节性迁徙", "transportSemantics": ["步道", "商路", "河道", "近海航路"]},
+        "ancient": {"technology": "古典", "populationPattern": "城邦与农耕腹地", "transportSemantics": ["官道", "驿道", "河道", "海路"]},
+        "medieval": {"technology": "中古", "populationPattern": "城堡、集镇与农耕腹地", "transportSemantics": ["驿道", "商路", "河道", "海路"]},
+        "early-modern": {"technology": "近世", "populationPattern": "商业港口与区域城市", "transportSemantics": ["官道", "驿道", "商路", "河道", "远洋航线"]},
+        "preindustrial": {
+            "technology": "前工业",
+            "populationPattern": "稀疏定居与广阔边疆",
+            "transportSemantics": ["官道", "驿道", "商路", "可通航河道", "海路"],
+        },
+        "industrial": {
+            "technology": "工业时代",
+            "populationPattern": "铁路走廊、港口城市与工业盆地并存",
+            "transportSemantics": ["干线铁路", "支线铁路", "铺装道路", "内河航道", "远洋航线"],
+        },
+        "contemporary": {
+            "technology": "近现代",
+            "populationPattern": "多核心都市圈、快速交通走廊与广域服务网络",
+            "transportSemantics": ["高速铁路", "铁路", "高速公路", "干线公路", "内河航道", "海运航线"],
+        },
+    }
+    era = settings.technology_era
+    era_profile = era_profiles[era]
     metadata["worldProfile"] = {
         "name": world_name,
         "seed": naming_seed,
-        "starClass": "G2黄色恒星",
-        "satellites": "多颗小卫星",
-        "tides": "偏弱",
         "plateRegime": f"{recipe.plate_count}块、连续运动学板块系统",
         "landFraction": float(diagnostics["landFraction"]),
         "continentLayout": (
             f"{recipe.continent_count}个大陆地壳核心；"
             f"{diagnostics['worldFamily']}"
         ),
-        "climateBias": "偏干，草原、荒漠与内流盆地偏多",
-        "technology": "preindustrial",
-        "populationPattern": "稀疏定居与广阔边疆",
-        "transportSemantics": ["官道", "驿道", "商路", "可通航河道", "海路"],
+        "technologyEra": era,
+        "travelCapabilities": list(settings.travel_capabilities),
+        **era_profile,
     }
     metadata["proceduralPhysicalSource"] = {
         "method": diagnostics["method"],
@@ -300,13 +319,14 @@ def attach_world_metadata(
         "fieldBundle": {
             "path": str(Path(bundle_path).resolve()),
             "sha256": bundle_sha256,
-            "schema": "procedural-surface-bundle-v2",
+            "schema": "procedural-surface-bundle-v3",
         },
     }
     metadata["societyGeneration"] = {
         "namingProfile": "procedural",
         "humanSeed": settings.human_seed,
         "namingSeed": settings.naming_seed,
+        "technologyEra": era,
         **dict(settings.society),
     }
     if forbidden_names:

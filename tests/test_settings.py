@@ -16,6 +16,7 @@ class WorldSettingsTests(unittest.TestCase):
         self.assertEqual(settings.naming_seed, 3188500066)
         self.assertEqual(settings.society["stateCount"], 45)
         self.assertEqual(settings.society["frontierTargetShare"], 0.25)
+        self.assertEqual(settings.technology_era, "preindustrial")
 
     def test_unknown_fields_are_rejected(self):
         document = json.loads(EXAMPLE.read_text(encoding="utf-8"))
@@ -34,6 +35,30 @@ class WorldSettingsTests(unittest.TestCase):
             path.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "frontierTargetShare"):
                 load_world_settings(path)
+
+    def test_technology_era_is_strict(self):
+        document = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        document["technologyEra"] = "steam-punk"
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "technologyEra"):
+                load_world_settings(path)
+
+    def test_saved_flight_capabilities_round_trip_and_reject_unknown_modes(self):
+        document = json.loads(EXAMPLE.read_text(encoding='utf-8'))
+        document['travelCapabilities'] = ['magic-flight','dragon']
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'settings.json'
+            path.write_text(json.dumps(document),encoding='utf-8')
+            settings = load_world_settings(path)
+            self.assertEqual(settings.travel_capabilities,('magic-flight','dragon'))
+            self.assertEqual(settings.document(),document)
+            for invalid in (['airplane'],['dragon','dragon']):
+                document['travelCapabilities'] = invalid
+                path.write_text(json.dumps(document),encoding='utf-8')
+                with self.assertRaisesRegex(ValueError,'travelCapabilities'):
+                    load_world_settings(path)
 
 
 if __name__ == "__main__":

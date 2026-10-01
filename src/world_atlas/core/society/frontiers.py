@@ -21,6 +21,7 @@ from ..thematic import (
     smooth_field,
 )
 from .model import CultureLayers, FrontierGroup, PopulationLayers
+from .population import population_density
 from .onomastics import lineage_roots, lineage_style_index
 from .spatial import (
     connected_components,
@@ -46,7 +47,8 @@ def derive_stateless_frontier(
     elevation: np.ndarray,
     annual_precipitation: np.ndarray,
     land_potential: np.ndarray,
-    population_weight: np.ndarray,
+    population_density: np.ndarray,
+    cell_areas: np.ndarray,
     accessibility: np.ndarray,
     river_order: np.ndarray,
     transition_penalty: np.ndarray,
@@ -60,7 +62,9 @@ def derive_stateless_frontier(
     administered country, not an empty population mask.  A low-frequency
     state-formation score chooses the broad extent, while a narrow native-
     resolution regrowth pass places its edge on major rivers, drainage
-    divides and ridges.  Urban anchors are never reserved as stateless land.
+    divides and ridges.  Dense settled belts and urban/transport anchors are
+    never reserved as stateless land. ``target_share`` is a soft upper budget:
+    geography may support less frontier, never forced clearance of farmland.
     """
 
     domain = np.asarray(land, dtype=bool)
@@ -70,7 +74,8 @@ def derive_stateless_frontier(
     height = np.asarray(elevation, dtype=np.float64)
     precipitation = np.asarray(annual_precipitation, dtype=np.float64)
     potential = np.asarray(land_potential, dtype=np.float64)
-    population = np.asarray(population_weight, dtype=np.float64)
+    density = np.asarray(population_density, dtype=np.float64)
+    areas = np.asarray(cell_areas, dtype=np.float64)
     access = np.asarray(accessibility, dtype=np.float64)
     rivers = np.asarray(river_order)
     transitions = np.asarray(transition_penalty, dtype=np.float32)
@@ -83,7 +88,8 @@ def derive_stateless_frontier(
         height,
         precipitation,
         potential,
-        population,
+        density,
+        areas,
         access,
         rivers,
         anchors,
@@ -99,7 +105,11 @@ def derive_stateless_frontier(
     if land_count == 0 or target_count == 0:
         return np.zeros(shape, dtype=bool)
 
-    population_scale = population / max(float(population.max(initial=0.0)), 1.0e-12)
+    if np.any(~np.isfinite(density)) or np.any(density < 0.0):
+        raise ValueError("frontier population density must be finite and non-negative")
+    if np.any(~np.isfinite(areas)) or np.any(areas <= 0.0):
+        raise ValueError("frontier cell areas must be finite and positive")
+    population_scale = density / max(float(density.max(initial=0.0)), 1.0e-12)
     access_scale = np.clip(access, 0.0, 1.0)
     potential_scale = np.clip(potential, 0.0, 1.0)
     relief = np.clip((height - 0.42) / 0.34, 0.0, 1.0)
@@ -141,7 +151,17 @@ def derive_stateless_frontier(
     frontier_score = 0.82 * macro + 0.18 * local_propensity
     frontier_score += 0.035 * np.max(transitions, axis=0)
 
-    eligible = domain & ~anchors
+    # A regional preference score cannot turn an inhabited agricultural belt
+    # into stateless land merely because a requested area quota is still
+    # unfilled. Compare density within this world, not against its single
+    # busiest pixel, which can make ordinary productive countryside look empty.
+    mean_density = float(np.average(density[domain], weights=areas[domain]))
+    relative_density = density / max(mean_density, 1.0e-12)
+    settled_belt = (relative_density >= 0.75) | (
+        (relative_density >= 0.45)
+        & ((access_scale >= 0.25) | (potential_scale >= 0.45))
+    )
+    eligible = domain & ~anchors & ~settled_belt
     target_count = min(target_count, int(np.count_nonzero(eligible)))
     frontier = np.zeros(shape, dtype=bool)
     remaining = target_count
@@ -159,9 +179,8 @@ def derive_stateless_frontier(
             ]
         frontier.reshape(-1)[selected] = True
 
-    # Re-grow only the seam.  This preserves the 35% regional allocation but
-    # moves its visible edge off pixel-distance contours and onto physical
-    # barriers at the authored map resolution.
+    # Re-grow only the seam, then reapply the settlement constraints. Natural
+    # boundary refinement must not expand a belt into protected countryside.
     labels = np.zeros(shape, dtype=np.int8)
     labels[domain] = 1
     labels[frontier] = 2
@@ -174,15 +193,13 @@ def derive_stateless_frontier(
             np.float32
         ),
         band_radius=9,
-        jitter_strength=0.04,
     )
-    result = domain & (labels == 2) & ~anchors
+    result = eligible & (labels == 2)
 
     # A low-frequency threshold can still leave tiny hilltop or coastal
     # islands of stateless color.  They reproduce the unexplained holes the
     # frontier model is meant to remove, so retain only regional-scale belts.
-    # The missing share is grown outward from those belts rather than started
-    # again as disconnected specks.
+    # Removing specks is allowed to reduce the requested share.
     components, sizes = connected_components(result)
     minimum_component = max(
         32,
@@ -193,33 +210,6 @@ def derive_stateless_frontier(
         if int(size) < minimum_component:
             result[components == identifier] = False
 
-    def adjacent(mask: np.ndarray) -> np.ndarray:
-        padded = np.pad(mask, ((1, 1), (0, 0)), mode="constant")
-        return (
-            np.roll(mask, 1, axis=1)
-            | np.roll(mask, -1, axis=1)
-            | padded[:-2]
-            | padded[2:]
-        )
-
-    # Boundary regrowth may move a broad seam by several cells and therefore
-    # change its area.  Restore the authored 35% exactly by adding only cells
-    # touching an existing belt, ranked by the same geographic propensity.
-    while int(np.count_nonzero(result)) < target_count:
-        deficit = target_count - int(np.count_nonzero(result))
-        growth = eligible & ~result & adjacent(result)
-        indices = np.flatnonzero(growth)
-        if indices.size == 0:
-            indices = np.flatnonzero(eligible & ~result)
-        if indices.size == 0:
-            break
-        take = min(deficit, int(indices.size))
-        scores = frontier_score.reshape(-1)[indices]
-        if take < indices.size:
-            indices = indices[
-                np.argpartition(scores, scores.size - take)[-take:]
-            ]
-        result.reshape(-1)[indices] = True
     return result.astype(bool)
 
 
@@ -510,8 +500,9 @@ def derive_frontier_groups(
     density = smooth_field(coarse_support.astype(np.float64), radius=3, passes=1)
     ocean_adjacent = _ocean_adjacent(grid)
     coarse_potential = reduce_field(thematic.land_potential, step=step, mode="mean")
+    density_field = population_density(grid, population)
     coarse_population = reduce_field(
-        population.population_weight,
+        density_field,
         step=step,
         mode="mean",
     )
@@ -562,7 +553,7 @@ def derive_frontier_groups(
             (BIOME_TEMPERATE_GRASSLAND, BIOME_SAVANNA_DRY_GRASSLAND),
         )
         - 0.08 * ocean_adjacent
-        + 0.10 * population.population_band.astype(np.float64) / 6.0
+        + 0.10 * density_field / max(float(density_field.max(initial=0.0)), 1.0e-12)
         - 0.20 * grid.snow
     )
     anchors = [

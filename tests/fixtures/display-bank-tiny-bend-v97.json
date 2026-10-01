@@ -1,0 +1,65 @@
+{
+  "crossing": {
+    "id": "bridge-0047",
+    "kind": "bridge",
+    "sourceRoadIds": [
+      "road-1101"
+    ],
+    "nativePoint": [
+      864.5,
+      275.5
+    ],
+    "displayPoint": [
+      864.5,
+      275.5
+    ],
+    "riverCell": [
+      275,
+      864
+    ],
+    "riverOrder": 1,
+    "evidence": "recorded-bridge-and-native-flow-crossing",
+    "sourceBankTransitions": [
+      {
+        "routeIdentifier": "road-1101",
+        "nativeDirections": [
+          [
+            0.38268343236508984,
+            0.9238795325112867
+          ],
+          [
+            -0.38268343236509034,
+            -0.9238795325112865
+          ]
+        ],
+        "bankPoints": [
+          [
+            864.5012875479288,
+            275.50310841567006
+          ],
+          [
+            864.4989911672692,
+            275.49756446234056
+          ]
+        ]
+      }
+    ]
+  },
+  "riverGeometry": {
+    "type": "LineString",
+    "coordinates": [
+      [
+        864.7,
+        275.5
+      ],
+      [
+        864.5,
+        275.5
+      ],
+      [
+        864.4938907085649,
+        275.50610929143505
+      ]
+    ]
+  }
+}

@@ -26,7 +26,7 @@ from .onomastics import (
     lineage_key,
     lineage_language_candidates,
 )
-from .politics import _naturalize_straight_state_boundaries
+from .population import population_density
 from .spatial import (
     allocate_regions_by_proximity,
     connected_components,
@@ -383,7 +383,7 @@ def _civilization_transmission_mask(
     steppe: np.ndarray,
     coast: np.ndarray,
     snow: np.ndarray,
-    dry: np.ndarray,
+    habitability: np.ndarray,
 ) -> np.ndarray:
     """Return land reachable through continuous human and physical corridors.
 
@@ -403,7 +403,7 @@ def _civilization_transmission_mask(
     grassland = np.asarray(steppe, dtype=np.float64)
     coastal = np.asarray(coast, dtype=np.float64)
     permanent_snow = np.asarray(snow, dtype=bool)
-    arid = np.asarray(dry, dtype=bool)
+    residential_capacity = np.asarray(habitability, dtype=np.float64)
     fields = (
         hearths,
         population,
@@ -414,14 +414,14 @@ def _civilization_transmission_mask(
         grassland,
         coastal,
         permanent_snow,
-        arid,
+        residential_capacity,
     )
     if any(field.shape != coarse_land.shape for field in fields):
         raise ValueError("civilization transmission fields must align")
     if not np.any(hearths & coarse_land):
         raise ValueError("civilization transmission requires inhabited hearths")
 
-    population_scale = population / max(float(population.max(initial=1.0)), 1.0e-15)
+    population_scale = population / max(float(population.max(initial=0.0)), 1.0e-15)
     access_scale = np.clip(access, 0.0, 1.0)
     navigable_valley = (
         (rivers >= 2)
@@ -444,7 +444,7 @@ def _civilization_transmission_mask(
         & (population_scale < 0.12)
         & (access_scale < 0.06)
     ) | (
-        arid
+        (residential_capacity < 0.20)
         & (suitability < 0.11)
         & (population_scale < 0.15)
         & (access_scale < 0.06)
@@ -1117,29 +1117,21 @@ def derive_cultures(
     elevation = reduce_field(grid.elevation, step=step, mode="max")
     potential = reduce_field(thematic.land_potential, step=step, mode="mean")
     population_support = reduce_field(population.population_weight, step=step, mode="max")
+    density_support = reduce_field(population_density(grid, population), step=step, mode="max")
     river = reduce_field(grid.river_order > 0, step=step, mode="max").astype(bool)
     river_order = reduce_field(grid.river_order, step=step, mode="max")
-    sample_rows = np.minimum(
-        np.arange(coarse_land.shape[0], dtype=np.int64) * step + step // 2,
-        grid.shape[0] - 1,
-    )
-    sample_columns = np.minimum(
-        np.arange(coarse_land.shape[1], dtype=np.int64) * step + step // 2,
-        grid.shape[1] - 1,
-    )
-    sampled_basins = thematic.drainage_basin[np.ix_(sample_rows, sample_columns)]
-    basin = np.where(sampled_basins >= 0, sampled_basins.astype(np.int64) + 1, 0)
     transition_penalty = physical_transition_penalties(
         elevation,
-        basin,
         river_order,
+        land_mask=grid.water == 0,
     ) * 1.45
     snow = reduce_field(grid.snow, step=step, mode="max").astype(bool)
-    dry = reduce_field(
-        thematic.climate.annual_precipitation < 0.05,
+    habitability = reduce_field(
+        thematic.habitability,
         step=step,
-        mode="max",
-    ).astype(bool)
+        mode="mean",
+    )
+    residential_constraint = 1.0 - np.clip(habitability, 0.0, 1.0)
     ocean = np.isin(grid.water, (1, 3))
     ocean_adjacent = np.roll(ocean, 1, axis=1) | np.roll(ocean, -1, axis=1)
     if grid.shape[0] > 1:
@@ -1203,7 +1195,7 @@ def derive_cultures(
     transmission_support = _civilization_transmission_mask(
         coarse_land,
         inhabited_candidate_mask,
-        population_support,
+        density_support,
         accessibility,
         potential,
         elevation,
@@ -1211,7 +1203,7 @@ def derive_cultures(
         steppe,
         coast,
         snow,
-        dry,
+        habitability,
     )
     transmission_component, _transmission_sizes = connected_components(
         transmission_support
@@ -1236,8 +1228,8 @@ def derive_cultures(
         civilization_count=civilization_count,
     )
     macro_radius = max(2, int(round(min(coarse_land.shape) / 28.0)))
-    population_scale = population_support / max(
-        float(population_support.max(initial=1.0)), 1.0e-15
+    population_scale = density_support / max(
+        float(density_support.max(initial=0.0)), 1.0e-15
     )
     candidate_values = candidate_score[candidate_mask]
     candidate_low = float(candidate_values.min())
@@ -1297,7 +1289,7 @@ def derive_cultures(
         1.0
         + 6.2 * np.square(np.clip(elevation, 0.0, 1.0))
         + 2.6 * (1.0 - np.clip(potential, 0.0, 1.0))
-        + 3.8 * dry
+        + 3.8 * residential_constraint
         + 30.0 * snow
         - 0.38 * river
     )
@@ -1433,18 +1425,6 @@ def derive_cultures(
             if civilization[settlement.row, settlement.column] > 0
         },
         band_radius=28,
-        jitter_strength=0.15,
-    )
-    civilization = _naturalize_straight_state_boundaries(
-        civilization,
-        grid.elevation,
-        thematic.drainage_basin,
-        grid.river_order,
-        np.where(civilization > 0, 1, 0).astype(np.int16),
-        np.asarray([0, *([1] * len(civilization_seeds))], dtype=np.int16),
-        settlement_cells,
-        minimum_run=12,
-        search_radius=7,
     )
     cultural_frontier = land & grid.snow
     civilization[cultural_frontier & ~settlement_cells] = 0
@@ -1470,12 +1450,12 @@ def derive_cultures(
         1.0
         + 8.5 * np.square(np.clip(elevation, 0.0, 1.0))
         + 1.2 * (1.0 - np.clip(potential, 0.0, 1.0))
-        + 2.8 * dry
+        + 2.8 * residential_constraint
         + 40.0 * snow
         - 0.42 * river
         - 0.30 * np.clip(accessibility, 0.0, 1.0)
         - 0.18 * np.clip(
-            population_support / max(float(population_support.max(initial=1.0)), 1.0e-15),
+            population_scale,
             0.0,
             1.0,
         )
@@ -1543,7 +1523,6 @@ def derive_cultures(
         label_owner=language_parent,
         friction=language_friction,
         band_radius=14,
-        jitter_strength=0.12,
     )
     family_for_language = {
         identifier: civilization_by_language[identifier]

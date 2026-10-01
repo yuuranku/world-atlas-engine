@@ -5,12 +5,17 @@ from __future__ import annotations
 import heapq
 import hashlib
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 
 import numpy as np
+import shapely
+from scipy.ndimage import distance_transform_edt
 
 from ..model import WorldGrid
+from ..suitability import relative_land_slope
 from ..thematic import ThematicLayers, smooth_field
+from ..road_engineering import RoadEngineering
 from .model import (
     Bridge,
     PoliticalLayers,
@@ -34,6 +39,23 @@ _NEIGHBORS = (
 )
 _TIER_RANK = {"metropolis": 2, "city": 1, "town": 0, "site": 0}
 _ROAD_LOCAL_DEGREE = {"metropolis": 3, "city": 2, "town": 1, "site": 1}
+_TECHNOLOGY_ERAS = frozenset(
+    {"tribal", "ancient", "medieval", "early-modern", "preindustrial", "industrial", "contemporary"}
+)
+_RAIL_ERAS = frozenset({"industrial", "contemporary"})
+
+
+def _technology_era(grid: WorldGrid) -> str:
+    """Return the strict transport era carried by the canonical world profile."""
+
+    profile = grid.metadata.get("worldProfile", {})
+    era = profile.get("technologyEra") if isinstance(profile, Mapping) else None
+    if era not in _TECHNOLOGY_ERAS:
+        raise ValueError(
+            "transport requires a strict worldProfile.technologyEra; choose one of: "
+            + ", ".join(sorted(_TECHNOLOGY_ERAS))
+        )
+    return era
 
 
 @dataclass
@@ -53,14 +75,15 @@ class RoutingCache:
             digest.update(memoryview(values).cast("B"))
         return digest.digest()
 
-    def route(self, signature, friction, valid, start, goal, refinement):
-        key = (signature, start, goal)
+    def route(self, signature, friction, valid, start, goal, refinement, *, simplify: bool = True,
+              blocked_edges=None, river_barrier=None, edge_costs=None):
+        key = (signature, start, goal, simplify)
         if key in self.paths:
             self.hits += 1
             return self.paths[key]
         self.misses += 1
-        path = _least_cost_path(friction, valid, start, goal)
-        result = _terrain_safe_simplification(path, refinement, valid) if path else ()
+        path = _least_cost_path(friction, valid, start, goal,blocked_edges=blocked_edges,edge_costs=edge_costs)
+        result = _terrain_safe_simplification(path, refinement, valid,river_barrier=river_barrier,edge_costs=edge_costs) if path and simplify else path
         self.paths[key] = result
         return result
 
@@ -80,6 +103,7 @@ def _least_cost_path(
     valid: np.ndarray,
     start: tuple[int, int],
     goal: tuple[int, int],
+    *, blocked_edges=None, edge_costs=None,
 ) -> tuple[tuple[int, int], ...]:
     """A* path on a wrapped raster; an empty tuple means disconnected."""
 
@@ -91,6 +115,14 @@ def _least_cost_path(
         1.0e-9,
         float(valid_friction.min(initial=1.0)),
     )
+    if edge_costs is not None:
+        heuristic_scale = edge_costs.heuristic_scale
+        if not math.isfinite(heuristic_scale):
+            return ()
+        heuristic_cost = edge_costs.heuristic(goal)
+        edge_costs = memoryview(edge_costs.values)
+    else:
+        heuristic_cost = lambda point: _wrapped_distance(point,goal,width)*heuristic_scale
     # Buffer access returns native scalars; avoid millions of NumPy scalar
     # allocations while keeping costs, heap ordering and ties identical.
     friction = memoryview(np.ascontiguousarray(friction, dtype=np.float64))
@@ -99,7 +131,7 @@ def _least_cost_path(
     previous: dict[tuple[int, int], tuple[int, int]] = {}
     queue: list[tuple[float, float, int, int]] = [
         (
-            _wrapped_distance(start, goal, width) * heuristic_scale,
+            heuristic_cost(start),
             0.0,
             start[0],
             start[1],
@@ -116,7 +148,9 @@ def _least_cost_path(
                 path.append(previous[path[-1]])
             path.reverse()
             return tuple(path)
-        for dy, dx, distance in _NEIGHBORS:
+        for direction, (dy, dx, distance) in enumerate(_NEIGHBORS):
+            if blocked_edges is not None and blocked_edges[row,column] & (1 << direction):
+                continue
             next_row = row + dy
             if next_row < 0 or next_row >= height:
                 continue
@@ -133,16 +167,18 @@ def _least_cost_path(
                     and valid[next_row, column]
                 ):
                     continue
-            edge = 0.5 * (
+            edge = float(edge_costs[row,column,direction]) if edge_costs is not None else 0.5 * (
                 float(friction[row, column]) + float(friction[next_row, next_column])
             ) * distance
+            if not math.isfinite(edge):
+                continue
             next_cost = cost + edge
             point = (next_row, next_column)
             if next_cost >= costs.get(point, math.inf) - 1.0e-12:
                 continue
             costs[point] = next_cost
             previous[point] = current
-            heuristic = _wrapped_distance(point, goal, width) * heuristic_scale
+            heuristic = heuristic_cost(point)
             heapq.heappush(
                 queue,
                 (next_cost + heuristic, next_cost, next_row, next_column),
@@ -198,12 +234,18 @@ def _terrain_safe_simplification(
     friction: np.ndarray,
     valid: np.ndarray,
     *,
-    maximum_span: int = 18,
+    maximum_span: int = 6,
+    river_barrier=None,
+    edge_costs=None,
 ) -> tuple[tuple[int, int], ...]:
     """Remove flat-land lattice noise without cutting across real relief."""
 
     if len(path) <= 2:
         return path
+    if edge_costs is not None:
+        # Grade-aware road stations are authoritative. Retain turns instead of
+        # replacing them with chords whose construction cost was never routed.
+        return _simplify_lattice_path(path)
     height, width = valid.shape
 
     def line_cells(
@@ -240,7 +282,22 @@ def _terrain_safe_simplification(
         original_values: list[float] = []
         for candidate in range(anchor + 1, furthest + 1):
             original_values.append(float(friction[path[candidate]]))
+            # Preserve the actual valley route. Similar endpoint friction
+            # does not justify replacing a winding corridor with a long chord.
+            source = np.asarray(path[anchor:candidate + 1], dtype=np.float64)
+            source[:, 1] = source[0, 1] + (source[:, 1] - source[0, 1] + width / 2) % width - width / 2
+            delta = source[-1] - source[0]
+            length_squared = float(np.dot(delta, delta))
+            if length_squared > 0:
+                projection = np.clip((source - source[0]) @ delta / length_squared, 0, 1)
+                deviation = np.linalg.norm(source - (source[0] + projection[:, None] * delta), axis=1)
+                if float(deviation.max()) > 0.35:
+                    continue
             segment = line_cells(path[anchor], path[candidate])
+            if river_barrier is not None:
+                chord = shapely.LineString([(point[1]+.5,point[0]+.5) for point in source[[0,-1]]])
+                if shapely.crosses(chord,river_barrier):
+                    continue
             rows, columns = zip(*segment, strict=True)
             if not np.all(valid[rows, columns]):
                 continue
@@ -524,6 +581,12 @@ def _accessibility_field(
     settlements: tuple[Settlement, ...],
     routes: tuple[TransportRoute, ...],
 ) -> np.ndarray:
+    """Map-plane proximity to transport, with periodic longitude.
+
+    This measures local access, not terrain travel time. Each source strength
+    competes by exact Euclidean distance; four-neighbour propagation would
+    instead impose Manhattan diamonds on every downstream control field.
+    """
     field = np.zeros(shape, dtype=np.float64)
     route_value = {"trunk": 0.82, "regional": 0.66, "local": 0.48}
     for route in routes:
@@ -536,19 +599,281 @@ def _accessibility_field(
             field[settlement.row, settlement.column], tier_value[settlement.tier]
         )
     radius = max(2, min(18, min(shape) // 42))
-    current = field
-    for _distance in range(radius):
-        padded = np.pad(current, ((1, 1), (0, 0)), mode="constant")
-        neighbor = np.maximum.reduce(
-            (
-                np.roll(current, 1, axis=1),
-                np.roll(current, -1, axis=1),
-                padded[:-2],
-                padded[2:],
+    current = np.zeros(shape, dtype=np.float64)
+    halo = radius + 1
+    for value in np.unique(field[field > 0]):
+        longitude = np.pad(field != value, ((0, 0), (halo, halo)), mode="wrap")
+        padded = np.pad(longitude, ((halo, halo), (0, 0)),
+                        mode="constant", constant_values=True)
+        distance = distance_transform_edt(padded)[halo:-halo, halo:-halo]
+        current = np.maximum(current, np.where(
+            distance <= radius, value * np.power(0.88, distance), 0.0))
+    return np.clip(current, 0.0, 1.0).astype(np.float32)
+
+
+def _rail_engineering_fields(
+    grid: WorldGrid,
+    thematic: ThematicLayers,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return native railway construction friction and traversable ground.
+
+    Railway engineering is deliberately separate from roads: grades and local
+    relief dominate its cost, water is never traversable, and a represented
+    river channel has a large penalty so a line follows neither its thalweg nor
+    a decorative road corridor.  Crossing a river remains possible only when
+    the later bridge validation accepts a short transverse span.
+    """
+
+    elevation = np.asarray(grid.elevation, dtype=np.float64)
+    water = np.asarray(grid.water) != 0
+    snow = np.asarray(grid.snow, dtype=bool)
+    raw_grade = relative_land_slope(elevation, ~water)
+    ordinary_land = ~water & ~snow & (elevation < 0.90)
+    reference = float(np.percentile(raw_grade[ordinary_land], 92.0)) if np.any(ordinary_land) else 0.0
+    relative_grade = raw_grade / max(reference, 1.0e-9)
+    broad = smooth_field(
+        elevation,
+        radius=max(4, min(12, min(grid.shape) // 86)),
+        passes=2,
+    )
+    relief = np.clip(elevation - broad, 0.0, 1.0)
+    river_order = np.asarray(grid.river_order, dtype=np.float64)
+    # A route can use a shallow bridge cell when necessary, but cannot use a
+    # summit face or an enduring snowfield as an engineering shortcut.
+    valid = ordinary_land & (relative_grade <= 3.7)
+    friction = (
+        1.0
+        + 16.0 * np.square(np.clip(relative_grade, 0.0, 3.7))
+        + 92.0 * np.square(np.clip(relative_grade - 1.15, 0.0, 2.55))
+        + 44.0 * relief
+        + 18.0 * np.square(np.clip(elevation - 0.42, 0.0, 0.58))
+        + 2.8 * (1.0 - np.clip(thematic.land_potential, 0.0, 1.0))
+        # A bridge is costly, but a continental rail should not take a
+        # planet-scale detour merely to avoid one crossable river cell.  The
+        # subsequent transverse-span gate rejects any path that tries to use a
+        # river as a longitudinal corridor.
+        + np.where(river_order > 0.0, 8.0 + river_order * 3.5, 0.0)
+    )
+    return np.clip(friction, 0.82, None), valid
+
+
+def _rail_terminals(
+    settlements: tuple[Settlement, ...],
+    components: np.ndarray,
+    valid: np.ndarray,
+    *,
+    era: str,
+) -> tuple[Settlement, ...]:
+    """Select a bounded, high-demand terminal set before expensive routing."""
+
+    caps = {"industrial": 12, "contemporary": 24}
+    grouped: dict[int, list[Settlement]] = {}
+    for settlement in settlements:
+        if settlement.tier not in {"city", "metropolis"}:
+            continue
+        cell = (settlement.row, settlement.column)
+        if not valid[cell] or int(components[cell]) <= 0:
+            continue
+        grouped.setdefault(int(components[cell]), []).append(settlement)
+    selected: list[Settlement] = []
+    for component in sorted(grouped):
+        candidates = grouped[component]
+        candidates.sort(
+            key=lambda item: (
+                -_TIER_RANK[item.tier],
+                -item.population_max,
+                -item.population_min,
+                item.identifier,
             )
         )
-        current = np.maximum(current, neighbor * 0.88)
-    return np.clip(current, 0.0, 1.0).astype(np.float32)
+        cap = min(caps[era], max(2, int(math.ceil(math.sqrt(len(candidates)) * 3.2))))
+        selected.extend(candidates[:cap])
+    return tuple(sorted(selected, key=lambda item: item.identifier))
+
+
+def _rail_pairs(
+    terminals: tuple[Settlement, ...],
+    components: np.ndarray,
+    *,
+    era: str,
+) -> tuple[tuple[Settlement, Settlement], ...]:
+    """Form a sparse terminal forest without borrowing the road graph."""
+
+    by_identifier = {item.identifier: item for item in terminals}
+    cells = {item.identifier: (item.row, item.column) for item in terminals}
+    width = components.shape[1]
+    pairs: set[tuple[str, str]] = set()
+    degree_bonus = 1 if era == "contemporary" else 0
+    for source in terminals:
+        component = int(components[cells[source.identifier]])
+        candidates = [
+            target
+            for target in terminals
+            if target.identifier != source.identifier
+            and int(components[cells[target.identifier]]) == component
+        ]
+        candidates.sort(
+            key=lambda target: (
+                _wrapped_distance(cells[source.identifier], cells[target.identifier], width)
+                / (1.0 + 0.16 * _TIER_RANK[target.tier]),
+                -_TIER_RANK[target.tier],
+                -target.population_max,
+                target.identifier,
+            )
+        )
+        degree = 1 + degree_bonus + int(source.tier == "metropolis")
+        for target in candidates[:degree]:
+            pairs.add(tuple(sorted((source.identifier, target.identifier))))
+    _connect_pair_components(terminals, cells, components, pairs)
+    return tuple((by_identifier[first], by_identifier[second]) for first, second in sorted(pairs))
+
+
+def _refine_rail_path(
+    coarse_path: tuple[tuple[int, int], ...],
+    *,
+    step: int,
+    friction: np.ndarray,
+    valid: np.ndarray,
+    source: Settlement,
+    target: Settlement,
+) -> tuple[tuple[int, int], ...]:
+    """Resolve a coarse engineering corridor without straight-line shortcuts."""
+
+    height, width = valid.shape
+    corridor = np.zeros(valid.shape, dtype=bool)
+    padding = max(6, step * 4)
+    for row, column in coarse_path:
+        center_row = min(height - 1, row * step + step // 2)
+        center_column = (column * step + step // 2) % width
+        row_start = max(0, center_row - padding)
+        row_stop = min(height, center_row + padding + 1)
+        columns = np.arange(center_column - padding, center_column + padding + 1, dtype=np.int64) % width
+        corridor[row_start:row_stop, columns] = True
+    start = (source.row, source.column)
+    goal = (target.row, target.column)
+    corridor[start] = True
+    corridor[goal] = True
+    return _least_cost_path(friction, corridor & valid, start, goal)
+
+
+def _rail_bridge_permitted(era: str, importance: str, river_order: int, run_length: int) -> bool:
+    """Keep rail bridges shorter and more selective than ordinary road spans."""
+
+    maximum_order = {
+        "industrial": {"local": 1, "regional": 3, "trunk": 5},
+        "contemporary": {"local": 2, "regional": 4, "trunk": 6},
+    }[era][importance]
+    maximum_run = {
+        "industrial": {"local": 1, "regional": 2, "trunk": 3},
+        "contemporary": {"local": 1, "regional": 3, "trunk": 4},
+    }[era][importance]
+    return river_order <= maximum_order and run_length <= maximum_run
+
+
+def _rail_path_is_valid(
+    grid: WorldGrid,
+    path: tuple[tuple[int, int], ...],
+    *,
+    era: str,
+    importance: str,
+) -> bool:
+    if len(path) < 2 or any(int(grid.water[row, column]) != 0 for row, column in path):
+        return False
+    for run in _river_runs(path, grid.river_order):
+        crossing = _classify_transverse_crossing(grid, path, run)
+        if crossing is None:
+            return False
+        if not _rail_bridge_permitted(era, importance, crossing[2], run[1] - run[0] + 1):
+            return False
+    return True
+
+
+def _rail_routes(
+    grid: WorldGrid,
+    thematic: ThematicLayers,
+    settlements: tuple[Settlement, ...],
+    *,
+    routing_cache: RoutingCache,
+) -> tuple[TransportRoute, ...]:
+    """Generate independent, terrain-engineered rail corridors by era."""
+
+    era = _technology_era(grid)
+    if era not in _RAIL_ERAS:
+        return ()
+    friction, valid = _rail_engineering_fields(grid, thematic)
+    # City centres on water, permanent snow, a represented river channel, or
+    # an engineering-grade cliff are not silently snapped across terrain.
+    valid = valid.copy()
+    for settlement in settlements:
+        if int(grid.river_order[settlement.row, settlement.column]) > 0:
+            valid[settlement.row, settlement.column] = False
+    components, _sizes = connected_components(valid)
+    terminals = _rail_terminals(settlements, components, valid, era=era)
+    if len(terminals) < 2:
+        return ()
+    pairs = _rail_pairs(terminals, components, era=era)
+    if not pairs:
+        return ()
+    step = max(2, min(8, min(grid.shape) // 160))
+    coarse_friction = reduce_field(friction, step=step, mode="mean")
+    coarse_valid = reduce_field(valid, step=step, mode="mean") >= 0.62
+    for terminal in terminals:
+        coarse_valid[terminal.row // step, terminal.column // step] = True
+    signature = routing_cache.signature(coarse_friction, coarse_valid, friction, valid)
+    routes: list[TransportRoute] = []
+    for source, target in pairs:
+        source_cell = _nearest_valid(
+            coarse_valid,
+            (source.row // step, source.column // step),
+            radius=2,
+        )
+        target_cell = _nearest_valid(
+            coarse_valid,
+            (target.row // step, target.column // step),
+            radius=2,
+        )
+        if source_cell is None or target_cell is None:
+            continue
+        coarse_path = routing_cache.route(
+            signature,
+            coarse_friction,
+            coarse_valid,
+            source_cell,
+            target_cell,
+            coarse_friction,
+            simplify=False,
+        )
+        if not coarse_path:
+            continue
+        importance = _route_importance(source, target)
+        native_path = _refine_rail_path(
+            coarse_path,
+            step=step,
+            friction=friction,
+            valid=valid,
+            source=source,
+            target=target,
+        )
+        if not _rail_path_is_valid(grid, native_path, era=era, importance=importance):
+            continue
+        routes.append(
+            TransportRoute(
+                identifier=f"rail-{len(routes) + 1:04d}",
+                mode="rail",
+                importance=importance,
+                source_settlement_id=source.identifier,
+                target_settlement_id=target.identifier,
+                path=_world_path(
+                    native_path,
+                    1,
+                    grid.shape,
+                    source,
+                    target,
+                    simplify=False,
+                ),
+            )
+        )
+    return tuple(routes)
 
 
 def derive_transport(
@@ -557,6 +882,7 @@ def derive_transport(
     population: PopulationLayers,
     settlements: tuple[Settlement, ...],
     *,
+    raw_elevation_m: np.ndarray,
     routing_cache: RoutingCache | None = None,
 ) -> TransportLayers:
     """Build roads and water routes before any state border is generated."""
@@ -593,9 +919,8 @@ def derive_transport(
     summit = reduce_field(grid.elevation, step=step, mode="max")
     potential = reduce_field(thematic.land_potential, step=step, mode="mean")
     river = reduce_field(grid.river_order, step=step, mode="max")
-    vertical = np.gradient(elevation, axis=0)
-    horizontal = np.gradient(elevation, axis=1)
-    slope = np.hypot(vertical, horizontal)
+    full_slope = relative_land_slope(grid.elevation, grid.water == 0)
+    slope = reduce_field(full_slope, step=step, mode="max") * step
     broad_elevation = smooth_field(elevation, radius=4, passes=2)
     ridge_excess = np.clip(elevation - broad_elevation, 0.0, 1.0)
     friction = (
@@ -608,12 +933,6 @@ def derive_transport(
         - 0.62 * np.clip(river.astype(np.float64) / 3.0, 0.0, 1.0)
     )
     friction = np.clip(friction, 0.72, None)
-    full_vertical = np.gradient(grid.elevation.astype(np.float64), axis=0)
-    full_horizontal = (
-        np.roll(grid.elevation.astype(np.float64), -1, axis=1)
-        - np.roll(grid.elevation.astype(np.float64), 1, axis=1)
-    ) * 0.5
-    full_slope = np.hypot(full_vertical, full_horizontal)
     relief_radius = max(4, min(11, min(grid.shape) // 90))
     broad_full_elevation = smooth_field(
         grid.elevation.astype(np.float64),
@@ -641,6 +960,8 @@ def derive_transport(
         - 0.42 * np.clip(grid.river_order.astype(np.float64) / 3.0, 0.0, 1.0)
     )
     full_friction = np.clip(full_friction, 0.72, None)
+    engineering = RoadEngineering(raw_elevation_m, float(grid.metadata['planet']['radiusKm']), _technology_era(grid))
+    road_edges = engineering.edge_costs(full_friction)
     cells: dict[str, tuple[int, int]] = {}
     for settlement in settlements:
         origin = (settlement.row // step, settlement.column // step)
@@ -653,11 +974,20 @@ def derive_transport(
             cell = origin
         cells[settlement.identifier] = cell
     components, _sizes = connected_components(coarse_land)
-    road_signature = routing_cache.signature(friction, coarse_land, full_friction)
+    road_constraints = {importance:_road_river_constraints(grid,importance,raw_elevation_m=raw_elevation_m)
+                        for importance in ("local","regional","trunk")}
+    road_signatures = {importance:routing_cache.signature(friction,coarse_land&constraint[0],full_friction,constraint[1],road_edges.values)
+                       for importance,constraint in road_constraints.items()}
     routes: list[TransportRoute] = []
     for source, target in _road_pairs(settlements, cells, components):
-        path = routing_cache.route(road_signature, friction, coarse_land,
-            cells[source.identifier], cells[target.identifier], full_friction)
+        importance = _route_importance(source,target)
+        river_valid,blocked_edges,river_barrier = road_constraints[importance]
+        valid=coarse_land&river_valid
+        valid[cells[source.identifier]]=True
+        valid[cells[target.identifier]]=True
+        path = routing_cache.route(road_signatures[importance], friction, valid,
+            cells[source.identifier], cells[target.identifier], full_friction,
+            blocked_edges=blocked_edges,river_barrier=river_barrier,edge_costs=road_edges)
         if not path:
             continue
         if step == 1:
@@ -685,7 +1015,7 @@ def derive_transport(
             TransportRoute(
                 identifier=f"road-{len(routes) + 1:04d}",
                 mode="road",
-                importance=_route_importance(source, target),
+                importance=importance,
                 source_settlement_id=source.identifier,
                 target_settlement_id=target.identifier,
                 path=world_path,
@@ -779,11 +1109,22 @@ def derive_transport(
                     ),
                 )
             )
+    # Rails are an era-specific engineering layer. They never alter the road
+    # corridor, settlement placement, or political simulation that already
+    # passed physical routing checks.
+    routes.extend(
+        _rail_routes(
+            grid,
+            thematic,
+            settlements,
+            routing_cache=routing_cache,
+        )
+    )
     finalized = tuple(routes)
     return TransportLayers(
         accessibility=_accessibility_field(grid.shape, settlements, finalized),
         routes=finalized,
-        bridges=derive_bridges(grid, finalized),
+        bridges=derive_bridges(grid, finalized,raw_elevation_m=raw_elevation_m),
     )
 
 
@@ -912,6 +1253,61 @@ def _classify_transverse_crossing(
     return row, column, maximum_order
 
 
+def _road_river_constraints(grid, importance, *, raw_elevation_m):
+    """Native flow edges are crossing barriers beyond this road's capacity.
+
+    River support cells block crossing through a channel vertex. Opposing D8
+    diagonals can cross between four cell centres without visiting a river
+    cell; those exact flow intersections are also forbidden routing edges.
+    """
+    maximum_order = {"local":2,"regional":3,"trunk":255}[importance]
+    from ..river_network import hydrologic_outlet_targets
+    outlets=hydrologic_outlet_targets(grid,raw_elevation_m)
+    major = np.asarray(grid.river_order) > maximum_order
+    valid = ~major
+    blocked = np.zeros(grid.shape,dtype=np.uint8)
+    if not np.any(major):
+        return valid,blocked,shapely.GeometryCollection()
+    # Selecting segments, rather than whole merged reaches, avoids blocking
+    # an upstream small stream merely because its downstream reach is large.
+    source = np.flatnonzero(major.ravel())
+    target = np.asarray(grid.flow_to).ravel()[source].copy()
+    for index,cell in enumerate(source):
+        if int(cell) in outlets:
+            target[index]=outlets[int(cell)]
+    present = (target>=0)&(target<major.size)
+    source,target=source[present],target[present]
+    width = grid.shape[1]
+    first=np.column_stack((source%width+.5,source//width+.5))
+    last=np.column_stack((target%width+.5,target//width+.5))
+    ordinary=np.abs(first[:,0]-last[:,0])<=width/2
+    barrier=shapely.multilinestrings(shapely.linestrings(np.stack((first[ordinary],last[ordinary]),axis=1)))
+    # There are only four diagonal lattice edges adjacent to each channel
+    # cell. Vectorized GEOS predicates keep this sparse scan independent of
+    # the number of requested city routes.
+    rows,columns=np.nonzero(major)
+    candidates=set()
+    for row,column in zip(rows,columns,strict=True):
+        candidates.update((int(y),int(x)%width)for y in range(max(0,row-1),min(grid.shape[0],row+2))for x in range(column-1,column+2))
+    cells=np.asarray(sorted(candidates),dtype=np.int32)
+    barrier_index=shapely.STRtree(shapely.get_parts(barrier))
+    for direction,(dy,dx,_distance) in enumerate(_NEIGHBORS):
+        if not (dy and dx):
+            continue
+        next_rows=cells[:,0]+dy
+        next_columns=(cells[:,1]+dx)%width
+        present=(next_rows>=0)&(next_rows<grid.shape[0])
+        starts=cells[present];ends=np.column_stack((next_rows[present],next_columns[present]))
+        present=valid[starts[:,0],starts[:,1]]&valid[ends[:,0],ends[:,1]]
+        starts,ends=starts[present],ends[present]
+        ordinary=np.abs(starts[:,1]-ends[:,1])<=width/2
+        starts,ends=starts[ordinary],ends[ordinary]
+        lines=shapely.linestrings(np.stack((starts[:,::-1]+.5,ends[:,::-1]+.5),axis=1))
+        crossed=np.unique(barrier_index.query(lines,predicate="crosses")[0])
+        blocked[starts[crossed,0],starts[crossed,1]] |= np.uint8(1<<direction)
+    return valid,blocked,barrier
+
+
 def _route_can_bridge(importance: str, river_order: int) -> bool:
     maximum_order = {"local": 2, "regional": 3, "trunk": 255}[importance]
     return river_order <= maximum_order
@@ -920,20 +1316,18 @@ def _route_can_bridge(importance: str, river_order: int) -> bool:
 def derive_bridges(
     grid: WorldGrid,
     routes: tuple[TransportRoute, ...],
+    *, raw_elevation_m: np.ndarray,
 ) -> tuple[Bridge, ...]:
-    """Resolve engineered crossings from transverse road/river intersections."""
+    """Resolve each actual road/flow crossing without erasing nearby facilities."""
 
-    candidates: list[tuple[int, int, str, int, str]] = []
-    for route in routes:
-        if route.mode != "road":
-            continue
-        cells = _path_cells(route.path, grid.shape)
-        for run in _river_runs(cells, grid.river_order):
-            crossing = _classify_transverse_crossing(grid, cells, run)
-            if crossing is None or not _route_can_bridge(route.importance, crossing[2]):
-                continue
-            row, column, order = crossing
-            candidates.append((row, column, route.identifier, order, route.importance))
+    from ..transport_geometry import native_river_geometry, source_transport_crossings
+
+    candidates = []
+    for route, point, (row, column), order in source_transport_crossings(
+            grid, routes, native_river_geometry(grid,raw_elevation_m=raw_elevation_m),raw_elevation_m=raw_elevation_m):
+        if _route_can_bridge(route.importance, order):
+            candidates.append((row, column, route.identifier, order, route.importance,
+                               (round(point.x, 7), round(point.y, 7))))
 
     rank = {"local": 0, "regional": 1, "trunk": 2}
     selected: list[tuple[int, int, str, int, str]] = []
@@ -941,11 +1335,7 @@ def derive_bridges(
         candidates,
         key=lambda item: (-item[3], -rank[item[4]], item[2], item[0], item[1]),
     ):
-        row, column = candidate[:2]
-        if any(
-            _wrapped_distance((row, column), existing[:2], grid.shape[1]) < 5.0
-            for existing in selected
-        ):
+        if any(candidate[5] == existing[5] for existing in selected):
             continue
         selected.append(candidate)
     selected.sort(key=lambda item: (item[0], item[1], item[2]))
@@ -958,7 +1348,7 @@ def derive_bridges(
             river_order=order,
             importance=importance,
         )
-        for index, (row, column, route_identifier, order, importance) in enumerate(
+        for index, (row, column, route_identifier, order, importance, _point) in enumerate(
             selected,
             start=1,
         )
@@ -982,7 +1372,7 @@ def road_network_fields(
     load = np.zeros(shape, dtype=np.float64)
     route_value = {"trunk": 0.86, "regional": 0.68, "local": 0.46}
     for route in routes:
-        if route.mode != "road" or len(route.path) < 2:
+        if route.mode not in {"road", "rail"} or len(route.path) < 2:
             continue
         value = route_value[route.importance]
         cells = set(_path_cells(route.path, shape))
@@ -1023,83 +1413,204 @@ def conform_transport_to_politics(
     settlements: tuple[Settlement, ...],
     transport: TransportLayers,
     politics: PoliticalLayers,
+    *, raw_elevation_m: np.ndarray,
 ) -> TransportLayers:
-    """Reroute same-state roads that would otherwise enter another state."""
+    """Keep overland transport inside its legally usable political corridor.
+
+    Roads retain their historical same-state correction.  Railways have a
+    stricter rule: a domestic line stays inside its state, while an
+    international line may use only the two endpoint states.  A railway that
+    cannot satisfy that rule is omitted instead of being left as a visible
+    illegal shortcut through a third country.
+    """
 
     by_identifier = {item.identifier: item for item in settlements}
-    offending: list[tuple[int, int]] = []
+    offending_roads: list[tuple[int, int]] = []
+    offending_rails: list[tuple[int, frozenset[int]]] = []
     for index, route in enumerate(transport.routes):
-        if route.mode != "road" or route.target_settlement_id is None:
+        if route.target_settlement_id is None:
             continue
         source = by_identifier[route.source_settlement_id]
         target = by_identifier[route.target_settlement_id]
         source_state = int(politics.state_id[source.row, source.column])
         target_state = int(politics.state_id[target.row, target.column])
-        if source_state <= 0 or source_state != target_state:
+        route_cells = _path_cells(route.path, grid.shape)
+        if route.mode == "road":
+            if source_state <= 0 or source_state != target_state:
+                continue
+            if any(
+                int(politics.state_id[row, column]) != source_state
+                for row, column in route_cells
+            ):
+                offending_roads.append((index, source_state))
             continue
-        if any(
-            int(politics.state_id[row, column]) != source_state
-            for row, column in _path_cells(route.path, grid.shape)
+        if route.mode != "rail":
+            continue
+        permitted_states = frozenset((source_state, target_state))
+        if source_state <= 0 or target_state <= 0 or any(
+            int(politics.state_id[row, column]) not in permitted_states
+            for row, column in route_cells
         ):
-            offending.append((index, source_state))
-    if not offending:
+            offending_rails.append((index, permitted_states))
+    if not offending_roads and not offending_rails:
         return transport
 
-    elevation = grid.elevation.astype(np.float64)
-    vertical = np.gradient(elevation, axis=0)
-    horizontal = (np.roll(elevation, -1, axis=1) - np.roll(elevation, 1, axis=1)) * 0.5
-    slope = np.hypot(vertical, horizontal)
-    broad = smooth_field(
-        elevation,
-        radius=max(4, min(11, min(grid.shape) // 90)),
-        passes=2,
-    )
-    river_corridor = smooth_field(
-        (grid.river_order > 0).astype(np.float64),
-        radius=max(2, min(7, min(grid.shape) // 150)),
-        passes=1,
-    )
-    friction = np.clip(
-        1.0
-        + 7.5 * np.clip(elevation - 0.32, 0.0, 0.68)
-        + 24.0 * np.square(np.clip(elevation - 0.48, 0.0, 0.52))
-        + 76.0 * slope
-        + 18.0 * np.clip(elevation - broad, 0.0, 1.0)
-        + 1.6 * (1.0 - np.clip(thematic.land_potential, 0.0, 1.0))
-        - 0.48 * np.clip(river_corridor, 0.0, 1.0)
-        - 0.42 * np.clip(grid.river_order.astype(np.float64) / 3.0, 0.0, 1.0),
-        0.72,
-        None,
-    )
-    routes = list(transport.routes)
-    for index, state_identifier in offending:
-        route = routes[index]
-        source = by_identifier[route.source_settlement_id]
-        target = by_identifier[route.target_settlement_id or ""]
-        valid = politics.state_id == state_identifier
-        path = _least_cost_path(
-            friction,
-            valid,
-            (source.row, source.column),
-            (target.row, target.column),
+    routes: list[TransportRoute | None] = list(transport.routes)
+    if offending_roads:
+        elevation = grid.elevation.astype(np.float64)
+        slope = relative_land_slope(elevation, grid.water == 0)
+        broad = smooth_field(
+            elevation,
+            radius=max(4, min(11, min(grid.shape) // 90)),
+            passes=2,
         )
-        if not path:
-            continue
-        path = _terrain_safe_simplification(path, friction, valid)
-        world_path = _world_path(
-            path,
-            1,
-            grid.shape,
-            source,
-            target,
-            simplify=False,
+        river_corridor = smooth_field(
+            (grid.river_order > 0).astype(np.float64),
+            radius=max(2, min(7, min(grid.shape) // 150)),
+            passes=1,
         )
-        routes[index] = replace(route, path=world_path)
-    finalized = tuple(routes)
+        road_friction = np.clip(
+            1.0
+            + 7.5 * np.clip(elevation - 0.32, 0.0, 0.68)
+            + 24.0 * np.square(np.clip(elevation - 0.48, 0.0, 0.52))
+            + 76.0 * slope
+            + 18.0 * np.clip(elevation - broad, 0.0, 1.0)
+            + 1.6 * (1.0 - np.clip(thematic.land_potential, 0.0, 1.0))
+            - 0.48 * np.clip(river_corridor, 0.0, 1.0)
+            - 0.42 * np.clip(grid.river_order.astype(np.float64) / 3.0, 0.0, 1.0),
+            0.72,
+            None,
+        )
+        road_constraints = {importance:_road_river_constraints(grid,importance,raw_elevation_m=raw_elevation_m)
+                            for importance in ("local","regional","trunk")}
+        engineering = RoadEngineering(raw_elevation_m, float(grid.metadata['planet']['radiusKm']), _technology_era(grid))
+        road_edges = engineering.edge_costs(road_friction)
+        for index, state_identifier in offending_roads:
+            route = routes[index]
+            if route is None:
+                continue
+            source = by_identifier[route.source_settlement_id]
+            target = by_identifier[route.target_settlement_id or ""]
+            river_valid,blocked_edges,river_barrier = road_constraints[route.importance]
+            valid = (politics.state_id == state_identifier)&river_valid
+            valid[source.row,source.column]=True
+            valid[target.row,target.column]=True
+            path = _least_cost_path(
+                road_friction,
+                valid,
+                (source.row, source.column),
+                (target.row, target.column),
+                blocked_edges=blocked_edges,
+                edge_costs=road_edges,
+            )
+            if not path:
+                continue
+            path = _terrain_safe_simplification(path, road_friction, valid,river_barrier=river_barrier,edge_costs=road_edges)
+            world_path = _world_path(
+                path,
+                1,
+                grid.shape,
+                source,
+                target,
+                simplify=False,
+            )
+            routes[index] = replace(route, path=world_path)
+
+    if offending_rails:
+        era = _technology_era(grid)
+        rail_friction, rail_ground = _rail_engineering_fields(grid, thematic)
+        rail_ground = rail_ground.copy()
+        for settlement in settlements:
+            if int(grid.river_order[settlement.row, settlement.column]) > 0:
+                rail_ground[settlement.row, settlement.column] = False
+        step = max(2, min(8, min(grid.shape) // 160))
+        coarse_friction = reduce_field(rail_friction, step=step, mode="mean")
+        rail_cache = RoutingCache()
+        for index, permitted_states in offending_rails:
+            route = routes[index]
+            if route is None:
+                continue
+            source = by_identifier[route.source_settlement_id]
+            target = by_identifier[route.target_settlement_id or ""]
+            if era not in _RAIL_ERAS or min(permitted_states) <= 0:
+                routes[index] = None
+                continue
+            political_ground = rail_ground & np.isin(
+                politics.state_id,
+                tuple(sorted(permitted_states)),
+            )
+            start = (source.row, source.column)
+            goal = (target.row, target.column)
+            if not political_ground[start] or not political_ground[goal]:
+                routes[index] = None
+                continue
+            coarse_ground = reduce_field(political_ground, step=step, mode="mean") >= 0.62
+            coarse_ground[start[0] // step, start[1] // step] = True
+            coarse_ground[goal[0] // step, goal[1] // step] = True
+            source_cell = _nearest_valid(
+                coarse_ground,
+                (start[0] // step, start[1] // step),
+                radius=2,
+            )
+            target_cell = _nearest_valid(
+                coarse_ground,
+                (goal[0] // step, goal[1] // step),
+                radius=2,
+            )
+            if source_cell is None or target_cell is None:
+                routes[index] = None
+                continue
+            signature = rail_cache.signature(
+                coarse_friction,
+                coarse_ground,
+                rail_friction,
+                political_ground,
+            )
+            coarse_path = rail_cache.route(
+                signature,
+                coarse_friction,
+                coarse_ground,
+                source_cell,
+                target_cell,
+                coarse_friction,
+                simplify=False,
+            )
+            if not coarse_path:
+                routes[index] = None
+                continue
+            native_path = _refine_rail_path(
+                coarse_path,
+                step=step,
+                friction=rail_friction,
+                valid=political_ground,
+                source=source,
+                target=target,
+            )
+            if not _rail_path_is_valid(
+                grid,
+                native_path,
+                era=era,
+                importance=route.importance,
+            ):
+                routes[index] = None
+                continue
+            routes[index] = replace(
+                route,
+                path=_world_path(
+                    native_path,
+                    1,
+                    grid.shape,
+                    source,
+                    target,
+                    simplify=False,
+                ),
+            )
+
+    finalized = tuple(route for route in routes if route is not None)
     return TransportLayers(
         accessibility=_accessibility_field(grid.shape, settlements, finalized),
         routes=finalized,
-        bridges=derive_bridges(grid, finalized),
+        bridges=derive_bridges(grid, finalized,raw_elevation_m=raw_elevation_m),
     )
 
 

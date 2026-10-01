@@ -61,7 +61,7 @@ class SnowlineConfig:
     pole_threshold: float = 0.02
     exponent: float = 1.10
     max_offset: float = 0.15
-    polar_full_snow_latitude: float = 78.0
+    polar_full_snow_latitude: float = 68.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -591,6 +591,17 @@ def compute_perennial_snowline(
     # above this latitude the baseline threshold is zero, so low relative
     # elevation can qualify without pretending to know a metre-scale climate.
     # An explicit caller-supplied offset still adjusts that baseline.
+    # Growing seasons shorten before the permanent polar cap begins.  Lower
+    # the local snowline through that transition so subpolar coasts do not
+    # remain visually temperate until one abrupt final latitude band.
+    subpolar_start = max(48.0, polar_full_snow_latitude - 18.0)
+    polar_transition = np.clip(
+        (absolute_latitude - subpolar_start)
+        / max(polar_full_snow_latitude - subpolar_start, 1.0),
+        0.0,
+        1.0,
+    )
+    base_threshold *= 1.0 - 0.82 * np.power(polar_transition, 1.25)
     base_threshold = np.where(
         absolute_latitude >= polar_full_snow_latitude,
         0.0,

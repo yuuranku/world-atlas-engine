@@ -388,6 +388,46 @@ def _corridor_arcs(corridor: BoundaryCorridor, cores: Mapping[str, np.ndarray]) 
             tuple(float(value) for value in normal),
         ))
     return tuple(arcs)
+
+
+def _core_domain_corridor_gate(
+    base_scores: np.ndarray,
+    cores: np.ndarray,
+    radius_km: float,
+) -> np.ndarray:
+    """Keep a displaced border out of every plate's generating core domain.
+
+    A corridor is a local deformation of a pre-existing Voronoi boundary, not
+    a second plate generator.  Without this constraint a strong, curved arc
+    can cross the interior of a nearby microplate, sever its anchor from most
+    of its area, and leave a one-cell ``core`` behind.  The safe domain is
+    expressed as a fraction of each core's nearest-neighbour separation, so it
+    remains spherical and scales with the actual plate configuration instead
+    of with output resolution.
+    """
+
+    if len(cores) <= 1:
+        return np.ones(base_scores.shape[0], dtype=np.float64)
+    pairwise = np.clip(cores @ cores.T, -1.0, 1.0)
+    np.fill_diagonal(pairwise, -1.0)
+    nearest_spacing_km = radius_km * np.arccos(np.max(pairwise, axis=1))
+    nearest_index = np.argmax(base_scores, axis=1)
+    distance_to_nearest_core_km = radius_km * np.arccos(
+        np.clip(np.max(base_scores, axis=1), -1.0, 1.0)
+    )
+    spacing = nearest_spacing_km[nearest_index]
+    # Boundary ownership is allowed to move only through the outer part of
+    # each Voronoi province.  A short feather avoids introducing a synthetic
+    # circular rim around the protected core.
+    start = 0.32 * spacing
+    end = 0.46 * spacing
+    return np.clip(
+        (distance_to_nearest_core_km - start) / np.maximum(end - start, _EPS),
+        0.0,
+        1.0,
+    )
+
+
 def _apply_corridor_scores(
     scores: np.ndarray,
     cell_vectors: np.ndarray,
@@ -400,6 +440,7 @@ def _apply_corridor_scores(
         return scores
     original = np.array(scores, dtype=np.float64, copy=True)
     result = np.array(scores, dtype=np.float64, copy=True)
+    core_domain_gate = _core_domain_corridor_gate(original, cores, radius_km)
     core_map = {plate_id: cores[index] for index, plate_id in enumerate(plate_ids)}
     indices = {plate_id: index for index, plate_id in enumerate(plate_ids)}
     for corridor in corridors:
@@ -419,6 +460,7 @@ def _apply_corridor_scores(
             np.exp(-0.5 * np.square(absolute / corridor.influence_width_km)),
             0.0,
         )
+        weight *= core_domain_gate
         side = np.zeros_like(signed)
         side[finite] = np.tanh(signed[finite] / (0.35 * corridor.influence_width_km))
         first_index = indices[corridor.plate_ids[0]]
@@ -545,7 +587,7 @@ def clean_orphan_components(
     plate_ids: Sequence[str],
     protected_cells: Mapping[str, Iterable[int]] | None = None,
 ) -> tuple[np.ndarray, int]:
-    """Merge secondary components by longest shared edge, then stable ID."""
+    """Merge disconnected plate fragments while retaining each declared root."""
 
     checked = _validate_grid(grid)
     ids = _validate_ids(plate_ids)
@@ -567,12 +609,19 @@ def clean_orphan_components(
             protected = set(protected_cells.get(label, ())) if protected_cells else set()
             protected_components = [component for component in components if component & protected]
             if protected_components:
-                largest_size = max(len(component) for component in components)
-                if any(len(component) < largest_size for component in protected_components):
+                unowned = sorted(cell for cell in protected if result[cell] != label)
+                if unowned:
                     raise ValueError(
-                        f"protected core component for {label!r} is not the largest component"
+                        f"protected core cell for {label!r} is not owned by its plate"
                     )
-                primary = min(protected_components, key=lambda item: min(item))
+                if len(protected_components) != 1:
+                    raise ValueError(
+                        f"protected core cells for {label!r} occupy disconnected components"
+                    )
+                # Plate identity is rooted at its generating core.  A larger
+                # disconnected patch is an assignment artefact, not a reason
+                # to discard the core and silently relabel the plate.
+                primary = protected_components[0]
             else:
                 primary = min(components, key=lambda item: (-len(item), min(item)))
             for orphan in [component for component in components if component is not primary]:
@@ -594,6 +643,33 @@ def clean_orphan_components(
         if not changed:
             break
     return _frozen_array(result.reshape(checked.shape), dtype=object), merge_count
+
+
+def _validate_plate_topology(
+    grid: LatLonGrid,
+    plate_grid: np.ndarray,
+    plate_ids: Sequence[str],
+    protected_cells: Mapping[str, Iterable[int]],
+) -> dict[str, int]:
+    """Check the causal plate invariant after corridor deformation and repair."""
+
+    flat = np.asarray(plate_grid, dtype=object).reshape(-1)
+    component_counts: list[int] = []
+    protected_count = 0
+    for plate_id in plate_ids:
+        components = _components(grid, flat, plate_id)
+        component_counts.append(len(components))
+        for cell in protected_cells.get(plate_id, ()):
+            protected_count += 1
+            if cell < 0 or cell >= grid.cell_count or flat[cell] != plate_id:
+                raise ValueError(f"plate core ownership lost for {plate_id!r}")
+        if len(components) != 1:
+            raise ValueError(f"plate {plate_id!r} remains disconnected after topology repair")
+    return {
+        "connected_plate_count": int(len(plate_ids)),
+        "maximum_component_count": int(max(component_counts, default=0)),
+        "protected_core_count": int(protected_count),
+    }
 
 def _unique_edges(grid: LatLonGrid) -> Iterable[tuple[int, int]]:
     for first in range(grid.cell_count):
@@ -804,14 +880,20 @@ def build_plate_fields(
     protected: dict[str, set[int]] = {}
     flat = labels.reshape(-1).copy()
     cell_vectors = checked.unit_vectors.reshape((-1, 3))
-    for anchor in anchor_values:
-        cell = int(np.argmax(cell_vectors @ lon_lat_to_unit_vector(anchor.anchor_lon, anchor.anchor_lat)))
-        protected[anchor.plate_id] = {cell}
+    for definition in definitions:
+        cell = int(np.argmax(cell_vectors @ lon_lat_to_unit_vector(definition.anchor_lon, definition.anchor_lat)))
+        protected[definition.plate_id] = {cell}
     labels, orphan_merge_count = clean_orphan_components(
         checked,
         flat.reshape(checked.shape),
         ids,
         protected_cells=protected,
+    )
+    topology_diagnostics = _validate_plate_topology(
+        checked,
+        labels,
+        ids,
+        protected,
     )
     pole_vectors = np.asarray(
         [lon_lat_to_unit_vector(0.0, 90.0), lon_lat_to_unit_vector(0.0, -90.0)],
@@ -854,6 +936,7 @@ def build_plate_fields(
             "orphan_merge_count": orphan_merge_count,
             "corridor_count": len(corridors),
             "corridor_ids": tuple(value.corridor_id for value in corridors),
+            "topology": topology_diagnostics,
         }
     return PlateFields(labels, poles, definitions, cores, boundaries, junctions, velocity_grid, diagnostics)
 

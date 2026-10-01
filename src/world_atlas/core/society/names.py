@@ -10,10 +10,12 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+from scipy import ndimage
 
 from ..model import WorldGrid
 from ..thematic import ThematicLayers, smooth_field
 from .model import CultureLayers, GeographicFeature, NameLexicon, Settlement
+from .geographic_features import mountain_components, prominent_raw_summits
 from .onomastics import (
     lineage_roots,
     lineage_style_index,
@@ -42,6 +44,12 @@ _FEATURE_SUFFIX = {
     "plain": "平原",
     "plateau": "高原",
     "basin": "盆地",
+    "desert": "沙漠",
+    "wetland": "湿地",
+    "ridge": "岭", "hills": "丘陵", "valley": "河谷", "gorge": "深谷",
+    "foothills": "山麓", "steep-slope": "陡坡", "lowland-valley": "谷地",
+    "snow-mountain": "雪山", "cape": "岬", "peninsula": "半岛",
+    "isthmus": "地峡", "arid-upland": "旱岭",
 }
 _QUALIFIERS = ("上", "下", "东", "西", "南", "北", "中", "内", "外", "前", "后", "大", "小")
 _POLITICAL_NAME_ENDINGS = (
@@ -62,6 +70,62 @@ def _unique_names(values: list[str]) -> tuple[str, ...]:
             seen.add(name)
             result.append(name)
     return tuple(result)
+
+
+def extend_geographic_features(
+    grid: WorldGrid, cultures: CultureLayers, existing: tuple[GeographicFeature, ...],
+    lexicon: NameLexicon, *, inventory,
+) -> tuple[tuple[GeographicFeature, ...], list[dict]]:
+    """Add a bounded set of supported regional identities without renaming any.
+
+    One selected anchor remains inside its exact classified component. Sparse
+    names explain the map's physical areas and lines; they are not point icons
+    asserted at every classified cell. Repeated enrichment is idempotent.
+    """
+    from ..landforms import LANDFORM_TYPES
+
+    result = list(existing)
+    used = {item.name for item in existing}
+    families = {item.identifier: item.name_family for item in cultures.languages}
+    additions = []
+    new_locations = [(item.row, item.column) for item in existing if item.feature_type in LANDFORM_TYPES]
+    for kind in LANDFORM_TYPES:
+        mask = inventory.masks[kind]
+        existing_kind = [item for item in existing if item.feature_type == kind]
+        if any(not mask[item.row, item.column] for item in existing_kind):
+            raise ValueError(f"saved {kind} identity is outside its accepted physical support")
+        if existing_kind:
+            continue
+        minimum_size = {"cape": 2, "isthmus": 1, "gorge": 3, "snow-mountain": 8}.get(kind, 8)
+        limit = 10 if kind in {"hills", "valley", "lowland-valley", "peninsula"} else 6
+        anchors = _component_anchors(mask, _interior_depth(mask), limit=limit * 5, minimum_size=minimum_size)
+        same_kind = []
+        for row, column, size in anchors:
+            def distance(location):
+                other_row, other_column = location
+                dx = abs(column - other_column)
+                return np.hypot(row - other_row, min(dx, grid.shape[1] - dx))
+            if any(distance(location) < 48 for location in same_kind):
+                continue
+            if any(distance(location) < 12 for location in new_locations):
+                continue
+            language = _nearest_language(cultures.language_id, row, column)
+            ordinal = len(same_kind)
+            feature = GeographicFeature(
+                identifier=f"{kind}-{ordinal + 1:02d}", feature_type=kind,
+                name=generate_feature_name(lexicon, feature_type=kind, language_identifier=language,
+                    ordinal=ordinal, used=used, name_family=families[language]),
+                row=row, column=column, language_identifier=language,
+                tier="secondary" if size >= 64 else "detail",
+            )
+            result.append(feature)
+            same_kind.append((row, column))
+            new_locations.append((row, column))
+            additions.append({"identifier": feature.identifier, "type": kind, "name": feature.name,
+                              "row": row, "column": column, "supportedComponentCells": int(size)})
+            if len(same_kind) >= limit:
+                break
+    return tuple(result), additions
 
 
 def _root(name: str) -> str:
@@ -335,6 +399,10 @@ def _component_anchors(
     minimum_size: int,
 ) -> tuple[tuple[int, int, int], ...]:
     labels, sizes = connected_components(mask)
+    # Separate components are divided by false cells, so their individual
+    # interior depths equal the corresponding cells in one whole-mask distance
+    # transform.  Calculate it once instead of once per candidate component.
+    depth_map = _interior_depth(mask)
     ranked = sorted(
         (
             (size, label)
@@ -354,7 +422,7 @@ def _component_anchors(
         # Labels belong in the readable interior of a landform, not at the
         # single highest-valued edge pixel.  Importance only breaks ties
         # between similarly interior locations.
-        depth = _interior_depth(component)[rows, columns]
+        depth = depth_map[rows, columns]
         best = int(np.argmax(depth + 0.32 * normalized))
         result.append((int(rows[best]), int(columns[best]), int(size)))
     return tuple(result)
@@ -402,23 +470,29 @@ def _snap_anchor(
 
 
 def _interior_depth(mask: np.ndarray) -> np.ndarray:
-    """Return wrapped, four-neighbour distance from a component shoreline."""
+    """Return periodic-x, finite-y taxicab distance from a component edge.
 
-    current = np.asarray(mask, dtype=bool).copy()
-    depth = np.zeros(current.shape, dtype=np.float64)
-    level = 1.0
-    while np.any(current):
-        depth[current] = level
-        padded = np.pad(current, ((1, 1), (0, 0)), mode="constant")
-        current = (
-            current
-            & np.roll(current, 1, axis=1)
-            & np.roll(current, -1, axis=1)
-            & padded[:-2]
-            & padded[2:]
-        )
-        level += 1.0
-    return depth
+    The previous implementation repeatedly eroded every active raster cell,
+    making a large ocean or continent cost one complete world-grid pass per
+    interior depth.  A three-copy longitude tile gives the distance transform
+    the same wrapped-neighbour candidates; explicit false rows above and below
+    preserve the non-periodic pole boundary.  No false columns are added, so
+    a narrow world never mistakes the temporary tile edge for a coastline.
+    """
+
+    active = np.asarray(mask, dtype=bool)
+    if active.ndim != 2:
+        raise ValueError("interior-depth mask must be two-dimensional")
+    height, width = active.shape
+    if height == 0 or width == 0:
+        return np.zeros(active.shape, dtype=np.float64)
+    tiled = np.tile(active, (1, 3))
+    padded = np.zeros((height + 2, width * 3), dtype=bool)
+    padded[1:-1] = tiled
+    distance = ndimage.distance_transform_cdt(padded, metric="taxicab")
+    result = distance[1:-1, width : width * 2].astype(np.float64, copy=False)
+    result[~active] = 0.0
+    return result
 
 
 def _river_basin_anchors(
@@ -559,6 +633,7 @@ def _bounded_component_anchors(
     maximum_size: int,
 ) -> tuple[tuple[int, int, int, int], ...]:
     labels, sizes = connected_components(mask)
+    depth_map = _interior_depth(mask)
     ranked = sorted(
         (
             (size, label)
@@ -575,7 +650,7 @@ def _bounded_component_anchors(
         low = float(np.min(values, initial=0.0))
         span = max(float(np.max(values, initial=1.0)) - low, 1.0e-12)
         normalized = np.clip((values - low) / span, 0.0, 1.0)
-        depth = _interior_depth(component)[rows, columns]
+        depth = depth_map[rows, columns]
         best = int(np.argmax(depth + 0.28 * normalized))
         result.append((int(rows[best]), int(columns[best]), int(size), int(label)))
     return tuple(result)
@@ -648,16 +723,20 @@ def extract_geographic_features(
     thematic: ThematicLayers,
     cultures: CultureLayers,
     lexicon: NameLexicon,
+    *,
+    raw_elevation_m: np.ndarray,
 ) -> tuple[GeographicFeature, ...]:
     """Extract world, regional and close-zoom physical landmarks."""
 
-    if thematic.land_potential.shape != grid.shape:
-        raise ValueError("thematic layers must match WorldGrid shape")
+    if (
+        thematic.physiography.desert.shape != grid.shape
+        or thematic.physiography.wetland.shape != grid.shape
+    ):
+        raise ValueError("physiographic feature masks must match WorldGrid shape")
     if cultures.language_id.shape != grid.shape:
         raise ValueError("culture layers must match WorldGrid shape")
     step = 1
     elevation = reduce_field(grid.elevation, step=step, mode="mean")
-    potential = reduce_field(thematic.land_potential, step=step, mode="mean")
     land_fraction = reduce_field(grid.water == 0, step=step, mode="mean")
     water_fractions = np.stack(
         tuple(
@@ -740,11 +819,26 @@ def extract_geographic_features(
     plain_mask = (
         mainland_land
         & (smoothed_elevation < 0.39)
-        & (potential >= 0.46)
         & (coarse_slope < 0.038)
         & (roughness < 0.040)
         & ~basin_mask
     )
+    desert_mask = mainland_land & reduce_field(
+        thematic.physiography.desert,
+        step=step,
+        mode="max",
+    ).astype(bool)
+    wetland_mask = mainland_land & reduce_field(
+        thematic.physiography.wetland,
+        step=step,
+        mode="max",
+    ).astype(bool)
+    desert_dryness = -reduce_field(
+        thematic.climate.annual_precipitation_mm,
+        step=step,
+        mode="mean",
+    )
+    wetland_importance = reduce_field(grid.discharge, step=step, mode="mean")
     language = cultures.language_id
     family_by_language = {
         item.identifier: item.name_family for item in cultures.languages
@@ -757,9 +851,11 @@ def extract_geographic_features(
         ("inland-sea", inland_sea, _interior_depth(inland_sea), 8, 2),
         ("bay", bay_mask, land_neighbors.astype(np.float64), 14, 1),
         ("strait", strait_mask, land_neighbors.astype(np.float64), 12, 1),
-        ("plain", plain_mask, potential, 32, 5),
+        ("plain", plain_mask, -coarse_slope - roughness, 32, 5),
         ("plateau", plateau_mask, smoothed_elevation, 28, 4),
         ("basin", basin_mask, depression, 28, 4),
+        ("desert", desert_mask, desert_dryness, 20, 4),
+        ("wetland", wetland_mask, wetland_importance, 24, 3),
     )
     used: set[str] = set()
     result: list[GeographicFeature] = []
@@ -776,6 +872,12 @@ def extract_geographic_features(
             if feature_type in {"mountain", "plain", "plateau", "basin"}:
                 support = mainland_support
                 priority = grid.elevation if feature_type == "mountain" else None
+            elif feature_type == "desert":
+                support = thematic.physiography.desert & mainland_support
+                priority = -thematic.climate.annual_precipitation_mm
+            elif feature_type == "wetland":
+                support = thematic.physiography.wetland & mainland_support
+                priority = grid.discharge
             elif feature_type == "lake":
                 support = grid.water == 2
                 priority = None
@@ -806,7 +908,7 @@ def extract_geographic_features(
             )
             if feature_type in {"bay", "strait"}:
                 tier = "detail"
-            elif feature_type in {"plain", "plateau", "basin"}:
+            elif feature_type in {"plain", "plateau", "basin", "desert", "wetland"}:
                 tier = (
                     "major"
                     if size >= max(minimum_size * 6, int(coarse_land.size * 0.0025))
@@ -913,7 +1015,7 @@ def extract_geographic_features(
         )
     island_anchors = _bounded_component_anchors(
         coarse_habitable_land,
-        potential + 0.15 * elevation,
+        elevation,
         limit=96,
         minimum_size=1,
         maximum_size=island_maximum_size,
@@ -1016,6 +1118,9 @@ def extract_geographic_features(
     detail_elevation = reduce_field(grid.elevation, step=detail_step, mode="max")
     detail_land = reduce_field(mainland_support, step=detail_step, mode="max").astype(bool)
     detail_water = reduce_field(grid.water, step=detail_step, mode="max").astype(np.uint8)
+    raw_summits = prominent_raw_summits(
+        grid, raw_elevation_m, components=mountain_components(grid),
+    )
 
     def add_named(
         feature_type: str,
@@ -1048,11 +1153,10 @@ def extract_geographic_features(
             )
         )
 
-    peak_score = np.where(
-        detail_land & (detail_elevation >= 0.54),
-        detail_elevation,
-        -np.inf,
-    )
+    peak_score = np.full(grid.shape, -np.inf, dtype=np.float64)
+    for summit in raw_summits:
+        if detail_land[summit.row, summit.column]:
+            peak_score[summit.row, summit.column] = summit.elevation_m
     peak_seeds = select_spaced_seeds(
         peak_score,
         np.isfinite(peak_score),
@@ -1060,18 +1164,10 @@ def extract_geographic_features(
         minimum_distance=max(8.0, 34.0 / detail_step),
     )
     for coarse_row, coarse_column in peak_seeds:
-        row_start = coarse_row * detail_step
-        column_start = coarse_column * detail_step
-        block = grid.elevation[
-            row_start : min(grid.shape[0], row_start + detail_step),
-            column_start : min(grid.shape[1], column_start + detail_step),
-        ]
-        local = int(np.argmax(block))
-        local_row, local_column = np.unravel_index(local, block.shape)
         add_named(
             "peak",
-            row_start + int(local_row),
-            column_start + int(local_column),
+            coarse_row,
+            coarse_column,
             tier="detail",
         )
 
@@ -1124,4 +1220,7 @@ def extract_geographic_features(
         add_named("lake", row, column, tier="detail")
         if len(local_lakes) >= 16:
             break
-    return tuple(result)
+    from ..landforms import derive_landform_inventory
+    inventory = derive_landform_inventory(grid, thematic, raw_elevation_m=raw_elevation_m)
+    extended, _evidence = extend_geographic_features(grid, cultures, tuple(result), lexicon, inventory=inventory)
+    return extended

@@ -10,6 +10,7 @@ from scipy import ndimage
 
 from ..model import WorldGrid
 from ..thematic import ThematicLayers, smooth_field
+from ..suitability import continuous_proximity, relative_land_slope
 from .model import PopulationLayers, Settlement
 from .spatial import (
     connected_components,
@@ -20,14 +21,7 @@ from .spatial import (
 )
 
 
-def _gradient_magnitude(values: np.ndarray) -> np.ndarray:
-    """Return a finite terrain slope field, including degenerate test grids."""
-
-    field = np.asarray(values, dtype=np.float64)
-    if any(size < 2 for size in field.shape):
-        return np.zeros(field.shape, dtype=np.float64)
-    gradient_row, gradient_column = np.gradient(field)
-    return np.hypot(gradient_row, gradient_column)
+POPULATION_DENSITY_THRESHOLDS = (0.0,.1,.5,1.0,2.0,5.0)
 
 
 def _settlement_layout_variation(
@@ -95,16 +89,42 @@ def _latitude_area_weights(grid: WorldGrid) -> np.ndarray:
     return np.clip(np.cos(np.radians(latitudes)), 0.0, 1.0)[:, None]
 
 
-def _population_bands(weights: np.ndarray, land: np.ndarray) -> np.ndarray:
-    result = np.zeros(weights.shape, dtype=np.uint8)
-    positive = weights[land & (weights > 0.0)]
-    if positive.size == 0:
-        return result
-    thresholds = np.quantile(positive, (0.20, 0.40, 0.60, 0.80, 0.93))
-    result[land & (weights > 0.0)] = (
-        np.digitize(weights[land & (weights > 0.0)], thresholds).astype(np.uint8) + 1
-    )
+def _population_bands(density: np.ndarray, land: np.ndarray) -> np.ndarray:
+    result = np.zeros(density.shape, dtype=np.uint8)
+    positive=land&(density>0.0)
+    result[positive]=np.digitize(density[positive],POPULATION_DENSITY_THRESHOLDS).astype(np.uint8)
     return result
+
+
+def cell_areas_km2(grid: WorldGrid) -> np.ndarray:
+    """Return exact spherical native-cell areas as a read-only broadcast view."""
+    extents=grid.metadata['extents']
+    radius=float(grid.metadata['planet']['radiusKm'])
+    latitude=np.linspace(float(extents['north']),float(extents['south']),grid.shape[0]+1)
+    longitude_width=math.radians(float(extents['east'])-float(extents['west']))/grid.shape[1]
+    areas=radius*radius*longitude_width*np.abs(np.diff(np.sin(np.radians(latitude))))
+    if np.any(areas<=0.0) or np.any(~np.isfinite(areas)):
+        raise ValueError('Population density requires positive spherical cell areas')
+    return np.broadcast_to(areas[:,None], grid.shape)
+
+
+def _density_from_weights(grid: WorldGrid, weights: np.ndarray, minimum: int, maximum: int) -> np.ndarray:
+    if weights.shape!=grid.shape:
+        raise ValueError('Population weights must match the WorldGrid shape')
+    density=(np.asarray(weights,dtype=np.float64)*((minimum+maximum)/2.0)/cell_areas_km2(grid)).astype(np.float32)
+    density.setflags(write=False)
+    return density
+
+
+def population_density(grid: WorldGrid, population: PopulationLayers) -> np.ndarray:
+    """Estimate persons/km² from midpoint population and actual spherical area.
+
+    Population weights remain cell headcount fractions. Displaying those
+    fractions directly would confuse smaller high-latitude cells with sparse
+    settlement and change colours despite equal density on the ground.
+    """
+    return _density_from_weights(grid,population.population_weight,
+                                 population.population_min,population.population_max)
 
 
 def _latent_drainage_access(
@@ -141,6 +161,62 @@ def _latent_drainage_access(
     return drainage
 
 
+def _settlement_freshwater_access(
+    grid: WorldGrid,
+    rainfall_reliability: np.ndarray,
+    land: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return mapped-stream and sub-map water access for settlement choice.
+
+    ``river_order`` is the complete, evidence-gated canonical network.  A
+    settlement may benefit from every stream class, but never occupies a
+    channel cell itself.  Major rivers retain a separate corridor influence;
+    accumulated discharge provides the distinct groundwater/spring proxy for
+    habitable interior land that is not beside any mapped line.
+    """
+
+    allowed = np.asarray(land, dtype=bool)
+    if allowed.shape != grid.shape:
+        raise ValueError("settlement freshwater land mask must match the WorldGrid")
+    scale = min(grid.shape)
+    streams = grid.river_order > 0
+    major_streams = grid.river_order >= 2
+    stream_access = continuous_proximity(
+        streams,
+        max(2, min(12, scale // 96)),
+    )
+    major_stream_access = continuous_proximity(
+        major_streams,
+        max(2, min(10, scale // 110)),
+    )
+    lake_access = continuous_proximity(
+        grid.water == 2,
+        max(1, min(5, scale // 180)),
+    )
+    stream_bank = allowed & (_proximity(streams, 1) > 0.0)
+    groundwater_access = smooth_field(
+        _latent_drainage_access(
+            grid.discharge,
+            rainfall_reliability,
+            allowed,
+        ),
+        radius=min(grid.shape[1], max(2, min(6, scale // 180))),
+        passes=2,
+    )
+    groundwater_access[~allowed] = 0.0
+    freshwater = np.maximum.reduce(
+        (stream_access, lake_access, groundwater_access)
+    )
+    freshwater[~allowed] = 0.0
+    return (
+        stream_access,
+        major_stream_access,
+        stream_bank,
+        groundwater_access,
+        freshwater,
+    )
+
+
 def derive_population(
     grid: WorldGrid,
     thematic: ThematicLayers,
@@ -150,62 +226,25 @@ def derive_population(
 ) -> PopulationLayers:
     """Derive normalized population weights without inventing local headcounts."""
 
-    if thematic.land_potential.shape != grid.shape:
+    if thematic.land_potential.shape != grid.shape or thematic.habitability.shape != grid.shape:
         raise ValueError("thematic layers must match the WorldGrid shape")
     # Population, culture and states share one explicit human domain.  Polar
     # continents deliberately stop at physical climate/biome generation.
     land = society_domain_mask(grid)
-    scale = min(grid.shape)
     reliability = 1.0 - np.clip(
         thematic.climate.precipitation_range / 0.45,
         0.0,
         1.0,
     )
-    mapped_freshwater = _proximity(
-        (grid.water == 2) | (grid.river_order > 0),
-        max(2, min(18, scale // 64)),
-    )
-    latent_freshwater = smooth_field(
-        _latent_drainage_access(grid.discharge, reliability, land),
-        radius=min(grid.shape[1], max(2, min(6, scale // 180))),
-        passes=2,
-    )
-    latent_freshwater[~land] = 0.0
-    freshwater = np.maximum(
-        mapped_freshwater,
-        latent_freshwater,
-    )
-    maritime = _proximity(
-        (grid.water == 1) | (grid.water == 3),
-        max(1, min(8, scale // 128)),
-    )
     potential = np.asarray(thematic.land_potential, dtype=np.float64)
-    elevation = grid.elevation.astype(np.float64)
-    slope = _gradient_magnitude(elevation)
-    slope_penalty = np.power(np.clip(slope / 0.055, 0.0, 1.0), 1.25)
-    height_penalty = np.power(
-        np.clip((elevation - 0.42) / 0.38, 0.0, 1.0),
-        1.35,
-    )
-    terrain_access = (
-        (1.0 - 0.76 * slope_penalty)
-        * (1.0 - 0.58 * height_penalty)
-    )
+    habitability=np.asarray(thematic.habitability,dtype=np.float64)
     support = (
         np.power(np.clip(potential, 0.0, 1.0), 1.55)
+        * np.power(np.clip(habitability,0.0,1.0),1.10)
         * (0.62 + 0.38 * reliability)
-        * (0.82 + 0.18 * freshwater)
-        * (0.92 + 0.08 * maritime)
-        * terrain_access
         * _latitude_area_weights(grid)
     )
-    inhabitable = (
-        society_domain_mask(grid)
-        & ~grid.snow
-        & (thematic.climate.temperature >= 0.14)
-        & (thematic.climate.annual_precipitation >= 0.018)
-        & (potential > 0.0)
-    )
+    inhabitable = land & ~grid.snow
     support[~inhabitable] = 0.0
     total = float(support.sum(dtype=np.float64))
     if total <= 0.0:
@@ -221,7 +260,8 @@ def derive_population(
     anchor = int(np.argmax(weights.reshape(-1)))
     correction = np.float32(1.0 - float(weights.sum(dtype=np.float64)))
     weights.reshape(-1)[anchor] += correction
-    bands = _population_bands(weights, land)
+    density=_density_from_weights(grid,weights,population_min,population_max)
+    bands = _population_bands(density, land)
     return PopulationLayers(
         population_weight=weights,
         population_band=bands,
@@ -321,7 +361,7 @@ def _river_bank_location(
     scores = np.asarray(site_score, dtype=np.float64)
     if allowed.shape != rivers.shape or scores.shape != allowed.shape:
         raise ValueError("river-bank settlement fields must align")
-    if int(rivers[row, column]) < 2:
+    if int(rivers[row, column]) <= 0:
         return int(row), int(column)
     used = set() if occupied is None else occupied
     height, width = allowed.shape
@@ -380,7 +420,10 @@ def derive_settlements(
     ocean_coast = land & _adjacent_water(grid, (1, 3))
     lake_coast = land & _adjacent_water(grid, (2,))
     river = grid.river_order > 0
-    river_corridor = grid.river_order >= 2
+    # A channel is hydrology, not buildable ground.  Select banks and nearby
+    # terraces directly rather than choosing a line cell and repairing it
+    # later; the final bank relocation remains a defensive invariant.
+    settlement_land = land & ~river
     annual = thematic.climate.annual_precipitation
     population_relative = population.population_weight.astype(np.float64)
     maximum = float(population_relative.max(initial=0.0))
@@ -389,72 +432,51 @@ def derive_settlements(
     river_permanence = np.min(
         grid.seasonal_river_strength.astype(np.float64), axis=0
     ) / 255.0
-    river_score = (
-        np.clip(grid.river_order.astype(np.float64) / 5.0, 0.0, 1.0)
-        * (0.62 + 0.38 * river_permanence)
-    )
     incoming = np.zeros(grid.shape, dtype=np.float64)
     routed = river & (grid.flow_to >= 0)
     np.add.at(incoming.reshape(-1), grid.flow_to[routed], 1.0)
     confluence_score = np.clip((incoming - 1.0) / 2.0, 0.0, 1.0)
-    river_access = _proximity(
-        river_corridor,
-        max(2, min(10, min(grid.shape) // 110)),
-    )
     rainfall_reliability = 1.0 - np.clip(
         thematic.climate.precipitation_range.astype(np.float64) / 0.45,
         0.0,
         1.0,
     )
-    latent_freshwater = smooth_field(
-        _latent_drainage_access(
-            grid.discharge,
-            rainfall_reliability,
-            land,
-        ),
-        radius=min(
-            grid.shape[1],
-            max(2, min(6, min(grid.shape) // 180)),
-        ),
-        passes=2,
+    (
+        river_access,
+        major_river_access,
+        river_bank,
+        _groundwater_access,
+        freshwater_access,
+    ) = _settlement_freshwater_access(grid, rainfall_reliability, land)
+    river_bank &= settlement_land
+    river_corridor = settlement_land & (major_river_access > 0.0)
+    flowing_stream_access = _proximity(
+        river & (river_permanence > 0.0),
+        max(2, min(12, min(grid.shape) // 96)),
     )
-    latent_freshwater[~land] = 0.0
-    freshwater_access = np.maximum.reduce(
-        (
-            river_access,
-            _proximity(lake_coast, max(1, min(5, min(grid.shape) // 180))),
-            latent_freshwater,
-        )
+    confluence_access = _proximity(
+        confluence_score > 0.0,
+        max(2, min(8, min(grid.shape) // 144)),
+    )
+    river_score = (
+        0.58 * river_access * (0.72 + 0.28 * flowing_stream_access)
+        + 0.42 * major_river_access
     )
     dry_water_need = np.clip((0.16 - annual) / 0.16, 0.0, 1.0)
     elevation = grid.elevation.astype(np.float64)
-    slope = _gradient_magnitude(elevation)
-    temperature = thematic.climate.temperature.astype(np.float64)
-    temperature_comfort = np.clip(
-        1.0 - np.abs(temperature - 0.62) / 0.34,
-        0.0,
-        1.0,
-    )
-    moisture_support = np.clip((annual - 0.055) / 0.12, 0.0, 1.0) * np.clip(
-        (0.60 - annual) / 0.20,
-        0.0,
-        1.0,
-    )
-    climate_support = (
-        0.62 * temperature_comfort
-        + 0.23 * moisture_support
-        + 0.15 * rainfall_reliability
-    )
+    slope = relative_land_slope(elevation, grid.water == 0)
+    climate_support=thematic.habitability.astype(np.float64)
     settlement_terrain_penalty = (
         0.62 * np.clip(slope / 0.060, 0.0, 1.0)
         + 0.38 * np.clip((elevation - 0.48) / 0.30, 0.0, 1.0)
     )
     site_score = (
         0.40 * population_relative
-        + 0.29 * thematic.land_potential.astype(np.float64)
+        + 0.15 * thematic.land_potential.astype(np.float64)
+        + 0.14 * thematic.habitability.astype(np.float64)
         + 0.10 * freshwater_access
         + 0.03 * river_score
-        + 0.03 * confluence_score
+        + 0.03 * confluence_access
         + 0.05 * ocean_coast
         + 0.06 * lake_coast
         + 0.10 * climate_support
@@ -469,7 +491,7 @@ def derive_settlements(
         "world-seed:"
         + str(grid.metadata.get("societyGeneration", {}).get("humanSeed", 0)),
     )
-    site_score[~land | grid.snow] = -np.inf
+    site_score[~settlement_land | grid.snow] = -np.inf
     step = 1
     coarse_score = reduce_field(site_score, step=step, mode="max")
     positive_population = population_relative[population_relative > 0.0]
@@ -479,10 +501,10 @@ def derive_settlements(
         else 0.0
     )
     watered_exception = (
-        ocean_coast | lake_coast | river_corridor
+        ocean_coast | lake_coast | (freshwater_access >= 0.26)
     ) & (population_relative >= population_floor * 0.45)
     urban_valid = (
-        land
+        settlement_land
         & ~grid.snow
         & (elevation < 0.72)
         & (slope < 0.105)
@@ -509,11 +531,10 @@ def derive_settlements(
     strategic_enabled = target_count >= 40
     gateway_count = int(round(target_count * 0.025)) if strategic_enabled else 0
     coast_count = int(round(target_count * 0.075)) if strategic_enabled else 0
-    river_count = int(round(target_count * 0.05)) if strategic_enabled else 0
+    river_count = int(round(target_count * 0.035)) if strategic_enabled else 0
     lake_count = int(round(target_count * 0.04)) if strategic_enabled else 0
-    valley_count = int(round(target_count * 0.08)) if strategic_enabled else 0
-    plain_count = int(round(target_count * 0.36)) if strategic_enabled else 0
-    pass_count = int(round(target_count * 0.04)) if strategic_enabled else 0
+    valley_count = int(round(target_count * 0.065)) if strategic_enabled else 0
+    plain_count = int(round(target_count * 0.39)) if strategic_enabled else 0
     base_count = (
         target_count
         - gateway_count
@@ -522,7 +543,6 @@ def derive_settlements(
         - lake_count
         - valley_count
         - plain_count
-        - pass_count
     )
     base_seeds = select_spaced_seeds(
         coarse_score,
@@ -531,7 +551,11 @@ def derive_settlements(
         minimum_distance=float(spacing),
     )
     occupied = list(base_seeds)
-    coarse_coast = reduce_field(ocean_coast, step=step, mode="max").astype(bool)
+    coarse_coast = reduce_field(
+        ocean_coast & settlement_land,
+        step=step,
+        mode="max",
+    ).astype(bool)
     coarse_river = reduce_field(river_corridor, step=step, mode="max").astype(bool)
 
     # Maritime gateways are not ordinary agricultural coast.  A narrow strait
@@ -561,6 +585,7 @@ def derive_settlements(
     )
     gateway_valid = (
         ocean_coast
+        & settlement_land
         & ~grid.snow
         & (gateway_reach >= 0.32)
         & (elevation < 0.64)
@@ -595,17 +620,21 @@ def derive_settlements(
             np.pad(lake_importance, ((1, 1), (0, 0)), mode="constant")[2:],
         )
     )
-    coarse_lake = reduce_field(lake_coast, step=step, mode="max").astype(bool)
-    coast_site_score = np.where(ocean_coast, site_score, -np.inf)
+    coarse_lake = reduce_field(
+        lake_coast & settlement_land,
+        step=step,
+        mode="max",
+    ).astype(bool)
+    coast_site_score = np.where(ocean_coast & settlement_land, site_score, -np.inf)
     river_site_score = np.where(
-        river_corridor,
-        site_score + 0.20 * confluence_score + 0.08 * river_permanence,
+        river_bank | river_corridor,
+        site_score + 0.20 * confluence_access + 0.08 * flowing_stream_access,
         -np.inf,
     )
     coarse_coast_score = reduce_field(coast_site_score, step=step, mode="max")
     coarse_river_score = reduce_field(river_site_score, step=step, mode="max")
     lake_site_score = np.where(
-        lake_coast,
+        lake_coast & settlement_land,
         site_score + 0.24 * adjacent_lake_importance,
         -np.inf,
     )
@@ -616,14 +645,13 @@ def derive_settlements(
     # support cities even when the exact urban cell is beside, rather than on,
     # the rasterized river line.
     valley_valid = (
-        land
+        settlement_land
         & ~grid.snow
         & (river_access >= 0.34)
         & (thematic.land_potential >= 0.40)
         & (population_relative >= population_floor * 0.42)
-        & (temperature >= 0.32)
-        & (temperature <= 0.84)
-        & (annual >= 0.070)
+        & (thematic.habitability >= 0.32)
+        & ((annual >= 0.070) | (freshwater_access >= 0.55))
         & (elevation < 0.54)
         & (slope < 0.058)
     )
@@ -632,7 +660,7 @@ def derive_settlements(
         site_score
         + 0.22 * climate_support
         + 0.18 * river_access
-        + 0.12 * confluence_score
+        + 0.12 * confluence_access
         + 0.08 * (1.0 - np.clip(slope / 0.058, 0.0, 1.0)),
         -np.inf,
     )
@@ -644,7 +672,7 @@ def derive_settlements(
     # automatic great cities; hierarchy is still earned by population and
     # corridor centrality.
     plain_valid = (
-        land
+        settlement_land
         & ~grid.snow
         & ~ocean_coast
         & ~lake_coast
@@ -667,34 +695,8 @@ def derive_settlements(
     coarse_plain_score = reduce_field(plain_site_score, step=step, mode="max")
     coarse_plain_valid = reduce_field(plain_valid, step=step, mode="max").astype(bool)
 
-    padded = np.pad(elevation, 1, mode="edge")
-    neighbors = tuple(
-        padded[1 + dy : 1 + dy + grid.shape[0], 1 + dx : 1 + dx + grid.shape[1]]
-        for dy in (-1, 0, 1)
-        for dx in (-1, 0, 1)
-        if dy or dx
-    )
-    local_relief = np.maximum.reduce(neighbors) - np.minimum.reduce(neighbors)
-    pass_score = (
-        1.8 * local_relief
-        + 0.20 * population_relative
-        + 0.18 * thematic.land_potential.astype(np.float64)
-        - 0.9 * np.abs(elevation - 0.54)
-    )
-    pass_valid = (
-        land
-        & ~grid.snow
-        & ~ocean_coast
-        & ~lake_coast
-        & (elevation >= 0.40)
-        & (elevation <= 0.72)
-        & (local_relief >= 0.018)
-    )
-    coarse_pass_score = reduce_field(
-        np.where(pass_valid, pass_score, -np.inf), step=step, mode="max"
-    )
-    coarse_pass_valid = reduce_field(pass_valid, step=step, mode="max").astype(bool)
-
+    # Mountain relief alone cannot create a defended pass. Strategic gates
+    # are selected after the real urban road network and its demand exist.
     seed_groups: list[tuple[tuple[tuple[int, int], ...], np.ndarray, str | None, str]] = [
         (base_seeds, site_score, None, "urban"),
         (
@@ -769,18 +771,6 @@ def derive_settlements(
             "market",
             "plain-town",
         ),
-        (
-            _select_spaced_additions(
-                coarse_pass_score,
-                coarse_pass_valid,
-                count=pass_count,
-                minimum_distance=max(2.0, spacing * 0.68),
-                occupied=occupied,
-            ),
-            np.where(pass_valid, pass_score, -np.inf),
-            "pass",
-            "site",
-        ),
     ]
     missing = target_count - sum(len(seeds) for seeds, _score, _type, _tier in seed_groups)
     if missing > 0:
@@ -829,9 +819,15 @@ def derive_settlements(
             ),
             reverse=True,
         )[: min(42, max(16, target_count // 9))]
-        island_score = 0.58 * population_relative + 0.42 * thematic.land_potential.astype(np.float64) + 0.18 * ocean_coast
+        island_score = (
+            0.58 * population_relative
+            + 0.42 * thematic.land_potential.astype(np.float64)
+            + 0.18 * ocean_coast
+        )
         coarse_island_score = reduce_field(
-            np.where(ocean_coast, island_score, -np.inf), step=step, mode="max"
+            np.where(ocean_coast & settlement_land, island_score, -np.inf),
+            step=step,
+            mode="max",
         )
         for _size, component_identifier in island_candidates:
             valid = (components == component_identifier) & coarse_coast & np.isfinite(coarse_island_score)
@@ -842,7 +838,7 @@ def derive_settlements(
             seed = tuple(int(value) for value in np.unravel_index(int(best), valid.shape))
             row, column, score = _resolve_seed(
                 seed,
-                np.where(ocean_coast, island_score, -np.inf),
+                np.where(ocean_coast & settlement_land, island_score, -np.inf),
                 step=step,
                 shape=grid.shape,
             )
@@ -898,7 +894,7 @@ def derive_settlements(
         minimum_coastal_gap = max(12, coastal_coverage_radius // 2)
         usable_coast = (
             ocean_coast
-            & land
+            & settlement_land
             & ~grid.snow
             & (elevation < 0.66)
             & (slope < 0.10)
@@ -968,7 +964,7 @@ def derive_settlements(
         # hundreds of kilometres of another major river without a market node.
         # Audit the actual river network after all ordinary seeds are resolved
         # and insert one river town into every materially long uncovered reach.
-        river_gap_budget = max(6, min(20, int(round(target_count * 0.035))))
+        river_gap_budget = max(4, min(14, int(round(target_count * 0.025))))
         river_coverage_radius = max(24, min(44, min(grid.shape) // 24))
         minimum_gap_size = max(10, river_coverage_radius // 2)
         major_river = (grid.river_order >= 3) & land & ~grid.snow
@@ -1008,7 +1004,7 @@ def derive_settlements(
                     candidates,
                     river_site_score
                     + 0.22 * gap_reach
-                    + 0.06 * np.clip(grid.river_order.astype(np.float64) / 4.0, 0.0, 1.0),
+                    + 0.06 * major_river_access,
                     -np.inf,
                 )
                 flat = int(np.argmax(candidate_score))
@@ -1038,12 +1034,11 @@ def derive_settlements(
         # population support are deliberately outside this administrative
         # domain.
         administrative_domain = (
-            land
+            settlement_land
             & ~grid.snow
             & (population.population_weight > 0.0)
             & (thematic.land_potential >= 0.08)
-            & (temperature >= 0.14)
-            & (annual >= 0.018)
+            & (thematic.habitability >= 0.14)
             & (elevation < 0.68)
             & (slope < 0.090)
         )
@@ -1163,13 +1158,7 @@ def derive_settlements(
         resolved,
         key=lambda item: (-item[2], item[0] * grid.shape[1] + item[1]),
     ):
-        if (
-            category != "site"
-            and forced_type not in {"port", "island-port", "lake-port"}
-            and not ocean_coast[row, column]
-            and not lake_coast[row, column]
-            and int(grid.river_order[row, column]) >= 2
-        ):
+        if int(grid.river_order[row, column]) > 0:
             bank_row, bank_column = _river_bank_location(
                 row,
                 column,
@@ -1181,7 +1170,8 @@ def derive_settlements(
             if (bank_row, bank_column) != (row, column):
                 row, column = bank_row, bank_column
                 score = float(site_score[row, column])
-                forced_type = "river-city"
+                if forced_type is None:
+                    forced_type = "river-city"
         if (row, column) in occupied_resolved:
             continue
         occupied_resolved.add((row, column))
@@ -1217,7 +1207,7 @@ def derive_settlements(
             site_type = "port"
         elif lake_coast[row, column]:
             site_type = "lake-port"
-        elif river[row, column]:
+        elif river_bank[row, column]:
             site_type = "river-city"
         elif annual[row, column] < 0.065:
             site_type = "oasis"

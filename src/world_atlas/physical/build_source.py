@@ -401,8 +401,7 @@ class PhysicalFields:
         )
         parameters["bathymetryRule"] = (
             "piecewise-linear-RGB-segment-projection to continuous palette position, "
-            "masked normalized 3x3 smoothing, then authored ordinal classes; "
-            "board-edge ocean is deepest"
+            "masked normalized 3x3 smoothing, then ordinal classes from the shared surface"
         )
         parameters["bathymetrySmoothingRule"] = (
             "authored palette-position [0,1] surface; normalized masked 3x3 box "
@@ -4025,10 +4024,6 @@ def prepare_physical_fields(
         0,
         context.bathymetry_levels - 1,
     ).astype(np.int16)
-    # The padded board edge is an authoring registration edge, not an observed
-    # shallow-water sample. Explicitly close it as the deepest source class.
-    edge_ocean = ocean & _edge_mask(ocean.shape)
-    bathymetry_grid[edge_ocean] = context.bathymetry_levels - 1
     bathymetry_grid = _majority_denoise(
         bathymetry_grid, maritime_water, class_count=context.bathymetry_levels
     )
@@ -4046,7 +4041,11 @@ def prepare_physical_fields(
         for index, component in enumerate(raw_inland_components)
         if index not in raw_lake_component_indices and _is_linear_constraint(component)
     ]
-    polar_land_hydrology_exclusion = land & polar_latitude_mask
+    # The polar circle is a climate boundary, not a drainage wall.  Only a
+    # separately configured polar continent is removed from the human domain;
+    # ordinary high-latitude land remains in the same continuous drainage
+    # surface so rivers can reach its natural mouth.
+    polar_land_hydrology_exclusion = np.zeros_like(land, dtype=bool)
     if bool(np.any(lake_mask & polar_latitude_mask)):
         raise SourceBuildError("polar regions must not contain lakes")
     preliminary_snow_mask = compute_perennial_snowline(
@@ -4062,10 +4061,8 @@ def prepare_physical_fields(
         latitude_rows,
         planet=context.planet,
     )
-    # Polar continents deliberately end at climate and biome.  Exclude them
-    # from hydrology at the input boundary so their area and relief cannot
-    # change channel thresholds or drainage topology on the inhabited
-    # continents.  They remain canonical land for terrain, snow and climate.
+    # Hydrology always sees the complete terrestrial surface.  Climate and
+    # society apply their own polar-domain constraints downstream.
     hydrology_land = land & ~polar_land_hydrology_exclusion
     hydrology_ocean = ocean | polar_land_hydrology_exclusion
     preliminary_hydrology = compute_hydrology(
@@ -4132,10 +4129,8 @@ def prepare_physical_fields(
         hydrology,
         corrected_elevation=continuous_elevation.copy(),
     )
-    # Polar continents intentionally stop at terrain, snow, simple climate and
-    # biome.  Hydrology never enters them; clear every published field again at
-    # this contract boundary so downstream consumers cannot mistake polar land
-    # for a drainage surface.
+    # Keep the clearing branch for the explicit polar-continent configuration;
+    # ordinary Arctic and Antarctic-circle terrain never enters it.
     polar_hydrology_mask = polar_land_hydrology_exclusion
     if bool(polar_hydrology_mask.any()):
         def cleared(values: np.ndarray, fill: Any) -> np.ndarray:
@@ -4874,8 +4869,6 @@ def _build_source(
                 geometry, wrap_right_edge=True, context=context
             ),
         }
-        if index == BATHYMETRY_LEVELS:
-            feature["edgeRule"] = "authoring-board-edge-ocean-forced-deepest"
         bathymetry_features.append(feature)
 
     lake_features = [
@@ -5051,7 +5044,7 @@ def _build_source(
                 "continuousUpsampleFactor": 4,
                 "detailRule": "upsample-continuous-field-before-contouring; reduced-vector-simplification-after-contouring",
             },
-            "bathymetryRule": f"piecewise-linear projection onto the ordered {len(bathymetry_palette)}-stop bathymetry palette from shallow fringe to deep ocean, masked normalized 3x3 smoothing for {bathymetry_smoothing_iterations} iteration(s), then subdivided into {bathymetry_levels} authored ordinal levels; board-edge ocean is forced to the deepest ordinal",
+            "bathymetryRule": f"piecewise-linear projection onto the ordered {len(bathymetry_palette)}-stop bathymetry palette from shallow fringe to deep ocean, masked normalized 3x3 smoothing for {bathymetry_smoothing_iterations} iteration(s), then subdivided into {bathymetry_levels} ordinal levels from the shared surface",
             "bathymetrySmoothingIterations": BATHYMETRY_SMOOTHING_ITERATIONS,
             "bathymetrySmoothing": {
                 "algorithm": "masked-normalized-box-3x3",

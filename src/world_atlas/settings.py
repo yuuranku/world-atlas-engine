@@ -29,6 +29,7 @@ _SOCIETY_INTEGER_KEYS = {
     "populationMax",
 }
 _SOCIETY_KEYS = _SOCIETY_INTEGER_KEYS | {"frontierTargetShare"}
+_TECHNOLOGY_ERAS = frozenset({"tribal", "ancient", "medieval", "early-modern", "preindustrial", "industrial", "contemporary"})
 
 
 def _strict_mapping(value: object, *, name: str, keys: set[str]) -> dict:
@@ -64,14 +65,18 @@ class WorldSettings:
     naming_seed: int
     planet: Mapping[str, float | str]
     society: Mapping[str, int | float]
+    technology_era: str
+    travel_capabilities: tuple[str, ...]
 
     def document(self) -> dict[str, object]:
         return {
-            "schema": "world-atlas-world-settings-v1",
+            "schema": "world-atlas-world-settings-v3",
             "humanSeed": self.human_seed,
             "namingSeed": self.naming_seed,
             "planet": dict(self.planet),
             "society": dict(self.society),
+            "technologyEra": self.technology_era,
+            "travelCapabilities": list(self.travel_capabilities),
         }
 
 
@@ -80,10 +85,28 @@ def load_world_settings(path: str | Path) -> WorldSettings:
     root = _strict_mapping(
         document,
         name="world settings",
-        keys={"schema", "humanSeed", "namingSeed", "planet", "society"},
+        keys={
+            "schema",
+            "humanSeed",
+            "namingSeed",
+            "planet",
+            "society",
+            "technologyEra",
+            "travelCapabilities",
+        },
     )
-    if root["schema"] != "world-atlas-world-settings-v1":
+    if root["schema"] != "world-atlas-world-settings-v3":
         raise ValueError("unknown world settings schema")
+    technology_era = root["technologyEra"]
+    capabilities = root['travelCapabilities']
+    if (not isinstance(capabilities, list) or any(not isinstance(value,str) or value not in {'magic-flight','dragon'} for value in capabilities)
+            or len(set(capabilities)) != len(capabilities)):
+        raise ValueError('travelCapabilities must list unique supported capabilities: magic-flight, dragon')
+    if technology_era not in _TECHNOLOGY_ERAS:
+        raise ValueError(
+            "technologyEra must be one of: "
+            + ", ".join(sorted(_TECHNOLOGY_ERAS))
+        )
 
     planet = _strict_mapping(root["planet"], name="planet", keys=_PLANET_KEYS)
     direction = planet["rotationDirection"]
@@ -132,4 +155,6 @@ def load_world_settings(path: str | Path) -> WorldSettings:
         naming_seed=_seed(root["namingSeed"], name="namingSeed"),
         planet=normalized_planet,
         society=normalized_society,
+        technology_era=technology_era,
+        travel_capabilities=tuple(capabilities),
     )

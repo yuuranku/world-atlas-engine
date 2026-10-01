@@ -15,7 +15,7 @@ def immutable_array(value: np.ndarray, *, dtype: np.dtype) -> np.ndarray:
 
 @dataclass(frozen=True, slots=True)
 class PopulationLayers:
-    """Normalized population support and six-level display partition."""
+    """Cell headcount fractions and seven absolute density display classes."""
 
     population_weight: np.ndarray
     population_band: np.ndarray
@@ -109,7 +109,7 @@ class TransportRoute:
     def __post_init__(self) -> None:
         if not self.identifier.strip() or not self.source_settlement_id.strip():
             raise ValueError("transport route identifiers must be non-empty")
-        if self.mode not in {"road", "river", "sea"}:
+        if self.mode not in {"road", "rail", "river", "sea"}:
             raise ValueError("unsupported transport mode")
         if self.importance not in {"trunk", "regional", "local"}:
             raise ValueError("unsupported transport importance")
@@ -173,8 +173,8 @@ class TransportLayers:
             if bridge.row >= accessibility.shape[0] or bridge.column >= accessibility.shape[1]:
                 raise ValueError("bridge lies outside transport grid")
             route = route_by_identifier.get(bridge.route_identifier)
-            if route is None or route.mode != "road":
-                raise ValueError("bridges must reference a road route")
+            if route is None or route.mode not in {"road", "rail"}:
+                raise ValueError("bridges must reference an overland route")
         object.__setattr__(
             self,
             "accessibility",
@@ -353,6 +353,10 @@ class GeographicFeature:
             "plain",
             "plateau",
             "basin",
+            "desert",
+            "wetland",
+            "ridge", "hills", "valley", "gorge", "foothills", "steep-slope",
+            "lowland-valley", "snow-mountain", "cape", "peninsula", "isthmus", "arid-upland",
         }:
             raise ValueError("unsupported geographic feature type")
         if self.row < 0 or self.column < 0:
@@ -626,12 +630,29 @@ class SocietyLayers:
             raise ValueError("political layers must match population shape")
         if self.provinces.province_id.shape != shape:
             raise ValueError("province layers must match population shape")
-        state_by_province = {
-            item.identifier: item.state_identifier for item in self.provinces.provinces
-        }
-        for identifier, state_identifier in state_by_province.items():
-            if np.any(
-                self.politics.state_id[self.provinces.province_id == identifier]
-                != state_identifier
-            ):
-                raise ValueError("province cells must remain inside their parent country")
+        states = self.politics.state_id
+        provinces = self.provinces.province_id
+        controlled = states > 0
+        assigned = provinces > 0
+        if np.any(controlled & ~assigned):
+            raise ValueError("every country cell must belong to a province")
+        # One raster lookup, not a full-grid boolean scan for every province.
+        parent = np.zeros(len(self.provinces.provinces) + 1, dtype=np.int32)
+        for province in self.provinces.provinces:
+            parent[province.identifier] = province.state_identifier
+        if np.any(parent[provinces[assigned]] != states[assigned]):
+            raise ValueError("province cells must remain inside their parent country")
+
+        settlements = {item.identifier: item for item in self.settlements}
+        for kind, records, owners in (
+            ("country", self.politics.states, states),
+            ("province", self.provinces.provinces, provinces),
+        ):
+            for record in records:
+                core = settlements.get(record.core_settlement_id)
+                if (
+                    core is None
+                    or not (0 <= core.row < shape[0] and 0 <= core.column < shape[1])
+                    or int(owners[core.row, core.column]) != record.identifier
+                ):
+                    raise ValueError(f"{kind} core must lie inside its own territory")

@@ -23,7 +23,7 @@ from __future__ import annotations
 import heapq
 import math
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -1294,6 +1294,40 @@ def _multiple_flow_accumulation(
         for target, fraction in edge_targets[index]:
             result.flat[target] += result.flat[index] * fraction
     return result
+
+
+def _strahler_order(
+    stream_mask: np.ndarray,
+    downstream_index: np.ndarray,
+    topological: Sequence[int],
+) -> np.ndarray:
+    """Accumulate tributary orders without one Python list per terrain cell.
+
+    D8 gives each cell one outgoing edge. Processing that edge in topological
+    order needs only the greatest incoming order and its multiplicity, cutting
+    millions of empty predecessor containers from the full-resolution build.
+    """
+    order = np.zeros(stream_mask.shape, dtype=np.int16)
+    highest = np.zeros(stream_mask.size, dtype=np.int16)
+    equal_highest = np.zeros(stream_mask.size, dtype=np.uint8)
+    selected = stream_mask.ravel()
+    downstream = downstream_index.ravel()
+    values = order.ravel()
+    for index in topological:
+        if not selected[index]:
+            continue
+        value = max(1, int(highest[index]) + int(equal_highest[index] >= 2))
+        values[index] = value
+        target = int(downstream[index])
+        if target < 0 or not selected[target]:
+            continue
+        if value > highest[target]:
+            highest[target] = value
+            equal_highest[target] = 1
+        elif value == highest[target]:
+            equal_highest[target] += 1
+
+    return order
 
 
 def _suppress_parallel_streams(
@@ -2647,9 +2681,12 @@ def compute_hydrology(
         local rain and baseflow before snowmelt is added, then is normalized
         internally so only its spatial contrast changes channel selection.
     seasonality_index:
-        Optional ``[0, 1]`` monsoon seasonality.  Strong seasonality raises
-        the catchment threshold for a channel to be published as perennial;
-        snow-fed cells and configured lake drainage retain their own gates.
+        Optional ``[0, 1]`` monsoon seasonality.  It is validated alongside
+        the physical inputs, but does not create a second topology gate.
+        ``runoff_source_yield`` already expresses dry-season baseflow in the
+        accumulated catchment evidence.  A structural tributary is therefore
+        not removed merely because it is seasonal; consumers may use the
+        four seasonal runoff fields to draw an intermittent reach differently.
     config:
         Deterministic thresholds, finite burn depth, optional lake outlets, and
         optional explicit inland sink seeds.
@@ -3229,14 +3266,12 @@ def compute_hydrology(
     mfd_conservation_error = mfd_terminal - mfd_input
 
     land_count = max(1, int(np.count_nonzero(land)))
-    effective_minimum_headwater_length = max(
-        active_config.minimum_headwater_length,
-        int(math.ceil(math.sqrt(land_count) * 0.012)),
-    )
-    selection_config = replace(
-        active_config,
-        minimum_headwater_length=effective_minimum_headwater_length,
-    )
+    # This explicit reach-length threshold must not increase when unrelated
+    # land is added elsewhere. Catchment/valley/source evidence determines
+    # channel eligibility; global land area cannot erase a qualified local
+    # tributary that already meets the configured minimum length.
+    effective_minimum_headwater_length = active_config.minimum_headwater_length
+    selection_config = active_config
     threshold = max(
         1,
         int(math.ceil(land_count * active_config.stream_threshold_fraction)),
@@ -3272,20 +3307,18 @@ def compute_hydrology(
     local_stream_threshold = np.full(shape, threshold, dtype=np.int64)
     local_stream_threshold[valley_supported] = valley_threshold
     local_stream_threshold[valley_supported & upland] = upland_valley_threshold
-    if seasonality is None:
-        seasonal_multiplier = np.ones(shape, dtype=np.float64)
-    else:
-        # A strongly seasonal catchment needs substantially more contributing
-        # area to remain visible year-round.  The nonlinear response leaves
-        # weakly seasonal climates nearly unchanged, while a 0.9 monsoon index
-        # raises the perennial threshold above four times the humid baseline.
-        seasonal_multiplier = 1.0 + 4.2 * np.power(seasonality, 1.5)
-        local_stream_threshold[terrain] = np.ceil(
-            local_stream_threshold[terrain] * seasonal_multiplier[terrain]
-        ).astype(np.int64)
-    local_mainstem_threshold = np.ceil(
-        mainstem_threshold * seasonal_multiplier
-    ).astype(np.int64)
+    # Canonical ``stream_order`` is a physical drainage topology, not a
+    # four-season cartographic snapshot.  The climate source yield has already
+    # reduced persistent catchment supply before MFD accumulation; multiplying
+    # this threshold a second time used to erase whole monsoon and high-latitude
+    # tributary trees.  Keep every reach that clears the shared accumulation,
+    # valley/source, length, and anti-comb evidence gates below.  Seasonal map
+    # views can still show zero strength when their actual runoff is zero.
+    #
+    # Keep a ones field for scalar diagnostics and to make the selection rule
+    # explicit in the serialized hydrology audit.
+    seasonal_multiplier = np.ones(shape, dtype=np.float64)
+    local_mainstem_threshold = np.full(shape, mainstem_threshold, dtype=np.int64)
     local_stream_threshold[perennial_snow] = snow_threshold
     lake_draining = terrain & (outlet_type == "lake")
     lake_drainage_cell_count = int(np.count_nonzero(lake_draining))
@@ -3469,25 +3502,7 @@ def compute_hydrology(
         unsupported_flat_route,
         selection_config,
     )
-    stream_order = np.zeros(shape, dtype=np.int16)
-    stream_predecessors: list[list[int]] = [[] for _ in range(shape[0] * shape[1])]
-    for index in active_indices:
-        if not stream_mask.flat[index]:
-            continue
-        target_index = int(downstream.flat[index])
-        if target_index >= 0 and stream_mask.flat[target_index]:
-            stream_predecessors[target_index].append(index)
-    for index in topological:
-        if not stream_mask.flat[index]:
-            continue
-        predecessors = stream_predecessors[index]
-        if not predecessors:
-            stream_order.flat[index] = 1
-            continue
-        highest = max(int(stream_order.flat[pred]) for pred in predecessors)
-        stream_order.flat[index] = highest + (
-            1 if sum(int(stream_order.flat[pred]) == highest for pred in predecessors) >= 2 else 0
-        )
+    stream_order = _strahler_order(stream_mask, downstream, topological)
 
     network = _extract_network(
         stream_mask,
@@ -3511,6 +3526,12 @@ def compute_hydrology(
             "lakeBasin": int(lake_basin_threshold),
             "lakeDrainingCellCount": lake_drainage_cell_count,
             "maximumSeasonalMultiplier": float(np.max(seasonal_multiplier[terrain])),
+            "seasonalityTopologyGate": "none; climate runoff yield remains applied",
+            "seasonalityInputMaximum": (
+                float(np.max(seasonality[terrain]))
+                if seasonality is not None
+                else None
+            ),
         },
         "mainstemThreshold": int(mainstem_threshold),
         "rawSelectedStreamCellCount": int(np.count_nonzero(raw_stream_mask)),

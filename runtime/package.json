@@ -2,5 +2,6 @@
   "name": "world-atlas-render-runtime",
   "private": true,
   "version": "1.0.0",
-  "dependencies": { "mapshaper": "0.7.56" }
+  "dependencies": { "mapshaper": "0.7.56", "three": "0.186.1" },
+  "devDependencies": { "esbuild": "0.25.12" }
 }

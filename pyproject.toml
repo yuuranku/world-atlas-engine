@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "world-atlas-engine"
-version = "1.3.0"
+version = "1.4.0.dev3"
 description = "Deterministic tectonic terrain and human-world atlas generation"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
@@ -17,4 +17,4 @@ world-atlas = "world_atlas.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-world_atlas = ["data/*.json"]
+world_atlas = ["data/*.json", "core/web/*.js", "core/web/*.css", "core/web/*.html", "core/web/*.txt"]

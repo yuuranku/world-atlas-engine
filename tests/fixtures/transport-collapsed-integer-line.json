@@ -1,0 +1,12 @@
+{
+  "source": "fictional-world-v97-rebuilt accepted transport display",
+  "failedLevel": "regional",
+  "failedFeatureIndex": 42508,
+  "layer": "transport-network",
+  "mode": "road",
+  "importance": "local",
+  "points": [
+    [105.99639198389184, 425.9963919838926],
+    [105.99639198389185, 425.9963919838926]
+  ]
+}

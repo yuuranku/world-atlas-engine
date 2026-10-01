@@ -3,6 +3,40 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy import ndimage
+
+
+def coastal_scarp_transport(height_m, latitude_degrees):
+    """Conservative nearshore transport, only above a resolved relief threshold.
+
+    Allows material to cross sea level; does not impose a coastal elevation cap.
+    This is a grid-scale approximation, not a calibrated erosion simulation.
+    """
+    original = np.asarray(height_m, dtype=np.float64)
+    land = original > 0
+    padded = np.concatenate((land[:, -1:], land, land[:, :1]), axis=1)
+    distance = np.maximum(ndimage.distance_transform_edt(padded),
+                          ndimage.distance_transform_edt(~padded))[:, 1:-1]
+    cell_km = np.pi * 6371 / land.shape[0]
+    band = distance * cell_km <= 120
+    area = np.maximum(np.cos(np.radians(latitude_degrees)), 0.025)[:, None]
+    z = original.copy()
+    # Retain moderate cliffs/slopes; relax only large unresolved jumps.
+    threshold = 30 * cell_km
+    for _ in range(24):
+        d = z - np.roll(z, -1, axis=1)
+        flux = 0.12 * np.sign(d) * np.maximum(np.abs(d)-threshold, 0)
+        flux *= band & np.roll(band, -1, axis=1)
+        flux *= area
+        change = np.roll(flux, 1, axis=1) - flux
+        d = z[:-1] - z[1:]
+        shared_area = np.minimum(area[:-1], area[1:])
+        flux = 0.12 * np.sign(d) * np.maximum(np.abs(d)-threshold, 0)
+        flux *= (band[:-1] & band[1:]) * shared_area
+        change[:-1] -= flux
+        change[1:] += flux
+        z += change / area
+    return z.astype(np.float32)
 
 
 def relax_hillslopes(

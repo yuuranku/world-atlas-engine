@@ -17,7 +17,7 @@ from .polar import apply_polar_sea_ice
 from .procedural_planet import load_surface_bundle
 
 
-BASELINE_IMPORTER_VERSION = "worldgen-baseline-importer-v6"
+BASELINE_IMPORTER_VERSION = "worldgen-baseline-importer-v7"
 _SEASON_IDS = ("vernal", "june", "autumnal", "december")
 _SEASON_SOLAR_LONGITUDES = (0.0, 90.0, 180.0, 270.0)
 _RELATIVE_PRECIPITATION_MAXIMUM = 1.35
@@ -83,7 +83,6 @@ def _seasonal_river_strength(
     mean_discharge = np.mean(accumulated, axis=0)
     reference = max(float(np.quantile(mean_discharge[stream], 0.98)), 1.0e-9)
     log_reference = max(float(np.log1p(reference)), 1.0e-9)
-    width = shape[1]
     for season_index in range(4):
         discharge = accumulated[season_index]
         absolute = np.clip(np.log1p(discharge) / log_reference, 0.0, 1.0)
@@ -93,10 +92,13 @@ def _seasonal_river_strength(
             out=np.zeros_like(discharge),
             where=mean_discharge > 1.0e-12,
         )
-        visible = stream & (
-            (order >= 3)
-            | ((relative >= 0.42) & (absolute >= 0.025))
-        )
+        # ``river_order`` is the static, evidence-gated drainage topology.
+        # Do not hide low-order canonical tributaries behind a second relative
+        # display threshold here: the physical map can draw the complete
+        # network (for example as a thin/dashed reach), while this seasonal
+        # field answers the separate question of whether water is flowing in
+        # the sampled season.  A genuinely dry seasonal source remains zero.
+        flowing = stream & (discharge > 1.0e-12)
         strength = np.rint(
             255.0
             * np.clip(
@@ -105,12 +107,18 @@ def _seasonal_river_strength(
                 1.0,
             )
         ).astype(np.uint8)
-        strength[~visible] = 0
-        strength[(order >= 3) & stream] = np.maximum(
-            strength[(order >= 3) & stream], 48
+        strength[~flowing] = 0
+        # Quantization must not turn a non-zero seasonal tributary into a
+        # false absence. Larger Strahler orders retain a modest visual floor,
+        # but only while this season actually carries accumulated runoff.
+        order_floor = np.clip(
+            8 + 8 * np.maximum(order.astype(np.int16) - 1, 0),
+            8,
+            48,
         )
+        strength[flowing] = np.maximum(strength[flowing], order_floor[flowing])
 
-        # Any visible reach keeps every canonical downstream reach visible.
+        # Any flowing reach keeps every canonical downstream reach visible.
         active = strength > 0
         for start in np.flatnonzero(active.ravel()):
             current = int(start)

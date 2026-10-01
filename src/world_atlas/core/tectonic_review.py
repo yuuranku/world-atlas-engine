@@ -26,7 +26,7 @@ from PIL import Image
 from world_atlas.tectonic_foundation import derive_tectonic_foundation, foundation_from_causal_fields
 
 from .model import WorldGrid
-from .procedural_planet import load_surface_bundle
+from .procedural_planet import ProceduralSurface, load_surface_bundle
 from .society.world_identity import NameRegistry
 
 
@@ -104,7 +104,7 @@ def _pair_normal(
     return delta_x / length, delta_y / length
 
 
-def derive_tectonic_review(grid: WorldGrid) -> TectonicReview:
+def derive_tectonic_review(grid: WorldGrid, *, physical_source: ProceduralSurface | None = None) -> TectonicReview:
     """Render the same geography-first tectonic model used by island generation."""
 
     if not isinstance(grid, WorldGrid):
@@ -116,11 +116,17 @@ def derive_tectonic_review(grid: WorldGrid) -> TectonicReview:
         else None
     )
     bundle = source_metadata.get("fieldBundle") if isinstance(source_metadata, Mapping) else None
-    if bundle is not None:
+    surface = physical_source
+    if surface is not None and not isinstance(surface, ProceduralSurface):
+        raise TypeError("tectonic physical_source must be a ProceduralSurface")
+    if surface is None and bundle is not None:
+        if bundle["schema"] != "procedural-surface-bundle-v3":
+            raise ValueError("tectonic source requires the current raw-ground bundle schema")
         source = Path(bundle["path"])
         if hashlib.sha256(source.read_bytes()).hexdigest().upper() != bundle["sha256"].upper():
             raise ValueError("tectonic source bundle hash mismatch")
         surface = load_surface_bundle(source)
+    if surface is not None:
         if surface.land_mask.shape != grid.shape or not np.array_equal(surface.land_mask, grid.water == 0):
             raise ValueError("tectonic source does not match the accepted land mask")
         foundation = foundation_from_causal_fields(
@@ -166,7 +172,7 @@ def derive_tectonic_review(grid: WorldGrid) -> TectonicReview:
     diagnostics["boundaryPairCount"] = len(
         {boundary.plate_ids for boundary in foundation.boundaries}
     )
-    if bundle is None and foundation.plate_id.size >= 10_000:
+    if surface is None and foundation.plate_id.size >= 10_000:
         if float(diagnostics["coastBoundaryFraction"]) > 0.60:
             raise ValueError("tectonic QA failed: plate boundaries track coastlines too closely")
         if float(diagnostics["convergentEvidenceFraction"]) < 0.90:

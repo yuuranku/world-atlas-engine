@@ -10,29 +10,19 @@ from __future__ import annotations
 
 import hashlib
 import re
+from functools import lru_cache
+
+from .naming_profiles import naming_profile
 
 
-_STYLE_SYLLABLES: tuple[tuple[str, ...], ...] = (
-    ("洛", "衡", "宁", "安", "嘉", "宜", "临", "望", "清", "定", "崇", "绍"),
-    ("阿", "维", "诺", "格", "哈", "斯", "伦", "德", "贝", "克", "霍", "兰"),
-    ("罗", "塞", "蒙", "贝", "利", "亚", "托", "纳", "维", "奥", "雅", "卡"),
-    ("诺", "维", "拉", "罗", "米", "格", "德", "涅", "斯", "科", "普", "奥"),
-    ("阿", "尔", "卡", "乌", "苏", "巴", "特", "兰", "兹", "库", "蒂", "鲁"),
-    ("阿", "达", "沙", "赫", "拉", "伊", "斯", "坎", "德", "巴", "法", "米"),
-    ("阿", "麦", "萨", "法", "拉", "哈", "巴", "德", "尔", "纳", "卡", "里"),
-    ("阿", "拉", "迪", "纳", "迦", "塔", "巴", "罗", "萨", "米", "普", "达"),
-    ("拉", "玛", "纳", "巴", "鲁", "萨", "里", "达", "嘉", "卡", "蒂", "维"),
-    ("凯", "安", "布", "兰", "格", "伊", "罗", "莫", "特", "里", "温", "达"),
-    ("卡", "里", "维", "塔", "涅", "米", "萨", "尔", "瓦", "诺", "迪", "亚"),
-    ("穆", "巴", "恩", "卡", "鲁", "萨", "达", "里", "维", "纳", "基", "莫"),
-)
+_STYLE_COUNT = 12
 
 _FORMANTS: tuple[dict[str, tuple[str, ...]], ...] = (
     {
         "river": ("津", "济", "浦", "浔"), "coast": ("海", "浦", "潮", "汀"),
-        "lake": ("泽", "泞", "湄"), "mountain": ("岳", "岭", "岘"), "plain": ("原", "昌", "平"),
-        "wetland": ("泽", "汀", "洲"), "spring": ("泉", "井"), "pass": ("关", "险"),
-        "fortress": ("寨", "戍", "台"), "region": ("宁", "安", "嘉"),
+        "lake": ("泽", "湄", "湖"), "mountain": ("陵", "岑", "岘"), "plain": ("原", "安", "平", "陵", "城"),
+        "wetland": ("泽", "汀", "洲"), "spring": ("泉", "井"), "pass": ("关", "隘"),
+        "fortress": ("寨", "堡", "台"), "region": ("宁", "陵", "原", "城"),
     },
     {
         "river": ("福德", "布鲁克", "阿姆"), "coast": ("维克", "哈芬", "松德", "霍尔姆"),
@@ -92,15 +82,29 @@ _FORMANTS: tuple[dict[str, tuple[str, ...]], ...] = (
     },
 )
 
-_TRANSPARENT_TERMS = {
-    "river": ("河东", "河西", "江阴", "江阳", "临河", "济水"),
-    "coast": ("临海", "潮阳", "海宁", "望海"),
-    "lake": ("湖东", "湖西", "湖阴", "湖阳"),
-    "mountain": ("山南", "山北", "岭东", "岭西"),
-    "plain": ("广平", "安原", "宜丰", "昌平"),
-    "wetland": ("临泽", "江洲", "清浦"),
-    "spring": ("甘泉", "灵井"), "pass": ("山关", "石门"),
-    "fortress": ("定边", "安戍"), "region": ("宜宁", "嘉定", "安昌"),
+# A physical feature keeps both its cartographic classifier (added by the
+# caller) and a local formative.  This avoids turning every mountain, marsh,
+# or river into an opaque random root once the canonical identity pass runs.
+_FEATURE_ENVIRONMENT = {
+    "river": "river",
+    "mountain": "mountain",
+    "peak": "mountain",
+    "lake": "lake",
+    "sea": "coast",
+    "inland-sea": "coast",
+    "bay": "coast",
+    "strait": "coast",
+    "island": "coast",
+    "island-group": "coast",
+    "plain": "plain",
+    "plateau": "plain",
+    "basin": "plain",
+    "desert": "region",
+    "wetland": "wetland",
+    "ridge": "mountain", "hills": "mountain", "valley": "river", "gorge": "river",
+    "foothills": "mountain", "steep-slope": "mountain", "lowland-valley": "river",
+    "snow-mountain": "mountain", "cape": "coast", "peninsula": "coast",
+    "isthmus": "coast", "arid-upland": "region",
 }
 
 
@@ -110,10 +114,27 @@ def lineage_key(identifier: int, *, style_index: int | None = None) -> str:
     if identifier < 1:
         raise ValueError("lineage identifier must be positive")
     if style_index is not None:
-        if style_index < 0 or style_index >= len(_STYLE_SYLLABLES):
+        if style_index < 0 or style_index >= _STYLE_COUNT:
             raise ValueError("lineage style index is out of range")
         return f"lineage-s{style_index:02d}-{identifier:02d}"
     return f"lineage-{identifier:02d}"
+
+
+def lineage_branch(lineage: str, branch: str | int) -> str:
+    """Return a deterministic local branch without changing its sound family.
+
+    A civilization, its daughter languages, its states, and its settlements
+    should share a phonological inventory without repeatedly reusing one city
+    as every other proper name.  The branch remains an input to the root
+    derivation, while :func:`lineage_style_index` still reads the original
+    explicit style marker at the front of the lineage.
+    """
+
+    base = str(lineage).strip()
+    label = str(branch).strip()
+    if not base or not label:
+        raise ValueError("lineage branches require non-empty lineage and branch")
+    return f"{base}:branch-{label}"
 
 
 def _lineage_number(lineage: str) -> int:
@@ -126,40 +147,109 @@ def _lineage_number(lineage: str) -> int:
 def lineage_style_index(lineage: str) -> int:
     explicit = re.search(r"lineage-s(\d+)-", lineage)
     if explicit is not None:
-        return int(explicit.group(1)) % len(_STYLE_SYLLABLES)
+        return int(explicit.group(1)) % _STYLE_COUNT
     number = _lineage_number(lineage)
-    return (number * 7 + number // 3 + 1) % len(_STYLE_SYLLABLES)
+    return (number * 7 + number // 3 + 1) % _STYLE_COUNT
 
 
+@lru_cache(maxsize=2048)
 def lineage_roots(lineage: str, *, count: int = 128) -> tuple[str, ...]:
-    """Build an opaque local lexicon from one lineage's sound inventory."""
+    """Build roots from complete morphemes within one selected tradition."""
 
     style = lineage_style_index(lineage)
-    syllables = _STYLE_SYLLABLES[style]
-    digest = hashlib.sha256(lineage.encode("utf-8")).digest()
-    start = int.from_bytes(digest[:2], "big") % len(syllables)
-    roots: list[str] = []
-    seen: set[str] = set()
-    for ordinal in range(count * 4):
-        first_index = ordinal % len(syllables)
-        second_index = (ordinal // len(syllables)) % len(syllables)
-        first = syllables[(start + first_index * 5) % len(syllables)]
-        second = syllables[(start + second_index * 7 + 3) % len(syllables)]
-        third = syllables[(start + first_index * 7 + second_index * 5 + 1) % len(syllables)]
-        if second == first:
-            second = syllables[(start + second_index * 7 + 4) % len(syllables)]
-        if third in {first, second}:
-            third = syllables[(start + first_index * 7 + second_index * 5 + 2) % len(syllables)]
-        candidate = first + second + (third if (ordinal + digest[3]) % 5 == 0 else "")
-        if candidate in seen or len(set(candidate)) == 1:
-            continue
-        seen.add(candidate)
-        roots.append(candidate)
-        if len(roots) >= count:
-            break
+    profile = naming_profile(lineage, style=style)
+    # The inherited compound layer joins intact local morphemes, allowing a
+    # large civilization hundreds of distinct names without serial numbers or
+    # borrowing another culture's inventory.
+    inherited = (first + second for first in profile.stems for second in profile.stems
+                 if first != second and not second.startswith(first) and not first.endswith(second))
+    formed = (stem + ending for stem in profile.stems for ending in profile.endings
+              if not ending.startswith(stem) and not stem.endswith(ending))
+    inventory = tuple(dict.fromkeys(
+        root for root in (*formed, *inherited)
+        if not any(a == b for a, b in zip(root, root[1:]))
+    ))
+    roots = sorted(inventory, key=lambda root: hashlib.sha256(f"{lineage}:{root}".encode("utf-8")).digest())
     if len(roots) < count:
         raise ValueError(f"cannot build enough roots for {lineage}")
-    return tuple(roots)
+    return tuple(roots[:count])
+
+
+def _ordered_roots(lineage: str, *, seed: int) -> tuple[str, ...]:
+    roots = lineage_roots(lineage, count=384)
+    start = int(seed) % len(roots)
+    return roots[start:] + roots[:start]
+
+
+def lineage_entity_candidates(
+    lineage: str,
+    category: str,
+    *,
+    seed: int,
+) -> tuple[str, ...]:
+    """Return short, related stems for non-settlement proper names.
+
+    ``category`` deliberately changes the ordering rather than inventing a
+    second unrelated character pool.  Callers use a distinct
+    :func:`lineage_branch` for languages, civilizations, institutions, and
+    states; this yields recognisable family resemblance without reducing those
+    names to a city name plus a bureaucratic suffix.
+    """
+
+    category_digest = hashlib.sha256(category.encode("utf-8")).digest()
+    ordered = _ordered_roots(
+        lineage,
+        seed=int(seed) + int.from_bytes(category_digest[:4], "big"),
+    )
+    profile = naming_profile(lineage, style=lineage_style_index(lineage))
+    if category == "state" and profile.polities:
+        offset = int(seed) % len(profile.polities)
+        inherited = profile.polities[offset:] + profile.polities[:offset]
+        qualified = tuple(direction + root for direction in ("东", "西", "南", "北") for root in inherited)
+        return tuple(dict.fromkeys((*inherited, *qualified, *ordered)))
+    if category in {"state", "culture", "language", "faith"}:
+        endings = profile.endings
+        if profile.style == 0 and category == "state":
+            endings = tuple(ending for ending in endings if ending not in {"城", "津", "溪", "庭", "垣"})
+        formed = tuple(stem + ending for stem in profile.stems for ending in endings
+                       if not ending.startswith(stem) and not stem.endswith(ending)
+                       and not any(a == b for a, b in zip(stem + ending, (stem + ending)[1:])))
+        formed = tuple(sorted(formed, key=lambda root: hashlib.sha256(f"{seed}:{root}".encode("utf-8")).digest()))
+        return tuple(dict.fromkeys((*formed, *ordered)))
+    return tuple(sorted(ordered, key=len)) if profile.style == 0 else ordered
+
+
+def geographic_name_candidates(
+    lineage: str,
+    feature_type: str,
+    *,
+    seed: int,
+) -> tuple[str, ...]:
+    """Return feature-name stems with a visible local environmental formative."""
+
+    environment = _FEATURE_ENVIRONMENT.get(feature_type)
+    if environment is None:
+        raise ValueError(f"unsupported geographic feature type: {feature_type}")
+    style = lineage_style_index(lineage)
+    profile = naming_profile(lineage, style=style)
+    ordered_roots = _ordered_roots(lineage, seed=seed)
+    if style == 0:
+        offset = int(seed) % len(profile.landmarks)
+        landmarks = profile.landmarks[offset:] + profile.landmarks[:offset]
+        return tuple(dict.fromkeys((*landmarks, *ordered_roots)))
+    formants = _FORMANTS[style][environment]
+    formant_start = (int(seed) // 11) % len(formants)
+    ordered_formants = formants[formant_start:] + formants[:formant_start]
+    result: list[str] = []
+    stems = profile.stems[int(seed) % len(profile.stems):] + profile.stems[:int(seed) % len(profile.stems)]
+    for root in stems:
+        for formant in ordered_formants:
+            if root[-1:] != formant[:1] and not formant.startswith(root) and not root.endswith(formant):
+                result.append(root + formant)
+    # Keep a deeper reserve in the same local lexicon; the normal path always
+    # uses the formative above, so geography remains visibly site-grounded.
+    result.extend(ordered_roots)
+    return tuple(dict.fromkeys(result))
 
 
 def settlement_name_candidates(
@@ -171,48 +261,28 @@ def settlement_name_candidates(
 ) -> tuple[str, ...]:
     """Return proper-name candidates whose etymology follows the local site.
 
-    Most surface forms are deliberately opaque, as real names become worn and
-    conventional.  A minority preserves a recognizable geographic element.
+    Inherited roots mix with readable site formants. Transliterated traditions
+    retain more of their local river, harbour and settlement morphology.
     """
 
     style = lineage_style_index(lineage)
-    roots = lineage_roots(lineage)
-    root_start = seed % len(roots)
-    ordered_roots = roots[root_start:] + roots[:root_start]
+    profile = naming_profile(lineage, style=style)
+    ordered_roots = _ordered_roots(lineage, seed=seed)
     formants = _FORMANTS[style][environment]
     formant_start = (seed // 7) % len(formants)
     ordered_formants = formants[formant_start:] + formants[:formant_start]
-    # Most real settlement names preserve their geographic origin only after
-    # phonetic wear or semantic drift.  Keep transparent "river/coast/plain"
-    # compounds exceptional so the atlas does not read like a feature legend.
-    use_visible_etymology = seed % 100 < (14 if style == 0 else 9)
+    use_visible_etymology = environment in {"pass", "fortress"} or seed % 100 < 72
     result: list[str] = []
-    if style == 0 and use_visible_etymology:
-        transparent = list(_TRANSPARENT_TERMS[environment])
-        if relation is not None and environment in {"river", "lake", "mountain"}:
-            stem = {"river": "河", "lake": "湖", "mountain": "山"}[environment]
-            transparent.insert(0, f"{stem}{relation}")
-            transparent.insert(1, f"{ordered_roots[0][:1]}{'\u9633' if relation in {'\u5317', '\u4e1c'} else '\u9634'}")
-        shift = (seed // 13) % len(transparent)
-        result.extend(transparent[shift:] + transparent[:shift])
-    if use_visible_etymology:
-        for root in ordered_roots[:24]:
-            for formant in ordered_formants:
-                if root[-1:] == formant[:1]:
-                    continue
-                result.append(root + formant)
-    result.extend(ordered_roots)
-    if not use_visible_etymology:
-        for root in ordered_roots[:24]:
-            for formant in ordered_formants:
-                if root[-1:] == formant[:1]:
-                    continue
-                result.append(root + formant)
-    # Rare historical layers: a transferred clan/personal root plus the local
-    # element.  This gives the same lineage more depth without borrowing from
-    # a global catch-all list.
-    for first, second in zip(ordered_roots[:20], ordered_roots[17:37], strict=True):
-        result.append(first[:2] + second[-1:])
+    shift = int(seed) % len(profile.stems)
+    stems = profile.stems[shift:] + profile.stems[:shift]
+    visible = tuple(root + formant for root in stems for formant in ordered_formants
+                    if root[-1:] != formant[:1] and not formant.startswith(root)
+                    and not root.endswith(formant))
+    if style == 0 and relation is not None and environment in {"river", "lake", "mountain"}:
+        # Cardinal modifiers are used only when the caller measured a site's
+        # position relative to that physical feature.
+        result.extend(relation + root + ordered_formants[0] for root in stems[:8])
+    result.extend((*visible, *ordered_roots) if use_visible_etymology else (*ordered_roots, *visible))
     return tuple(dict.fromkeys(result))
 
 

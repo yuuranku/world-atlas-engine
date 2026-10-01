@@ -18,8 +18,18 @@ from typing import Mapping, Sequence
 
 import numpy as np
 from PIL import Image
-from world_atlas.core.geomorphology import relax_hillslopes
+from scipy import ndimage
+from world_atlas.core.geomorphology import relax_hillslopes, coastal_scarp_transport
+from world_atlas.core.spherical_distance import distance_from_sources
+from world_atlas.core.raster_topology import periodic_component_labels
+from scipy.spatial import cKDTree
 from world_atlas.core.coastal_margins import margin_motion
+from world_atlas.core.coastal_drainage import shoreline_distance
+from world_atlas.core.basin_reconstruction import reconstruct_basin
+from world_atlas.core.tectonic_coasts import (
+    selective_tectonic_transgression,
+    validate_coastal_surface,
+)
 
 from world_atlas.core.planet_morphology import (
     WorldMorphology,
@@ -123,7 +133,7 @@ class ProceduralSurface:
     land_mask: np.ndarray
     elevation: np.ndarray
     bathymetry: np.ndarray
-    signed_height: np.ndarray
+    relative_elevation_m: np.ndarray
     diagnostics: Mapping[str, object]
 
     def __post_init__(self) -> None:
@@ -145,10 +155,19 @@ class ProceduralSurface:
             "land_mask": np.asarray(self.land_mask, dtype=bool),
             "elevation": np.asarray(self.elevation, dtype=np.float32),
             "bathymetry": np.asarray(self.bathymetry, dtype=np.float32),
-            "signed_height": np.asarray(self.signed_height, dtype=np.float32),
+            "relative_elevation_m": np.asarray(self.relative_elevation_m, dtype=np.float32),
         }
         if any(array.shape != shape for array in arrays.values()):
             raise ValueError("procedural surface arrays must share one shape")
+        if not np.all(np.isfinite(arrays["relative_elevation_m"])):
+            raise ValueError("physical ground must contain finite model-metre samples")
+        if not np.array_equal(arrays["relative_elevation_m"] > 0, arrays["land_mask"]):
+            raise ValueError("physical ground sign must match native land ownership")
+        datum = float(self.diagnostics["seaLevelMeters"])
+        scale = float(self.diagnostics["elevationScaleMeters"])
+        exponent = float(self.diagnostics["elevationExponent"])
+        if not math.isfinite(datum) or not math.isfinite(scale) or scale <= 0 or not math.isfinite(exponent) or exponent <= 0:
+            raise ValueError("physical ground requires a finite datum and positive elevation mapping")
         for name, array in arrays.items():
             immutable = np.array(array, copy=True)
             immutable.setflags(write=False)
@@ -181,7 +200,12 @@ def _polar_crust_bias(field: np.ndarray, latitude: np.ndarray, recipe: PlanetRec
     existing tectonic field; it does not stamp a post-render ice continent.
     """
     latitude = np.asarray(latitude).reshape(-1, 1)
-    transition = np.clip((np.abs(latitude) - 58.0) / 26.0, 0.0, 1.0)
+    # High latitudes outside an explicitly requested polar continent remain
+    # ordinary tectonic terrain.  Starting the bias at 58 degrees flattened
+    # sub-polar coasts long before either pole was reached.  Confine the cap
+    # decision to the final polar band instead, leaving 60--70 degree land
+    # free to retain its own plate-derived relief.
+    transition = np.clip((np.abs(latitude) - 68.0) / 20.0, 0.0, 1.0)
     weight = transition * transition * (3.0 - 2.0 * transition)
     positive = np.where(latitude >= 0, recipe.north_polar_continent, recipe.south_polar_continent)
     span = float(np.ptp(field)) + 1.0
@@ -660,18 +684,21 @@ def _evolve_coastal_margins(relative_m, low_relief_support, boundary_class,
     scores = rng.random(len(rows))*np.sqrt(np.cos(lat))
     counts = {kind:0 for kind in ('rift','active','passive','transform','sedimentary')}
     slips = []
-    for ordinal in range(480):
+    # Every coast, including enclosed lakes and quiet passive margins, must
+    # receive the same structural treatment. Limiting this to a handful of
+    # active shore sectors left smooth threshold arcs beside broken shores.
+    for ordinal in range(560):
         if not available.any():
             break
         selected = int(np.argmax(np.where(available,scores,-1)))
         row,col = int(rows[selected]),int(cols[selected])
-        available &= (vectors @ vectors[selected]) < np.cos(350/_PLANET_RADIUS_KM)
+        available &= (vectors @ vectors[selected]) < np.cos(220/_PLANET_RADIUS_KM)
         quiet = float(low_relief_support[row,col])
-        if quiet > .62 and not (convergent[row,col] or divergent[row,col] or transform[row,col]):
-            counts['sedimentary'] += 1
-            continue
-        family = ('rift' if divergent[row,col] else 'active' if convergent[row,col]
-                  else 'transform' if transform[row,col] else 'passive')
+        family = (
+            'rift' if divergent[row,col] else 'active' if convergent[row,col]
+            else 'transform' if transform[row,col] else
+            'sedimentary' if quiet > .62 else 'passive'
+        )
         cos_lat = max(float(np.cos(lat[selected])),.15)
         col_km = 2*np.pi*_PLANET_RADIUS_KM/width*cos_lat
         north = -float(gradient_row[row,col])/row_km
@@ -682,18 +709,27 @@ def _evolve_coastal_margins(relative_m, low_relief_support, boundary_class,
         north,east = north/norm,east/norm
         speed = np.hypot(float(velocity_east[row,col]),float(velocity_north[row,col]))
         # cm/yr * Myr = 10 km; bounded because this is margin-scale reactivation.
-        slip = .40*float(motion_budget_km(speed,rng.uniform(1.5,4.5)))
-        length = float(rng.uniform(250,750))
-        influence = max(360.,slip*4.)
-        radius = max(length,influence)*1.5
+        reactivation = 0.56 if family == 'sedimentary' else 0.70
+        slip = reactivation * float(motion_budget_km(speed,rng.uniform(1.2,5.2)))
+        if family == 'sedimentary':
+            length = float(rng.uniform(110,320))
+        elif family in ('rift','transform'):
+            length = float(rng.uniform(150,440))
+        else:
+            length = float(rng.uniform(180,520))
+        influence = max(210.,slip*2.8)
+        radius = max(length,influence)*1.32
         rr = np.arange(max(0,row-int(radius/row_km)-2),min(height,row+int(radius/row_km)+3))
         cc = np.arange(col-int(radius/col_km)-2,col+int(radius/col_km)+3) % width
         east_km = ((cc[None,:]-col+width/2)%width-width/2)*col_km
         north_km = (row-rr[:,None])*row_km
         inward = north_km*north+east_km*east
         along = north_km*east-east_km*north
-        normal,tangent,support = margin_motion(along,inward,length,influence,slip,
-                                              seed=int(rng.integers(0,2**63)),family=family)
+        motion_family = 'passive' if family == 'sedimentary' else family
+        normal,tangent,support = margin_motion(
+            along,inward,length,influence,slip,
+            seed=int(rng.integers(0,2**63)),family=motion_family,
+        )
         patch_index = np.ix_(rr,cc)
         # Average overlapping motions; never accumulate them into a folded map.
         row_offsets[patch_index] += (normal*north+tangent*east)/row_km
@@ -704,11 +740,22 @@ def _evolve_coastal_margins(relative_m, low_relief_support, boundary_class,
     denominator = np.maximum(weights,1.)
     row_offsets /= denominator
     col_offsets /= denominator
+    # Overlapping individually valid motions can still fold the sampling map.
+    # A displacement Jacobian norm below one keeps I + grad(u) nonsingular.
+    dr_row, dr_col = np.gradient(row_offsets)
+    dc_row, dc_col = np.gradient(col_offsets)
+    strain = np.sqrt(dr_row**2 + dr_col**2 + dc_row**2 + dc_col**2)
+    maximum_strain = float(np.max(strain))
+    strain_scale = min(1.0, 0.65 / max(maximum_strain, 1.0e-12))
+    row_offsets *= strain_scale
+    col_offsets *= strain_scale
     evolved = _warp_periodic_field(relative,row_offsets,col_offsets)
     return evolved-relative, {
         'model':'full-resolution-finite-structural-margin-displacement',
+        'maximumDisplacementGradient':maximum_strain * strain_scale,
+        'strainScale':strain_scale,
         'modifiedShoreSegments':len(slips),'families':counts,
-        'lengthBandsKm':{'coastalSectorHalfLength':[250,750]},
+        'lengthBandsKm':{'coastalSectorHalfLength':[110,520]},
         'slipRangeKm':[min(slips,default=0),max(slips,default=0)],
         'grid':{'height':height,'width':width},
         'maximumCoordinateDisplacementCells':float(np.max(np.hypot(row_offsets,col_offsets))),
@@ -811,7 +858,13 @@ def _fluvial_dissection(
     incision = np.minimum(requested_incision, 0.46 * available_relief)
     dissected = relative.copy()
     dissected[land] -= incision[land].astype(np.float32)
+    from world_atlas.core.coastal_drainage import drown_coastal_valleys
+    dissected, drowned_metrics = drown_coastal_valleys(
+        dissected, accumulation, quiet_surface,
+        math.pi * _PLANET_RADIUS_KM / relative.shape[0],
+    )
     return dissected, {
+        "coastalTransgression": drowned_metrics,
         "model": "full-resolution-priority-flood-d8-mfd",
         "drainageReachCount": len(hydrology.network),
         "streamCellCount": int(np.count_nonzero(hydrology.stream_mask)),
@@ -1018,6 +1071,7 @@ def _select_crust_roots(
     count: int,
     morphology: WorldMorphology,
     seed: int,
+    land_fraction: float,
 ) -> tuple[int, ...]:
     vectors = np.asarray(grid.unit_vectors, dtype=np.float64).reshape((-1, 3))
     latitudes = np.abs(np.asarray(grid.latitude_degrees, dtype=np.float64).reshape(-1)) / 90.0
@@ -1053,7 +1107,11 @@ def _select_crust_roots(
         cluster_angle = np.arccos(np.clip(vectors[candidates] @ cluster, -1.0, 1.0))
         cluster_radius = math.radians(28.0 + 72.0 * (1.0 - morphology.continental_aggregation))
         clustered = np.exp(-0.5 * np.square(cluster_angle / max(cluster_radius, 1.0e-6)))
-        exclusion = math.radians(22.0 + 10.0 * (1.0 - morphology.continental_aggregation))
+        # Roots represent separate requested landmasses. Their minimum spacing
+        # must scale with the area they are about to accrete; a fixed 22-degree
+        # exclusion put three continent-sized nuclei inside one another.
+        equivalent_radius = math.acos(1.0 - 2.0 * land_fraction / count)
+        exclusion = 1.65 * equivalent_radius
         score = density * ((1.0 - morphology.continental_aggregation) + 3.0 * morphology.continental_aggregation * clustered)
         score *= np.clip((nearest_angle - exclusion) / math.radians(12.0), 0.0, 1.0)
         selected.append(int(rng.choice(candidates, p=score / np.sum(score))))
@@ -1104,6 +1162,27 @@ def _grow_continental_crust(
     ).reshape(-1)
     plate_flat = np.asarray(plate_grid).reshape(-1)
     boundary_flat = np.asarray(boundary_class, dtype=np.int8).reshape(-1)
+    divergent_mask = np.asarray(boundary_class) == BOUNDARY_DIVERGENT
+    convergent_mask = np.asarray(boundary_class) == BOUNDARY_CONVERGENT
+    if np.any(divergent_mask):
+        divergent_distance_km = _distance_from_sources(divergent_mask, grid)
+    else:
+        divergent_distance_km = np.full(grid.shape, 1.0e6, dtype=np.float64)
+    if np.any(convergent_mask):
+        convergent_distance_km = _distance_from_sources(convergent_mask, grid)
+    else:
+        convergent_distance_km = np.full(grid.shape, 1.0e6, dtype=np.float64)
+    # The growth front should feel a broad tectonic neighbourhood, not only
+    # the one-cell boundary label.  Rift corridors repel accreted continental
+    # crust and convergent margins attract it into elongated shelves and
+    # foreland blocks.  These are distance-field costs, so the result remains
+    # continuous and seed-replayable instead of becoming a post-cut mask.
+    divergent_influence = np.exp(
+        -0.5 * np.square(divergent_distance_km / 430.0)
+    ).reshape(-1)
+    convergent_influence = np.exp(
+        -0.5 * np.square(convergent_distance_km / 360.0)
+    ).reshape(-1)
     latitude_weight = np.cos(np.radians(grid.latitude_degrees[:, 0]))
     cell_weight = np.repeat(latitude_weight, width)
     absolute_latitude = np.abs(np.asarray(grid.latitude_degrees).reshape(-1)) / 90.0
@@ -1112,9 +1191,38 @@ def _grow_continental_crust(
 
     quota_weights = rng.lognormal(mean=0.0, sigma=0.42, size=len(root_cells))
     quota_weights /= float(np.sum(quota_weights))
+    minimum_share = min(0.07, 0.75 / len(root_cells))
+    excess = np.maximum(quota_weights - minimum_share, 0.0)
+    quota_weights = minimum_share + (1.0 - minimum_share * len(root_cells)) * excess / excess.sum()
     quotas = target_area * quota_weights
     owner_area = np.zeros(len(root_cells), dtype=np.float64)
     owner = np.full(cell_count, -1, dtype=np.int16)
+    # Oceanic crust survives between distinct accretion fronts. Width varies
+    # with inherited fabric and spreading influence instead of adding a
+    # uniform channel to the finished land mask.
+    reserved = np.full(cell_count, -1, dtype=np.int16)
+    separation_km = (
+        420.0 + 240.0 * divergent_influence
+        + 120.0 * np.clip(texture, -1.0, 1.0)
+    )
+    row_step = math.pi * _PLANET_RADIUS_KM / height
+    longitude_steps = math.tau * _PLANET_RADIUS_KM / width * latitude_weight
+
+    def reserve(cell: int, owner_index: int) -> None:
+        row, column = divmod(cell, width)
+        radius = max(float(separation_km[cell]), 1.6 * row_step)
+        row_radius = int(math.ceil(radius / row_step))
+        for target_row in range(max(0, row-row_radius), min(height, row+row_radius+1)):
+            dx = math.sqrt(max(radius * radius - ((target_row-row)*row_step)**2, 0.0))
+            column_radius = min(width//2, int(dx / max(float(longitude_steps[target_row]), row_step * 0.035)))
+            columns = (np.arange(column-column_radius, column+column_radius+1) % width)
+            neighbours = target_row * width + columns
+            previous = reserved[neighbours]
+            available = previous == -1
+            conflict = (previous >= 0) & (previous != owner_index)
+            reserved[neighbours[available]] = owner_index
+            reserved[neighbours[conflict]] = -2
+
     costs = np.full((len(root_cells), cell_count), np.inf, dtype=np.float32)
     frontiers: list[list[tuple[float, int]]] = [[] for _ in root_cells]
     preferred_angles = rng.uniform(-math.pi, math.pi, size=len(root_cells))
@@ -1124,17 +1232,10 @@ def _grow_continental_crust(
         if owner[root] >= 0:
             continue
         owner[root] = owner_index
+        reserve(root, owner_index)
         costs[owner_index, root] = 0.0
         owner_area[owner_index] += cell_weight[root]
         heapq.heappush(frontiers[owner_index], (0.0, root))
-
-    row_step = math.pi * _PLANET_RADIUS_KM / height
-    longitude_steps = (
-        math.tau
-        * _PLANET_RADIUS_KM
-        / width
-        * np.cos(np.radians(grid.latitude_degrees[:, 0]))
-    )
 
     def expand(owner_index: int, cell: int, current_cost: float) -> None:
         row, column = divmod(cell, width)
@@ -1153,7 +1254,7 @@ def _grow_continental_crust(
                 continue
             next_column = (column + delta_column) % width
             neighbour = next_row * width + next_column
-            if owner[neighbour] >= 0:
+            if owner[neighbour] >= 0 or reserved[neighbour] not in (-1, owner_index):
                 continue
             physical_x = delta_column * float(longitude_steps[row])
             physical_y = -delta_row * row_step
@@ -1175,6 +1276,12 @@ def _grow_continental_crust(
                 cell_cost += 0.28
             elif boundary_value == BOUNDARY_CONVERGENT:
                 cell_cost -= 0.12 * morphology.continental_aggregation
+            cell_cost += (
+                0.62 + 0.52 * morphology.ocean_basin_openness
+            ) * float(divergent_influence[neighbour])
+            cell_cost -= (
+                0.16 + 0.24 * morphology.continental_aggregation
+            ) * float(convergent_influence[neighbour])
             if plate_flat[neighbour] != plate_flat[cell]:
                 cell_cost += 0.18 + 0.22 * morphology.ocean_basin_openness
             candidate = current_cost + step_length * directional_cost * max(cell_cost, 0.20)
@@ -1207,7 +1314,7 @@ def _grow_continental_crust(
                     if not 1 <= nr < height - 1:
                         continue
                     neighbour = nr * width + nc
-                    if owner[neighbour] >= 0:
+                    if owner[neighbour] >= 0 or reserved[neighbour] not in (-1, owner_index):
                         continue
                     east, north = dc * float(longitude_steps[row]), -dr * row_step
                     step = max(math.hypot(east, north), row_step * 0.035)
@@ -1225,6 +1332,7 @@ def _grow_continental_crust(
                     break
                 travelled += step
                 owner[cell] = owner_index
+                reserve(cell, owner_index)
                 costs[owner_index, cell] = 0.0
                 owner_area[owner_index] += cell_weight[cell]
                 nucleus_cells[owner_index].append(cell)
@@ -1244,9 +1352,10 @@ def _grow_continental_crust(
             frontier = frontiers[owner_index]
             while frontier:
                 current_cost, cell = heapq.heappop(frontier)
-                if owner[cell] >= 0:
+                if owner[cell] >= 0 or reserved[cell] not in (-1, owner_index):
                     continue
                 owner[cell] = owner_index
+                reserve(cell, owner_index)
                 weight = float(cell_weight[cell])
                 owner_area[owner_index] += weight
                 occupied_area += weight
@@ -1352,22 +1461,33 @@ def _crust_accommodation_footprint(along_km, across_km, length_km, half_width_km
     rng = np.random.Generator(np.random.PCG64(int(seed) & 0xFFFFFFFFFFFFFFFF))
     t = np.asarray(along_km) / length_km
     bend = float(rng.choice((-1.0, 1.0)))
-    frequency = float(rng.uniform(1.1, 1.8))
-    axis = half_width_km * bend * (1.10 * np.sin(math.pi * t * frequency) + 0.65 * t * t)
+    frequency = float(rng.uniform(0.85, 1.25))
+    phase_axis = float(rng.uniform(-math.pi, math.pi))
+    axis = half_width_km * bend * (
+        0.72 * np.sin(math.pi * t * frequency + phase_axis)
+        + 0.20 * np.sin(math.pi * t * (frequency + 0.75) - phase_axis)
+        + 0.24 * t * t
+    )
     displacement = np.asarray(across_km) - axis
-    tip = np.sqrt(np.clip(1.04 - t, 0.0, 1.0))
+    # Use a rounded, two-ended structural block.  The former one-sided square
+    # root forced every feature to finish as a sharp coastal thorn.
+    tip = np.sqrt(np.clip(1.02 - np.square(t - 0.01), 0.0, 1.0))
     phase_left, phase_right = rng.uniform(-math.pi, math.pi, 2)
     # A fault block margin changes width at relay zones.  Interpolated seeded
     # controls keep those changes broad and geologic instead of pixel-noisy.
     block_t = np.linspace(0.0, 1.04, 9)
     left_blocks = np.interp(
-        np.clip(t, 0.0, 1.04), block_t, rng.uniform(0.72, 1.26, len(block_t))
+        np.clip(t, 0.0, 1.04), block_t, rng.uniform(0.62, 1.36, len(block_t))
     )
     right_blocks = np.interp(
-        np.clip(t, 0.0, 1.04), block_t, rng.uniform(0.74, 1.28, len(block_t))
+        np.clip(t, 0.0, 1.04), block_t, rng.uniform(0.64, 1.38, len(block_t))
     )
-    left = half_width_km * tip * left_blocks * (0.88 + 0.26 * np.sin(7.0 * t + phase_left))
-    right = half_width_km * tip * right_blocks * (0.94 + 0.30 * np.sin(5.0 * t + phase_right))
+    left = half_width_km * tip * left_blocks * (
+        0.94 + 0.12 * np.sin(2.6 * t + phase_left)
+    )
+    right = half_width_km * tip * right_blocks * (
+        0.96 + 0.14 * np.sin(2.1 * t + phase_right)
+    )
     bank = np.where(displacement < 0.0, left, right)
     boundary = np.minimum(bank - np.abs(displacement), (1.04 - t) * length_km)
     boundary = np.minimum(boundary, (t + 1.0) * length_km)
@@ -1622,9 +1742,59 @@ def _continental_crust(
     recipe: PlanetRecipe,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray, float, Mapping[str, object]]:
+    """Condition the kinematic history on the requested present-day continents.
+
+    A continent count is a constraint on the resulting crust, not a number of
+    arbitrary labels. Reconstruct shorter histories when the motion tears a
+    nucleus into an extra continent or accretes two into one. Every candidate
+    rebuilds ancestral plates and crust before applying its Euler motion.
+    """
+    requested_duration = 32.0 + 28.0 * morphology.crust_fragmentation
+    area = np.cos(np.radians(grid.latitude_degrees))
+    attempts = []
+    for fraction in (1.0, 0.5, 0.25, 0.125):
+        result = _continental_crust_candidate(
+            grid, plate_fields, boundary_class, morphology, recipe, seed,
+            requested_duration * fraction,
+        )
+        land, field, level, metrics = result
+        counts = []
+        stable = True
+        for connectivity in (4, 8):
+            labels, _ = periodic_component_labels(land, connectivity)
+            component_area = np.bincount(labels.ravel(), weights=area.ravel())[1:]
+            shares = np.sort(component_area / component_area.sum())[::-1]
+            counts.append(int(np.count_nonzero(shares >= 0.05)))
+            # Leave a real area margin around the major-landmass criterion:
+            # a 4.99% detached block can become a fourth continent after the
+            # native shoreline/erosion pass. Condition the crust itself.
+            stable &= bool(len(shares) >= recipe.continent_count
+                           and shares[recipe.continent_count - 1] >= 0.06
+                           and (len(shares) == recipe.continent_count
+                                or shares[recipe.continent_count] < 0.04))
+        attempts.append({"durationMyr": requested_duration * fraction,
+                         "fourConnectedMajorCount": counts[0], "eightConnectedMajorCount": counts[1],
+                         "stableAreaMargin": stable})
+        if stable and counts == [recipe.continent_count, recipe.continent_count]:
+            return land, field, level, {
+                **metrics,
+                "continentConstruction": {"model": "area-spaced-separated-crust-with-conditioned-euler-history",
+                                           "requestedCount": recipe.continent_count, "attempts": attempts},
+            }
+    raise ValueError(f"continental construction did not meet {recipe.continent_count} physical continents: {attempts}")
+
+
+def _continental_crust_candidate(
+    grid: LatLonGrid,
+    plate_fields: PlateFields,
+    boundary_class: np.ndarray,
+    morphology: WorldMorphology,
+    recipe: PlanetRecipe,
+    seed: int,
+    transport_duration: float,
+) -> tuple[np.ndarray, np.ndarray, float, Mapping[str, object]]:
     vectors = np.asarray(grid.unit_vectors, dtype=np.float64).reshape((-1, 3))
     divergent_distance = _distance_from_sources(boundary_class == BOUNDARY_DIVERGENT, grid)
-    transport_duration = 32.0 + 28.0 * morphology.crust_fragmentation
     ancestral_definitions = _advect_plate_definitions(plate_fields.plates, transport_duration)
     ancestral_initial = build_plate_fields(
         grid, plate_count=len(ancestral_definitions), anchors=ancestral_definitions,
@@ -1639,7 +1809,7 @@ def _continental_crust(
     # Accreted crust must be allowed across the future rift. Pre-clearing a
     # wide ocean around every divergent boundary leaves little shared crust
     # to tear apart when the finite motion below actually starts.
-    roots = _select_crust_roots(grid, recipe.continent_count, morphology, seed)
+    roots = _select_crust_roots(grid, recipe.continent_count, morphology, seed, recipe.land_fraction)
     rng = np.random.Generator(np.random.PCG64(seed ^ 0xA24BAED4963EE407))
     crust_fraction = min(recipe.land_fraction + 0.075, 0.62)
     continental_mask = _grow_continental_crust(
@@ -1693,7 +1863,7 @@ def _continental_crust(
     # to the measured coast distance so the sea-level contour gains real
     # capes, hooked bays and offset shelves without painting lines into the
     # open ocean or roughening the continental interior.
-    coast_distance_km = np.minimum(inside_distance, outside_distance)
+    coast_distance_km = shoreline_distance(inside_distance, outside_distance)
     shelf_macro = _spherical_band_noise(
         grid.shape[0],
         grid.shape[1],
@@ -1708,14 +1878,14 @@ def _continental_crust(
     ).astype(np.float64)
     shelf_blocks = np.tanh(1.72 * (0.72 * shelf_macro + 0.28 * shelf_relay))
     shelf_support = np.exp(-0.5 * np.square(coast_distance_km / 560.0))
-    shelf_strength = 0.27 + 0.20 * morphology.crust_fragmentation
+    shelf_strength = 0.43 + 0.30 * morphology.crust_fragmentation
     potential_grid += shelf_strength * shelf_support * shelf_blocks
     # A second, narrower relay band adds asymmetrical notches at the edge of
     # individual blocks while decaying before it can create visible ocean
     # contour rings.
     relay_support = np.exp(-0.5 * np.square(coast_distance_km / 265.0))
     potential_grid += (
-        0.10 + 0.08 * morphology.crust_fragmentation
+        0.14 + 0.10 * morphology.crust_fragmentation
     ) * relay_support * shelf_relay * np.sign(shelf_blocks)
     texture = _spherical_fbm(
         grid.shape[0],
@@ -1862,48 +2032,8 @@ def _distance_from_sources(mask: np.ndarray, grid: LatLonGrid) -> np.ndarray:
     source = np.asarray(mask, dtype=bool)
     if source.shape != grid.shape:
         raise ValueError("source mask must match the reference grid")
-    sources = np.flatnonzero(source.reshape(-1))
-    if not len(sources):
-        raise ValueError("distance source mask is empty")
-    distance = np.full(grid.cell_count, np.inf, dtype=np.float64)
-    distance[sources] = 0.0
-    queue = [(0.0, int(cell)) for cell in sources]
-    heapq.heapify(queue)
-    row_step = math.pi * _PLANET_RADIUS_KM / grid.shape[0]
-    longitude_step = (
-        math.tau
-        * _PLANET_RADIUS_KM
-        / grid.shape[1]
-        * np.cos(np.radians(grid.latitude_degrees[:, 0]))
-    )
-    while queue:
-        current_distance, cell = heapq.heappop(queue)
-        if current_distance != distance[cell]:
-            continue
-        row, column = divmod(cell, grid.shape[1])
-        for delta_row, delta_column in (
-            (-1, -1),
-            (-1, 0),
-            (-1, 1),
-            (0, -1),
-            (0, 1),
-            (1, -1),
-            (1, 0),
-            (1, 1),
-        ):
-            neighbour_row = row + delta_row
-            if not 0 <= neighbour_row < grid.shape[0]:
-                continue
-            neighbour_column = (column + delta_column) % grid.shape[1]
-            neighbour = neighbour_row * grid.shape[1] + neighbour_column
-            north_south = row_step * abs(delta_row)
-            east_west = float(longitude_step[row]) * abs(delta_column)
-            step = math.hypot(north_south, east_west)
-            candidate = current_distance + max(step, row_step * 0.035)
-            if candidate < distance[neighbour]:
-                distance[neighbour] = candidate
-                heapq.heappush(queue, (candidate, neighbour))
-    return distance.reshape(grid.shape)
+    return distance_from_sources(source, grid.latitude_degrees[:, 0], _PLANET_RADIUS_KM)
+
 
 
 def _build_crust_fields(
@@ -2069,6 +2199,7 @@ def _shelf_archipelago_uplift(
     seed: int,
     group_limit: int,
     islands_per_group: int,
+    emergence_scale: float = 1.0,
 ) -> tuple[np.ndarray, Mapping[str, object]]:
     """Return seeded uplift for shelf fragments, arcs and hotspot groups.
 
@@ -2086,6 +2217,8 @@ def _shelf_archipelago_uplift(
             "islandCount": 0,
             "islandCellCount": 0,
         }
+    if not math.isfinite(emergence_scale) or emergence_scale <= 0.0:
+        raise ValueError("archipelago emergence scale must be positive")
     ocean_depth = np.zeros(grid.shape, dtype=np.float64)
     oceanic = np.asarray(crust.kind) == CRUST_OCEANIC
     valid_age = ocean & oceanic & np.isfinite(crust.ocean_age_myr)
@@ -2115,12 +2248,13 @@ def _shelf_archipelago_uplift(
         1.0,
     )
     # Candidate search in the island module is intentionally geometric (it
-    # tests shore clearance and group spacing for every accepted island). Run
-    # that search on a dedicated half-reference work field, then resample the
-    # resulting causal uplift back to the 720x360 reference field. This keeps
-    # island *scale* geological while avoiding an O(N²) full-grid search.
-    work_height = min(grid.shape[0], 180)
-    work_width = min(grid.shape[1], 360)
+    # tests shore clearance and group spacing for every accepted island). Keep
+    # it on a finer 240x480 reference field when possible: the old 180x360
+    # work raster made island groups disappear during the final resampling and
+    # gave their coasts the same rounded silhouette as the broad continents.
+    # This remains bounded for small test maps while preserving reproducibility.
+    work_height = min(grid.shape[0], 240)
+    work_width = min(grid.shape[1], 480)
     work_land = _resize_nearest(land, work_height, work_width).astype(bool)
     work_ocean = ~work_land
     work_depth = _resize_periodic_float(ocean_depth, work_height, work_width)
@@ -2135,21 +2269,22 @@ def _shelf_archipelago_uplift(
         maximum_groups=max(4, int(group_limit)),
         maximum_islands_per_group=max(4, int(islands_per_group)),
         minimum_shore_distance=3,
-        maximum_shore_distance=44,
-        shallow_limit=0.74,
+        maximum_shore_distance=50,
+        shallow_limit=0.78,
     )
     uplift_work = np.zeros((work_height, work_width), dtype=np.float64)
     families = (
-        (archipelagos.large_island_mask, 2900.0, 3900.0),
-        (archipelagos.shelf_island_mask, 1700.0, 3600.0),
-        (archipelagos.island_arc_mask, 2800.0, 3600.0),
-        (archipelagos.hotspot_island_mask, 3450.0, 3700.0),
+        (archipelagos.large_island_mask, 3250.0, 4450.0),
+        (archipelagos.shelf_island_mask, 2250.0, 4050.0),
+        (archipelagos.island_arc_mask, 3050.0, 3950.0),
+        (archipelagos.hotspot_island_mask, 3650.0, 4150.0),
     )
     relative = np.asarray(archipelagos.relative_elevation, dtype=np.float64)
     for mask, base, gain in families:
         work_mask = np.asarray(mask, dtype=bool)
         uplift_work[work_mask] = (
-            base + gain * np.clip(relative[work_mask], 0.0, 1.0)
+            emergence_scale
+            * (base + gain * np.clip(relative[work_mask], 0.0, 1.0))
         )
     uplift = _resize_periodic_float(
         uplift_work.astype(np.float32), grid.shape[0], grid.shape[1]
@@ -2166,7 +2301,8 @@ def _shelf_archipelago_uplift(
         "hotspotIslandCellCount": int(np.count_nonzero(archipelagos.hotspot_island_mask)),
         "seamountCellCount": int(np.count_nonzero(archipelagos.seamount_mask)),
         "shelfCellCount": int(np.count_nonzero(archipelagos.shelf_mask)),
-        "model": "reference-grid-shelf-fragment-arc-hotspot-groups-v6",
+        "emergenceScale": float(emergence_scale),
+        "model": "reference-grid-shelf-fragment-arc-hotspot-groups-v8",
     }
 
 
@@ -2691,7 +2827,8 @@ def _reference_relief(
     # Plains are depositional/erosional surfaces, not low Gaussian hills.  They
     # subdue only the old cratonic fabric; later sutures and active ranges can
     # still cross them and create foreland relief.
-    signed *= 1.0 - 0.50 * continental_plain_support
+    regional_surface = _smooth_field(signed, radius=3, passes=2)
+    signed += 0.50 * continental_plain_support * (regional_surface - signed)
     signed += province_relief
 
     # Modern plates are too few to explain the interior fabric of old
@@ -3080,14 +3217,49 @@ def _reference_relief(
         seed ^ 0xDB4F0B9175AE2165,
     )
     signed += hotspot * (0.58 + 0.30 * morphology.hotspot_activity)
+    island_pressure = float(
+        np.clip(
+            0.30 * morphology.crust_fragmentation
+            + 0.30 * morphology.island_arc_activity
+            + 0.24 * morphology.hotspot_activity
+            + 0.16 * (1.0 - morphology.ocean_basin_openness),
+            0.0,
+            1.0,
+        )
+    )
     archipelago_uplift, archipelago_diagnostics = _shelf_archipelago_uplift(
         grid,
         continental_mask,
         signed,
         crust,
         seed=seed ^ 0xBB67AE8584CAA73B,
-        group_limit=10 + int(round(5.0 * morphology.hotspot_activity)),
-        islands_per_group=8 + int(round(3.0 * morphology.crust_fragmentation)),
+        # Island abundance follows the same continuous geological axes as the
+        # rest of the surface.  Fragmented crust and active arcs create more
+        # shelf groups; open, hotspot-rich basins add a smaller deep-ocean
+        # contribution without making every seed an archipelago world.
+        group_limit=10
+        + int(
+            round(
+                8.0 * (
+                    0.34 * morphology.crust_fragmentation
+                    + 0.30 * morphology.island_arc_activity
+                    + 0.22 * morphology.hotspot_activity
+                    + 0.14 * (1.0 - morphology.ocean_basin_openness)
+                )
+            )
+        ),
+        islands_per_group=10
+        + int(
+            round(
+                10.0 * (
+                    0.42 * morphology.crust_fragmentation
+                    + 0.30 * morphology.island_arc_activity
+                    + 0.18 * morphology.hotspot_activity
+                    + 0.10 * (1.0 - morphology.ocean_basin_openness)
+                )
+            )
+        ),
+        emergence_scale=1.0 + 0.42 * island_pressure,
     )
     signed += archipelago_uplift
     diagnostics = {
@@ -3102,6 +3274,7 @@ def _reference_relief(
         "reactivatedSutureFraction": float(np.mean(reactivated_union)),
         "reactivatedSutures": dict(reactivated_diagnostics),
         "directionalOrogenicBelts": orogenic_belts,
+        "islandPressure": island_pressure,
         "shelfArchipelagos": archipelago_diagnostics,
         "tectonicSaturationMeters": {
             "uplift": tectonic_uplift_ceiling_m,
@@ -3188,42 +3361,46 @@ def _remap_plate_ids(labels: np.ndarray) -> np.ndarray:
 
 def _continent_owners(
     land: np.ndarray,
-    height: np.ndarray,
     count: int,
-    seed: int,
 ) -> np.ndarray:
+    # A connected physical mainland owns one continent. Spherical Voronoi
+    # labels used to split a supercontinent into the requested count, masking
+    # bad generation while scattering islands among unrelated owner labels.
+    labels, component_count = periodic_component_labels(land, 4)
+    latitude = 90.0 - (np.arange(land.shape[0]) + 0.5) * 180.0 / land.shape[0]
+    area = np.broadcast_to(np.cos(np.radians(latitude))[:, None], land.shape)
+    sizes = np.bincount(labels.ravel(), weights=area.ravel(), minlength=component_count + 1)
+    sizes[0] = 0.0
+    major = np.flatnonzero(sizes >= 0.05 * sizes.sum())
+    if major.size != count:
+        raise ValueError(f"final physical land has {major.size} major continents; requested {count}")
+    labels8, _ = periodic_component_labels(land, 8)
+    sizes8 = np.bincount(labels8.ravel(), weights=area.ravel())[1:]
+    if np.count_nonzero(sizes8 >= 0.05 * sizes8.sum()) != count:
+        raise ValueError("diagonal land bridges merge the requested final continents")
+    major = major[np.argsort(-sizes[major], kind="stable")]
+    lookup = np.zeros(component_count + 1, dtype=np.int16)
+    lookup[major] = np.arange(1, count + 1, dtype=np.int16)
+    owner = lookup[labels]
     x, y, z = _sphere_vectors(*land.shape)
-    flat_land = np.flatnonzero(land)
-    if flat_land.size < count:
-        raise ValueError("not enough land cells for the requested continent count")
-    land_height = height.reshape(-1)[flat_land]
-    candidates = flat_land[land_height >= float(np.quantile(land_height, 0.46))]
-    rng = np.random.Generator(np.random.PCG64(seed))
-    first = int(candidates[int(rng.integers(0, len(candidates)))])
-    selected = [first]
-    flat_x, flat_y, flat_z = x.reshape(-1), y.reshape(-1), z.reshape(-1)
-    nearest_similarity = (
-        flat_x[candidates] * flat_x[first]
-        + flat_y[candidates] * flat_y[first]
-        + flat_z[candidates] * flat_z[first]
-    )
-    for _ in range(1, count):
-        chosen = int(candidates[int(np.argmax(1.0 - nearest_similarity))])
-        selected.append(chosen)
-        similarity = (
-            flat_x[candidates] * flat_x[chosen]
-            + flat_y[candidates] * flat_y[chosen]
-            + flat_z[candidates] * flat_z[chosen]
-        )
-        nearest_similarity = np.maximum(nearest_similarity, similarity)
-    best = np.full(land.shape, -2.0, dtype=np.float32)
-    owner = np.zeros(land.shape, dtype=np.int16)
-    for identifier, cell in enumerate(selected, 1):
-        similarity = x * flat_x[cell] + y * flat_y[cell] + z * flat_z[cell]
-        wins = similarity > best
-        best[wins] = similarity[wins]
-        owner[wins] = identifier
-    return np.where(land, owner, 0).astype(np.int16)
+    vectors = np.column_stack((x.ravel(), y.ravel(), z.ravel()))
+    interior = ndimage.binary_erosion(owner > 0)
+    core_cells = np.flatnonzero((owner > 0) & ~interior)
+    # Island assignment uses distance to the entire mainland, so a long
+    # peninsula remains associated with its neighbouring shelf islands.
+    tree = cKDTree(vectors[core_cells])
+    minor_cells = np.flatnonzero(land & (owner == 0))
+    if minor_cells.size:
+        _, nearest = tree.query(vectors[minor_cells], workers=1)
+        nearest_owners = owner.ravel()[core_cells[nearest]]
+        votes = np.bincount(
+            labels.ravel()[minor_cells] * (count + 1) + nearest_owners,
+            weights=area.ravel()[minor_cells],
+            minlength=(component_count + 1) * (count + 1),
+        ).reshape(component_count + 1, count + 1)
+        minor_ids = np.flatnonzero((sizes > 0) & (lookup == 0))
+        lookup[minor_ids] = np.argmax(votes[minor_ids], axis=1)
+    return lookup[labels]
 
 
 def _coastline_scale_profile(land: np.ndarray) -> dict[str, float]:
@@ -3277,6 +3454,185 @@ def _component_areas(mask: np.ndarray, latitude_weights: np.ndarray) -> list[flo
                     stack.append(neighbour_row * width + neighbour_column)
         areas.append(area)
     return sorted(areas, reverse=True)
+
+
+def _periodic_water_components(
+    mask: np.ndarray,
+) -> list[tuple[list[tuple[int, int]], bool]]:
+    """Return 4-connected water components with horizontal wrap.
+
+    The world surface is periodic in longitude.  A component that reaches the
+    first or last row is exterior ocean; a component that stays between those
+    rows is a genuinely enclosed basin and is eligible for the large-lake
+    policy below.  Keeping the cell lists (rather than a label raster) makes
+    this helper cheap enough to run once on the final synthesis grid.
+    """
+
+    water = np.asarray(mask, dtype=bool)
+    if water.ndim != 2:
+        raise ValueError("water component mask must be two-dimensional")
+    height, width = water.shape
+    remaining = water.copy()
+    components: list[tuple[list[tuple[int, int]], bool]] = []
+    while bool(np.any(remaining)):
+        start = int(np.flatnonzero(remaining.reshape(-1))[0])
+        start_row, start_column = divmod(start, width)
+        remaining[start_row, start_column] = False
+        stack = [(start_row, start_column)]
+        cells: list[tuple[int, int]] = []
+        touches_edge = False
+        while stack:
+            row, column = stack.pop()
+            cells.append((row, column))
+            touches_edge |= row == 0 or row == height - 1
+            for neighbour_row, neighbour_column in (
+                (row - 1, column),
+                (row + 1, column),
+                (row, (column - 1) % width),
+                (row, (column + 1) % width),
+            ):
+                if (
+                    0 <= neighbour_row < height
+                    and remaining[neighbour_row, neighbour_column]
+                ):
+                    remaining[neighbour_row, neighbour_column] = False
+                    stack.append((neighbour_row, neighbour_column))
+        components.append((cells, touches_edge))
+    return components
+
+
+def _apply_large_lake_policy(
+    relative_m: np.ndarray,
+    land: np.ndarray,
+    morphology: WorldMorphology,
+    seed: int,
+) -> tuple[np.ndarray, Mapping[str, object]]:
+    """Keep only credible lakes and turn rejected water holes into terrain.
+
+    An enclosed water patch is not automatically a world-scale lake.  Closed
+    continental basins and fragmented crust make large lakes more likely;
+    open ocean basins make them rare.  The policy is deterministic because it
+    uses only the already sampled morphology axes and the stage seed.  It
+    retains a bounded number of super-lakes, removes pixel-scale closed ponds,
+    and leaves every exterior ocean component untouched.  Rejected water is
+    reconstructed from its surrounding terrain rather than painted over.
+    """
+
+    relative = np.asarray(relative_m, dtype=np.float64).copy()
+    land_mask = np.asarray(land, dtype=bool)
+    if relative.shape != land_mask.shape or relative.ndim != 2:
+        raise ValueError("large-lake fields must share a two-dimensional shape")
+    height, width = relative.shape
+    basin_pressure = float(
+        np.clip(
+            0.12
+            + 0.48 * (1.0 - morphology.ocean_basin_openness)
+            + 0.22 * morphology.continental_aggregation
+            + 0.14 * morphology.crust_fragmentation
+            + 0.06 * (1.0 - morphology.hemisphere_asymmetry),
+            0.04,
+            0.94,
+        )
+    )
+    target_large_lakes = int(np.clip(round(0.35 + 2.65 * basin_pressure), 0, 3))
+    threshold_fraction = 0.00090 + 0.00070 * (1.0 - basin_pressure)
+    threshold_cells = max(500, int(round(height * width * threshold_fraction)))
+    components = _periodic_water_components(~land_mask)
+    eligible = sorted(
+        (
+            (len(cells), cells)
+            for cells, touches_edge in components
+            if not touches_edge and len(cells) >= threshold_cells
+        ),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    # Tiny enclosed water components are raster artefacts, not legible lakes
+    # at world-map scale.  Use an area threshold that grows with the authored
+    # grid, while remaining below the scale of a genuine regional lake.
+    micro_lake_threshold_cells = max(
+        12,
+        int(round(height * width * 0.000008)),
+    )
+    micro = [
+        (len(cells), cells)
+        for cells, touches_edge in components
+        if not touches_edge and len(cells) <= micro_lake_threshold_cells
+    ]
+    suppressed = eligible[target_large_lakes:] + micro
+    if not suppressed:
+        return relative, {
+            "model": "seeded-enclosed-basin-selection-v2",
+            "basinPressure": basin_pressure,
+            "largeLakeThresholdCells": threshold_cells,
+            "microLakeThresholdCells": micro_lake_threshold_cells,
+            "eligibleLargeLakeCount": len(eligible),
+            "targetLargeLakeCount": target_large_lakes,
+            "preservedLargeLakeCount": min(target_large_lakes, len(eligible)),
+            "suppressedLargeLakeCount": 0,
+            "suppressedLargeLakeCells": 0,
+            "suppressedMicroLakeCount": 0,
+            "suppressedMicroLakeCells": 0,
+        }
+
+    # A periodic horizontal pad keeps distance-to-shore correct when an
+    # enclosed basin crosses the antimeridian before the seam is selected.
+    water = ~land_mask
+    padded_water = np.concatenate((water[:, -1:], water, water[:, :1]), axis=1)
+    distance_to_land = ndimage.distance_transform_edt(padded_water)[:, 1:-1]
+    basin_texture = _normalise(
+        _smooth_field(
+            _spherical_fbm(height, width, int(seed) ^ 0xA54FF53A, detail=0.28),
+            radius=6,
+            passes=2,
+        )
+    )
+    suppressed_cells = 0
+    suppressed_micro_cells = 0
+    suppressed_micro_count = 0
+    base_height = 70.0 + 150.0 * basin_pressure
+    for ordinal, (area, cells) in enumerate(suppressed):
+        component_mask = np.zeros((height, width), dtype=bool)
+        rows = np.fromiter((cell[0] for cell in cells), dtype=np.int64)
+        columns = np.fromiter((cell[1] for cell in cells), dtype=np.int64)
+        component_mask[rows, columns] = True
+        deepest = max(float(np.max(distance_to_land[component_mask], initial=1.0)), 1.0)
+        interior = np.clip(distance_to_land[component_mask] / deepest, 0.0, 1.0)
+        is_micro_lake = area <= micro_lake_threshold_cells
+        if is_micro_lake:
+            # A one- or two-cell pond should inherit almost all of its rim
+            # height, otherwise filling it simply leaves a diamond-shaped
+            # lowland scar in the same place.
+            interior *= max(0.08, float(area) / micro_lake_threshold_cells)
+        basin_floor = (
+            base_height
+            + 230.0 * interior
+            + 95.0 * (basin_texture[component_mask] - 0.5)
+            + 35.0 * math.sin((ordinal + 1) * 1.71 + float(seed & 0xFFFF) * 1.0e-5)
+        )
+        # A joint surface solve blends all rim heights. Nearest-rim copying
+        # partitions a basin into radial sectors, visible as comb-like seams.
+        local_relief = reconstruct_basin(
+            relative, component_mask, np.maximum(basin_floor, 32.0)
+        )
+        relative[component_mask] = np.maximum(local_relief, 32.0)
+        suppressed_cells += int(area)
+        if is_micro_lake:
+            suppressed_micro_cells += int(area)
+            suppressed_micro_count += 1
+    return relative, {
+        "model": "seeded-enclosed-basin-selection-v2",
+        "basinPressure": basin_pressure,
+        "largeLakeThresholdCells": threshold_cells,
+        "microLakeThresholdCells": micro_lake_threshold_cells,
+        "eligibleLargeLakeCount": len(eligible),
+        "targetLargeLakeCount": target_large_lakes,
+        "preservedLargeLakeCount": min(target_large_lakes, len(eligible)),
+        "suppressedLargeLakeCount": len(eligible[target_large_lakes:]),
+        "suppressedLargeLakeCells": suppressed_cells - suppressed_micro_cells,
+        "suppressedMicroLakeCount": suppressed_micro_count,
+        "suppressedMicroLakeCells": suppressed_micro_cells,
+    }
 
 
 def _dilate(mask: np.ndarray, passes: int) -> np.ndarray:
@@ -3635,13 +3991,10 @@ def generate_planet_surface(recipe: PlanetRecipe) -> ProceduralSurface:
     signed_m -= (
         760.0 + 660.0 * morphology.ocean_basin_openness
     ) * mature_spreading_exclusion
-    full_detail = _spherical_fbm(
-        recipe.height,
-        recipe.width,
-        stage_seeds["coast"],
-        detail=0.55 + recipe.coastline_detail,
-    )
-    signed_m += (300.0 + 680.0 * recipe.coastline_detail) * full_detail
+    # Native detail is added by _full_resolution_relief_detail below, with
+    # support from existing relief and shorelines. The old additional global
+    # fBm pass contained planetary-scale waves and raised submerged straits
+    # into land bridges, undoing the already constructed continental crust.
     latitude = (
         math.pi / 2.0
         - (np.arange(recipe.height, dtype=np.float64)[:, None] + 0.5)
@@ -3684,12 +4037,135 @@ def generate_planet_surface(recipe: PlanetRecipe) -> ProceduralSurface:
         stage_seeds['coast'], recipe.coastline_detail,
     )
     signed_m += coast_delta
+
+    # Re-apply a final shoreline-scale structural field after the terrain warp
+    # and sector transport.  Earlier crustal fields establish the continent;
+    # this pass keeps the actual warped shoreline from being ironed back into
+    # a smooth arc by interpolation.  It is measured from the current
+    # provisional zero contour, so it cannot create unrelated open-ocean
+    # ridges or paint a decorative ring around every island.
+    final_reference_level = _weighted_level(
+        reference_signed,
+        np.cos(np.radians(reference_grid.latitude_degrees[:, 0]))[:, None],
+        recipe.land_fraction,
+    )
+    final_reference_land = reference_signed > final_reference_level
+    final_inside = _distance_from_sources(~final_reference_land, reference_grid)
+    final_outside = _distance_from_sources(final_reference_land, reference_grid)
+    final_coast_distance = shoreline_distance(final_inside, final_outside)
+    edge_macro = _spherical_band_noise(
+        reference_height,
+        reference_width,
+        stage_seeds["coast"] ^ 0x2C1B3C6D7E8F9011,
+        ((6.5, 0.43, 5), (12.5, 0.31, 5), (21.0, 0.21, 4)),
+    )
+    edge_relay = _spherical_band_noise(
+        reference_height,
+        reference_width,
+        stage_seeds["coast"] ^ 0x6A09E667F3BCC909,
+        ((18.0, 0.39, 5), (33.0, 0.27, 4), (57.0, 0.16, 4)),
+    )
+    edge_support = np.exp(-0.5 * np.square(final_coast_distance / 420.0))
+    relay_support = np.exp(-0.5 * np.square(final_coast_distance / 205.0))
+    warped_edge_macro = _resize_periodic_float(
+        edge_support.astype(np.float32) * np.tanh(1.55 * edge_macro),
+        recipe.height,
+        recipe.width,
+    )
+    warped_edge_relay = _resize_periodic_float(
+        relay_support.astype(np.float32) * edge_relay * np.sign(edge_macro),
+        recipe.height,
+        recipe.width,
+    )
+    signed_m += (125.0 + 190.0 * recipe.coastline_detail) * warped_edge_macro
+    signed_m += (58.0 + 92.0 * recipe.coastline_detail) * warped_edge_relay
+
+    # Resolve the coast from the continuous structural surface.  The broad
+    # margin field above supplies the capes, bays and rifts; at native scale a
+    # short nearshore relaxation removes raster-cell corners without applying
+    # independent high-frequency noise to the shoreline.
+    # Measure support from the current zero contour. The old reference mask
+    # only covered the shoreline before structural movement, leaving lakes
+    # and newly formed coves on a different, visibly smoother algorithm.
+    current_level = _weighted_level(signed_m, latitude_weight, recipe.land_fraction)
+    current_relative = signed_m - current_level
+    current_land = signed_m > current_level
+    padded_land = np.concatenate((current_land[:, -1:], current_land, current_land[:, :1]), axis=1)
+    native_row_km = math.pi * _PLANET_RADIUS_KM / recipe.height
+    inside_distance = ndimage.distance_transform_edt(padded_land)[:, 1:-1] * native_row_km
+    outside_distance = ndimage.distance_transform_edt(~padded_land)[:, 1:-1] * native_row_km
+    # One transform is zero at every cell: select the nonzero side.
+    # Taking the minimum makes the nearshore mask cover the entire planet.
+    current_coast_distance = shoreline_distance(inside_distance, outside_distance)
+    shoreline_relaxed = _smooth_field(signed_m, radius=1, passes=1)
+    shoreline_relaxation = 0.56 * np.exp(
+        -0.5 * np.square(current_coast_distance / 48.0)
+    )
+    signed_m += shoreline_relaxation * (shoreline_relaxed - signed_m)
+
+    current_level = _weighted_level(signed_m, latitude_weight, recipe.land_fraction)
+    current_relative = signed_m - current_level
+    current_land = signed_m > current_level
+    padded_land = np.concatenate((current_land[:, -1:], current_land, current_land[:, :1]), axis=1)
+    inside_distance = ndimage.distance_transform_edt(padded_land)[:, 1:-1] * native_row_km
+    outside_distance = ndimage.distance_transform_edt(~padded_land)[:, 1:-1] * native_row_km
+    current_coast_distance = shoreline_distance(inside_distance, outside_distance)
+    # The former final pass applied a fresh random field to every shore.  It
+    # made the final contour less coupled to the terrain it was supposed to
+    # describe.  Here a lowland can be drowned only when existing local relief
+    # says it is a valley/weak block, and the response is scaled by the actual
+    # plate-boundary/velocity context.  The helper also rejects every new wet
+    # cell that cannot reach an already existing ocean or lake.
+    current_boundary = _resize_nearest(
+        reference_boundary,
+        recipe.height,
+        recipe.width,
+    ).astype(np.int8)
+    current_velocity_east = _resize_periodic_float(
+        np.sum(coast_velocity * ref_east, axis=-1).astype(np.float32),
+        recipe.height,
+        recipe.width,
+    )
+    current_velocity_north = _resize_periodic_float(
+        np.sum(coast_velocity * ref_north, axis=-1).astype(np.float32),
+        recipe.height,
+        recipe.width,
+    )
+    current_relative, coastal_transgression_diagnostics = selective_tectonic_transgression(
+        current_relative,
+        current_coast_distance,
+        current_boundary,
+        current_velocity_east,
+        current_velocity_north,
+        np.degrees(latitude[:, 0]),
+        low_relief_support,
+        recipe.coastline_detail,
+    )
+    signed_m = current_relative + current_level
     sea_level_m = _weighted_level(
         signed_m,
         latitude_weight,
         recipe.land_fraction,
     )
     relative_m = signed_m - sea_level_m
+    land = relative_m > 0.0
+    relative_m, large_lake_diagnostics = _apply_large_lake_policy(
+        relative_m,
+        land,
+        morphology,
+        stage_seeds["relief"] ^ 0xC2B2AE3D27D4EB4F,
+    )
+    # Keep the signed field and the land mask in lockstep after closing any
+    # seed-incredible super-lake basins.  Ordinary enclosed lakes and exterior
+    # ocean cells are unchanged by this pass.
+    signed_m = relative_m + sea_level_m
+    # Do not re-solve the global datum here: doing so lifts the sea level in
+    # response to the newly filled basins and reopens them as several smaller
+    # holes.  The recipe's land fraction remains the target for the original
+    # tectonic cut; this localized correction intentionally adds only the
+    # selected basin area.
+    land = relative_m > 0.0
+    relative_m = coastal_scarp_transport(relative_m, np.degrees(latitude[:, 0]))
     land = relative_m > 0.0
     relative_m, geomorphic_evolution = _fluvial_dissection(
         relative_m,
@@ -3698,6 +4174,8 @@ def generate_planet_surface(recipe: PlanetRecipe) -> ProceduralSurface:
         low_relief_support,
     )
 
+    land = relative_m > 0.0
+    signed_m = relative_m + sea_level_m
     # Pole-spanning land necessarily touches every longitude in Plate Carree;
     # choose the rectangular seam using the inhabited/non-polar continents.
     seam_land = land.copy()
@@ -3804,12 +4282,12 @@ def generate_planet_surface(recipe: PlanetRecipe) -> ProceduralSurface:
         boundary_class,
         stage_seeds["relief"],
     )
-    signed_height = np.where(land, elevation, -bathymetry).astype(np.float32)
-    continent_id = _continent_owners(
+    continent_id = _continent_owners(land, recipe.continent_count)
+    coastal_surface_validation = validate_coastal_surface(
         land,
-        relative_m,
-        recipe.continent_count,
-        stage_seeds["crust"],
+        elevation,
+        boundary_class,
+        np.degrees(latitude[:, 0]),
     )
 
     analysis_land = _resize_nearest(
@@ -3846,6 +4324,9 @@ def generate_planet_surface(recipe: PlanetRecipe) -> ProceduralSurface:
         "effectivePlateCount": int(len(np.unique(plate_id))),
         "continentCount": recipe.continent_count,
         "seaLevelMeters": sea_level_m,
+        "relativeElevationUnits": "model-metres-above-sea-level",
+        "elevationScaleMeters": land_scale,
+        "elevationExponent": 1.06,
         "mapSeam": {
             "sourceColumn": seam_column,
             "sourceLongitudeDegrees": (
@@ -3878,8 +4359,11 @@ def generate_planet_surface(recipe: PlanetRecipe) -> ProceduralSurface:
         "crustPotentialRange": [float(np.min(crust_potential)), float(np.max(crust_potential))],
         "crustStructureMetrics": dict(crust_structure_metrics),
         "reliefDiagnostics": dict(relief_diagnostics),
+        "largeLakePolicy": dict(large_lake_diagnostics),
         "fullResolutionRelief": dict(detail_diagnostics),
         "coastalEvolution": dict(coast_evolution),
+        "coastalTransgression": dict(coastal_transgression_diagnostics),
+        "coastalSurfaceValidation": dict(coastal_surface_validation),
         "geomorphicEvolution": dict(geomorphic_evolution),
         "hillslopeEvolution": dict(hillslope_diagnostics),
         "morphologyAxes": vars_from_slots(morphology),
@@ -3907,7 +4391,7 @@ def generate_planet_surface(recipe: PlanetRecipe) -> ProceduralSurface:
         land_mask=land,
         elevation=elevation,
         bathymetry=bathymetry,
-        signed_height=signed_height,
+        relative_elevation_m=relative_m,
         diagnostics=diagnostics,
     )
 
@@ -3978,7 +4462,7 @@ def save_surface_bundle(surface: ProceduralSurface, path: str | Path) -> Path:
                 land_mask=surface.land_mask,
                 elevation=surface.elevation,
                 bathymetry=surface.bathymetry,
-                signed_height=surface.signed_height,
+                relative_elevation_m=surface.relative_elevation_m,
                 diagnostics_utf8=np.frombuffer(diagnostics, dtype=np.uint8),
             )
         temporary.replace(output)
@@ -4004,7 +4488,7 @@ def load_surface_bundle(path: str | Path) -> ProceduralSurface:
             "land_mask",
             "elevation",
             "bathymetry",
-            "signed_height",
+            "relative_elevation_m",
             "diagnostics_utf8",
         }
         if set(archive.files) != expected:
@@ -4027,7 +4511,7 @@ def load_surface_bundle(path: str | Path) -> ProceduralSurface:
             land_mask=archive["land_mask"],
             elevation=archive["elevation"],
             bathymetry=archive["bathymetry"],
-            signed_height=archive["signed_height"],
+            relative_elevation_m=archive["relative_elevation_m"],
             diagnostics=diagnostics,
         )
 

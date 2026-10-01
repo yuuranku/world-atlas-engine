@@ -10,15 +10,17 @@ import shutil
 import time
 
 from world_atlas.inputs import attach_world_metadata
-from world_atlas.core.baseline import load_baseline
+from world_atlas.core.baseline import compute_input_fingerprint, load_baseline
+from world_atlas.core.config import load_world_config
 from world_atlas.core.model import WorldGrid
-from world_atlas.core.procedural_planet import PlanetRecipe
+from world_atlas.core.procedural_planet import PlanetRecipe, load_surface_bundle
 from world_atlas.core.render import render_review, _society_generation_request
 from world_atlas.core.thematic import derive_thematic_layers
+from world_atlas.core.ecological_sources import derive_ecological_sources
 from world_atlas.core.society.pipeline import derive_society_layers
 from world_atlas.core.society.storage import load_society, save_society
 from world_atlas.core.society.world_identity import collect_proper_names, naming_audit
-from world_atlas.settings import WorldSettings
+from world_atlas.settings import WorldSettings, load_world_settings
 from world_atlas.timing import elapsed_seconds, measure_stage
 from world_atlas import __version__
 
@@ -47,6 +49,7 @@ def prepare_regeneration(
     bundle = (config_path.parent / field_record["path"]).resolve()
     if sha256(bundle) != field_record["sha256"].upper():
         raise ValueError("accepted physical field hash mismatch")
+    load_surface_bundle(bundle)
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     forbidden = {"埃瑞诺", "中洛", "中洛天", "米斯拉"}
     inventory = []
@@ -59,6 +62,9 @@ def prepare_regeneration(
     shutil.copy2(source, output / "source/physical-reference.png")
     shutil.copy2(bundle, output / "source/physical-fields.npz")
     shutil.copy2(provenance_path, output / "source/provenance.json")
+    source_checkpoint = bundle.parent / "physical-grid"
+    if source_checkpoint.is_dir():
+        shutil.copytree(source_checkpoint, output / "source/physical-grid")
     config["source"]["path"] = "source/physical-reference.png"
     config["source"]["fieldBundle"]["path"] = "source/physical-fields.npz"
     config["output"]["directory"] = "."
@@ -72,6 +78,36 @@ def prepare_regeneration(
         "forbidden": tuple(sorted(forbidden)),
         "settings": settings,
     }
+
+
+def _load_verified_physical_checkpoint(config_path: Path, checkpoint: Path) -> WorldGrid | None:
+    """Load a terrain-owned grid only when every physical input still agrees.
+
+    The cache is deliberately not a broad memoization layer: its fingerprint
+    includes the source bytes, surface bundle, normalized physical settings,
+    importer identity, and cell-truth source digest. A missing, malformed, or
+    stale checkpoint simply yields ``None`` and forces the canonical rebuild.
+    """
+
+    manifest_path = checkpoint / "checkpoint.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema") != "world-atlas-physical-checkpoint-v1":
+            return None
+        grid = WorldGrid.load(checkpoint)
+        config = load_world_config(config_path)
+        fingerprint = compute_input_fingerprint(config.source.path, config)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if (
+        manifest.get("inputFingerprint") != fingerprint
+        or grid.metadata.get("inputFingerprint") != fingerprint
+        or manifest.get("gridDigest") != grid.content_digest()
+    ):
+        return None
+    return grid
 
 
 def write_json(path: Path, document: dict) -> None:
@@ -105,11 +141,28 @@ def build_accepted_world(
         "fieldSha256": sha256(output / "source/physical-fields.npz"),
         "settingsSha256": sha256(output / "world-settings.json")})
     print(f"Accepted terrain verified; {len(prepared['forbidden'])} old names excluded. Building climate and hydrology.", flush=True)
+    checkpoint = output / "source/physical-grid"
     with measure_stage(output, "climate-hydrology"):
-        grid = attach_world_metadata(load_baseline(prepared["config"]), recipe, provenance,
+        physical_grid = _load_verified_physical_checkpoint(prepared["config"], checkpoint)
+        checkpoint_state = "hit" if physical_grid is not None else "miss"
+        if physical_grid is None:
+            physical_grid = load_baseline(prepared["config"])
+            physical_grid.save(checkpoint)
+            write_json(checkpoint / "checkpoint.json", {
+                "schema": "world-atlas-physical-checkpoint-v1",
+                "inputFingerprint": physical_grid.metadata["inputFingerprint"],
+                "gridDigest": physical_grid.content_digest(),
+            })
+        grid = attach_world_metadata(physical_grid, recipe, provenance,
             bundle_path=output / "source/physical-fields.npz", bundle_sha256=sha256(output / "source/physical-fields.npz"),
             settings=settings, forbidden_names=prepared["forbidden"])
         grid.save(output / "grid")
+    record = json.loads((output / "regeneration.json").read_text(encoding="utf-8"))
+    record["physicalCheckpoint"] = {
+        "state": checkpoint_state,
+        "source": "source/physical-grid",
+    }
+    write_json(output / "regeneration.json", record)
     print(f"Physical grid saved ({time.monotonic() - started:.0f}s). Building society and review layers.", flush=True)
     return publish_accepted_world(output, started=started)
 
@@ -140,8 +193,12 @@ def publish_accepted_world(output: Path, *, started: float | None = None) -> dic
     ):
         raise ValueError("human generation contract changed after the physical checkpoint")
     name_source, generation_request = _society_generation_request(grid)
+    raw_source = load_surface_bundle(output / "source/physical-fields.npz")
     with measure_stage(output, "society"):
-        society = derive_society_layers(grid, derive_thematic_layers(grid), name_source, **generation_request)
+        society = derive_society_layers(grid, derive_thematic_layers(grid,
+                                        ecological_sources=derive_ecological_sources(grid, raw_source)), name_source,
+                                        raw_elevation_m=raw_source.relative_elevation_m,
+                                        **generation_request)
         save_society(society, output / "society", grid_digest=grid.content_digest())
     logging.info("Society checkpoint saved; rendering all map views")
     return finish_accepted_world(output, started=started)
@@ -157,14 +214,21 @@ def finish_accepted_world(output: Path, *, started: float | None = None) -> dict
     if record["status"] != "building":
         raise ValueError("only an unfinished build can be published")
     grid = WorldGrid.load(output / "grid")
+    bundle_path = output / "source/physical-fields.npz"
+    if sha256(bundle_path) != record["fieldSha256"]:
+        raise ValueError("accepted physical source changed before rendering")
+    physical_source = load_surface_bundle(bundle_path)
     society = load_society(output / "society", expected_grid_digest=grid.content_digest())
     forbidden = grid.metadata["societyGeneration"]["forbiddenNames"]
     with measure_stage(output, "render"):
-        render_review(grid, output / "review", society=society)
+        settings = load_world_settings(output/'world-settings.json')
+        render_review(grid, output / "review", society=society, physical_source=physical_source,
+                      travel_capabilities=settings.travel_capabilities)
     society = load_society(output / "review", expected_grid_digest=grid.content_digest())
     audit = naming_audit(society, forbidden)
     write_json(output / "review/naming-audit.json", audit)
-    record = {"schema": "accepted-world-v2", "status": "complete", "worldName": grid.metadata["worldProfile"]["name"],
+    record = {**record, "schema": "accepted-world-v2", "status": "complete", "worldName": grid.metadata["worldProfile"]["name"],
+        "physicalCheckpoint": record.get("physicalCheckpoint"),
         "engineVersion": __version__,
         "humanSeed": record["humanSeed"], "namingSeed": record["namingSeed"],
         "terrainSeed": record["terrainSeed"], "gridDigest": grid.content_digest(),
