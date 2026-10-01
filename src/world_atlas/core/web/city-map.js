@@ -229,7 +229,7 @@
         if(house.every(dry)&&Math.max(...heights)-Math.min(...heights)<4){
           group.append(svg('path',{d:path(house)+'Z',fill:palette[i%palette.length],stroke:'#4e5a4b','stroke-width':.6,'vector-effect':'non-scaling-stroke',class:'city-harbor-warehouse'}));
           group.append(svg('path',{d:path([at(x,y-.041),at(x,y-.037-h)]),stroke:'#e4d8b8','stroke-width':.55,'vector-effect':'non-scaling-stroke'}));
-          group.append(svg('path',{d:path([at(x,y-.039),at(x,y-.014)]),stroke:'#e8dfc8','stroke-width':.0035/factor,'stroke-linecap':'round'}));
+          group.append(svg('path',{d:path([at(x,y-.039),at(x,y-.014)]),stroke:'#e8dfc8','stroke-width':.0035/((m.row+m.column)/2),'stroke-linecap':'round'}));
         }
       }
       if(harbor.kind==='sea'&&!small&&harbor.shelter<.78&&berths.length>1){
