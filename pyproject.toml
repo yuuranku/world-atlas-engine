@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "world-atlas-engine"
-version = "1.4.0.dev8"
+version = "1.4.0.dev9"
 description = "Deterministic tectonic terrain and human-world atlas generation"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"

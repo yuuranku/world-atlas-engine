@@ -643,9 +643,11 @@ def _refined_branch_paths(field,level,lower,upper,ports,bounds=None):
     if bounds is None:bounds=field_range_gradient_bounds
 
     starts,ends,branch_low,branch_high,branch_axes,branch_directions=[],[],[],[],[],[]
-    last_records=[]
-    for depth in range(40):
-        if not len(lower):break
+    terminal_paths=[]
+    depth=0
+    # Certification controls termination; a native interval can require more
+    # than forty subdivisions before its conservative range excludes a level.
+    while len(lower):
         value_low,value_high,gradient_low,gradient_high=bounds(field,lower,upper)
         active=(value_low<=level)&(value_high>=level)&(value_low!=value_high)
         lower,upper,gradient_low,gradient_high=(a[active]for a in
@@ -671,7 +673,19 @@ def _refined_branch_paths(field,level,lower,upper,ports,bounds=None):
             excluded=(elo>level)|(ehi<level)
             edge_ok[ids]=np.all((edge_monotone|excluded).reshape(-1,4),axis=1)
         regular=edge_ok & np.any(monotone,axis=1) & ((count==0)|(count==2))
-        diagonal_ids=np.flatnonzero(~np.any(monotone,axis=1))
+        midpoint=lower+(upper-lower)*.5
+        splittable=(midpoint>lower)&(midpoint<upper)
+        # Adjacent binary64 coordinates have no queryable interior. Their
+        # four values and shared edge roots exhaust the represented cell;
+        # interval rounding can otherwise keep it active indefinitely.
+        terminal=~np.any(splittable,axis=1)
+        regular|=terminal & (count==0)
+        for identifier in np.flatnonzero(terminal & (count==2)):
+            edges=np.flatnonzero(crossing[identifier])
+            points=ports.solve(corners[identifier,edges],corners[identifier,(edges+1)%4])
+            if not np.array_equal(points[0],points[1]):terminal_paths.append(points)
+            regular[identifier]=True
+        diagonal_ids=np.flatnonzero(~regular & ~np.any(monotone,axis=1))
         if len(diagonal_ids):
             dlo,dhi=directional_bounds(field,lower[diagonal_ids],upper[diagonal_ids],
                                       np.array(((1.,1.),(1.,-1.))))
@@ -719,7 +733,7 @@ def _refined_branch_paths(field,level,lower,upper,ports,bounds=None):
                         branch_low.append(lower[identifier]);branch_high.append(upper[identifier]);branch_axes.append(2)
                         branch_directions.append(direction)
                         regular[identifier]=True
-        accepted=np.flatnonzero(regular & (count==2) & np.any(monotone,axis=1))
+        accepted=np.flatnonzero(regular & ~terminal & (count==2) & np.any(monotone,axis=1))
         if len(accepted):
             first,last=[],[]
             for identifier in accepted:
@@ -744,31 +758,34 @@ def _refined_branch_paths(field,level,lower,upper,ports,bounds=None):
                 branch_low.append(lower[identifier]);branch_high.append(upper[identifier]);branch_axes.append(axis)
                 branch_directions.append(_CHART_DIRECTIONS[axis])
         unresolved=~regular
-        if depth==39:
-            for identifier in np.flatnonzero(unresolved)[:3]:
-                last_records.append({'box':[lower[identifier].tolist(),upper[identifier].tolist()],
-                                     'range':[float(value_low[active][identifier]),float(value_high[active][identifier])],
-                                     'gradient':[gradient_low[identifier].tolist(),gradient_high[identifier].tolist()],
-                                     'values':values[identifier].tolist(),'crossings':int(count[identifier]),
-                                     'monotone':monotone[identifier].tolist(),'edgeOK':bool(edge_ok[identifier])})
-        lower,upper,monotone=lower[unresolved],upper[unresolved],monotone[unresolved]
+        lower,upper,monotone,splittable=(a[unresolved]for a in(lower,upper,monotone,splittable))
         if not len(lower):break
-        middle=(lower+upper)*.5
-        if np.any(middle==lower)or np.any(middle==upper):
-            raise ValueError(f"physical contour unresolved at binary64 critical cell, level={level}")
+        middle=lower+(upper-lower)*.5
+        if np.any(~np.any(splittable,axis=1)):
+            ids=np.flatnonzero(~np.any(splittable,axis=1))[:3]
+            vlo,vhi,glo,ghi=bounds(field,lower[ids],upper[ids])
+            points=_corner_points(lower[ids],upper[ids])
+            raise ValueError(f"physical contour unresolved at binary64 critical cell, level={level}, "
+                             f"depth={depth},boxes={list(zip(lower[ids].tolist(),upper[ids].tolist()))}, "
+                             f"ranges={[vlo.tolist(),vhi.tolist()]},gradient={[glo.tolist(),ghi.tolist()]}, "
+                             f"values={field.sample_points(points[:,:,0],points[:,:,1]).tolist()}")
         child_low,child_high=[],[]
         # Retain a proven root bracket. Splitting its solved coordinate adds
         # artificial boundaries arbitrarily close to a real model corner.
         # Refine only the independent parameter when one chart is certified.
         one_axis=np.sum(monotone,axis=1)==1
+        split=splittable & ~monotone
+        split[~one_axis]=splittable[~one_axis]
+        if np.any(~np.any(split,axis=1)):
+            raise ValueError(f"physical contour parameter unresolved at binary64, level={level}")
         for solved_axis in (0,1):
-            ids=np.flatnonzero(one_axis & monotone[:,solved_axis])
+            ids=np.flatnonzero(~split[:,solved_axis] & split[:,1-solved_axis])
             if not len(ids):continue
             axis=1-solved_axis
             first_high,last_low=upper[ids].copy(),lower[ids].copy()
             first_high[:,axis],last_low[:,axis]=middle[ids,axis],middle[ids,axis]
             child_low.extend((lower[ids],last_low));child_high.extend((first_high,upper[ids]))
-        ids=np.flatnonzero(~one_axis)
+        ids=np.flatnonzero(np.all(split,axis=1))
         if len(ids):
             a,b,m=lower[ids],upper[ids],middle[ids]
             child_low.extend((a,np.column_stack((m[:,0],a[:,1])),m,np.column_stack((a[:,0],m[:,1]))))
@@ -777,15 +794,8 @@ def _refined_branch_paths(field,level,lower,upper,ports,bounds=None):
         if len(lower)>1000000:
             raise ValueError(f"physical contour critical-cell isolation did not contract inside native batch, "
                              f"level={level},depth={depth},first={lower[0].tolist()}")
-    else:
-        diagnostic_low,diagnostic_high=lower[:3],upper[:3]
-        vlo,vhi,glo,ghi=bounds(field,diagnostic_low,diagnostic_high)
-        corner=_corner_points(diagnostic_low,diagnostic_high)
-        raise ValueError(f"physical contour critical-cell isolation must converge, level={level}, "
-                         f"parents={last_records},pendingChildren={len(lower)},boxes={list(zip(diagnostic_low.tolist(),diagnostic_high.tolist()))}, "
-                         f"ranges={[vlo.tolist(),vhi.tolist()]},gradient={[glo.tolist(),ghi.tolist()]}, "
-                         f"values={field.sample_points(corner[:,:,0],corner[:,:,1]).tolist()}")
-    if not starts:return []
+        depth+=1
+    if not starts:return terminal_paths
     starts,ends,branch_low,branch_high=(np.asarray(a)for a in(starts,ends,branch_low,branch_high))
     axes=np.asarray(branch_axes)
     directions=np.asarray(branch_directions)
@@ -813,7 +823,7 @@ def _refined_branch_paths(field,level,lower,upper,ports,bounds=None):
             points[ids]=_direction_sections(field,level,points[ids],branch_low[selected],
                                             branch_high[selected],directions[selected])
         return points.reshape(-1,3,2)
-    return adaptive_curve_paths(starts,ends,sections)
+    return terminal_paths+adaptive_curve_paths(starts,ends,sections)
 
 
 def _refined_curves(field,levels,lower,upper,coarse_low,coarse_high):
