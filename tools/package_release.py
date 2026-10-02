@@ -55,7 +55,7 @@ def seal(root: Path) -> dict:
     skill_zip = dist / 'generate-world-atlas-skill.zip'
     write_zip(skill_zip, {'generate-world-atlas/'+p.relative_to(skill).as_posix(): p for p in content_files(skill)})
     entries = {}
-    for folder in ('src/world_atlas', 'tests', 'tools', 'docs', 'skills', '.github'):
+    for folder in ('src/world_atlas', 'tests', 'scripts', 'tools', 'docs', 'skills', '.github'):
         for path in content_files(root/folder):
             entries[path.relative_to(root).as_posix()] = path
     for name in ('pyproject.toml', 'MANIFEST.in', 'README.md', '.gitignore', '.gitattributes',
