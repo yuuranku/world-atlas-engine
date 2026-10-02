@@ -3088,7 +3088,7 @@ def _write_map_previews(output: Path, grid: WorldGrid, thematic: ThematicLayers,
         "population": np.where(density > 0, np.digitize(density, POPULATION_DENSITY_THRESHOLDS), 0).astype(np.uint8),
         "civilizations": _civilization_display_values(grid, thematic, society),
         "languages": society.cultures.language_id,
-        "religions": society.religions.religion_id,
+        "religions": _religion_display_values(society),
         "political": society.politics.state_id,
         "provinces": society.provinces.province_id,
     }

@@ -2,16 +2,16 @@
 
 从板块、海陆与连续地形，到水系、城市、交通、文化、宗教、国家和省份的可复现世界生成器。计算代码与 AI 工作流分离：引擎离线计算，skill 负责先问 17 个世界设定问题、解释参数、参考研究和看图验收。
 
-当前版本 **1.4.0.dev12** 为开发预发布，增加按需城市地图、多文化宫城、屋顶材料色差、真实岸线港区、局部蓄水湖与支流合流，以及道路、建筑和城防的统一避让。保留大陆连通修复、柯本气候、文明命名、交通依据的政区边界、坡度约束道路和离线 Three.js 球体。城市改动及验证边界见[城市精细化](docs/city-refinement-v101.md)；上一稳定版本是 [1.3.0](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.3.0)。
+当前版本 **1.4.0.dev13** 为开发预发布，增加按需城市地图、多文化宫城、屋顶材料色差、真实岸线港区、局部蓄水湖与支流合流，以及道路、建筑和城防的统一避让。保留大陆连通修复、柯本气候、文明命名、交通依据的政区边界、坡度约束道路和离线 Three.js 球体。城市改动及验证边界见[城市精细化](docs/city-refinement-v101.md)；上一稳定版本是 [1.3.0](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.3.0)。
 
 ![v38 引擎实际生成的地形底图](docs/images/v38-terrain.png)
 
 ## 下载与开始
 
-- [下载 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev12/generate-world-atlas-skill.zip)：内含问卷、规则、下载与安装脚本。
-- [下载计算 wheel](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev12/world_atlas_engine-1.4.0.dev12-py3-none-any.whl)：供 Python/CLI 直接调用。
-- [下载独立源码包](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev12/world-atlas-engine-1.4.0.dev12-source.zip)。
-- [全部附件与 SHA-256 清单](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.4.0.dev12)。
+- [下载 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev13/generate-world-atlas-skill.zip)：内含问卷、规则、下载与安装脚本。
+- [下载计算 wheel](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev13/world_atlas_engine-1.4.0.dev13-py3-none-any.whl)：供 Python/CLI 直接调用。
+- [下载独立源码包](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev13/world-atlas-engine-1.4.0.dev13-source.zip)。
+- [全部附件与 SHA-256 清单](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.4.0.dev13)。
 
 ### 使用 skill
 
@@ -30,7 +30,7 @@ python scripts/install_engine.py --target ./atlas-runtime
 
 安装器仅创建本地虚拟环境和 renderer，不修改系统 Python/npm。输出 `atlas-runtime/runtime.json`，包含可直接调用的 Python 与 Mapshaper 绝对路径。已有环境沿用并运行 `doctor` 检查；不要对同一个目录重复安装。
 
-包按固定 tag + SHA-256 下载，不追踪 `latest`。成功下载缓存在 `.world-atlas-downloads/1.4.0.dev12`；使用前再次校验。网络中断、文件截断或哈希不符会停止，未经验证的 wheel 不会安装。缓存需支持硬链接的本地文件系统（已测 NTFS）。已安装成功的环境可离线计算；缓存 wheel 不等于缓存了全部第三方依赖。
+包按固定 tag + SHA-256 下载，不追踪 `latest`。成功下载缓存在 `.world-atlas-downloads/1.4.0.dev13`；使用前再次校验。网络中断、文件截断或哈希不符会停止，未经验证的 wheel 不会安装。缓存需支持硬链接的本地文件系统（已测 NTFS）。已安装成功的环境可离线计算；缓存 wheel 不等于缓存了全部第三方依赖。
 
 ### 直接使用计算包
 
