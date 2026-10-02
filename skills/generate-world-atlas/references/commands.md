@@ -10,11 +10,11 @@
 
 `--check-only` 只检查本地清单，不联网也不创建运行目录。仅下载计算包：`python scripts/download_engine.py --cache <缓存目录>`。历史 v5 输入与其匹配引擎留在 1.1.0 Release，不混入新版安装流程。
 
-安装版本由资产清单 `engineVersion` 决定。1.2.1 配方必须明确两个极地选择，完整世界必须提供世界设置；复现历史世界使用其原版引擎。新版不自动迁移或猜测缺失参数。
+安装版本由资产清单 `engineVersion` 决定。配方必须明确两个极地选择；完整世界必须提供严格 v3 世界设置，包含 `technologyEra` 和 `travelCapabilities`。普通世界的额外交通能力填 `[]`；只有玩家世界观支持时才声明飞行能力。复现历史世界使用其原版引擎，新版不自动迁移或猜测缺失参数。
 
 首次安装需要已有 Python 3.14、Node.js/npm 和网络；运行阶段离线，不需 API key。Mapshaper 0.7.56 是完整地图共享边界的实际依赖，不能漏列。
 
-分享 [完整轻量 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.2.1/generate-world-atlas-skill.zip)，不能只发 SKILL.md。安装到宿主 skills 目录后重新加载技能；首次新世界仍先问 17 题，确认有效参数后才自动下载。源代码和单独 wheel 见 [版本下载页](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.2.1)。不要使用原作者的盘符路径。`--target` 必须是全新目录，安装后使用返回的解释器/Mapshaper 路径。仅安装计算 wheel 时，地形模式只需 Python 及 wheel 声明的库；完整人文地图另需锁定的 Node/Mapshaper。
+分享 [完整轻量 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev3/generate-world-atlas-skill.zip)，不能只发 SKILL.md。这是开发预发布。安装到宿主 skills 目录后重新加载技能；首次新世界仍先问 17 题，确认有效参数后才自动下载。源代码和单独 wheel 见 [版本下载页](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.4.0.dev3)。不要使用原作者的盘符路径。`--target` 必须是全新目录，安装后使用返回的解释器/Mapshaper 路径。仅安装计算 wheel 时，地形模式只需 Python 及 wheel 声明的库；完整人文地图另需锁定的 Node/Mapshaper。
 
 ## 入口
 
@@ -35,7 +35,7 @@ python -m world_atlas verify <完整世界目录>
 
 `world` 重算物理网格和人文，保存 source、grid、society、review、命名及语义检查。`verify` 写检查报告，不修改计算数组。
 
-`reproduce` 固定地形，重建后续链路并比较三项语义指纹；这不代表“所有新种子均已验证”。
+`reproduce` 固定地形，重建后续链路并比较四项语义指纹：物理数组、人文数组、人文实体及导航网络；这不代表“所有新种子均已验证”。
 
 新地形配方参考 `assets/terrain.json`，人文设置参考 `assets/world-settings.json`，两个极地布尔字段必填。历史 v38 用固定 1.1.0 引擎与 `terrain-v38.json` 复现，并对照原 `terrain-v38.acceptance.json`，不能用新版改写旧指纹。
 

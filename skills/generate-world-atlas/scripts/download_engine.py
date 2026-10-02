@@ -33,8 +33,8 @@ def open_download(url):
 def load_release(assets):
     record = json.loads((assets / 'release.json').read_text(encoding='utf-8'))
     version = record['engineVersion']
-    if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
-        raise ValueError('release must pin a numeric engine version, never latest')
+    if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:\.dev[0-9]+)?', version):
+        raise ValueError('release must pin an exact engine version, never latest')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', record['repository']):
         raise ValueError('invalid GitHub repository')
     if not record['assets']:

@@ -53,6 +53,16 @@ class DownloadTests(unittest.TestCase):
                 self.fetch()
         self.assertEqual(list(self.cache.rglob('*')), [])
 
+    def test_pinned_development_release_uses_its_exact_version(self):
+        self.name = 'world_atlas_engine-1.4.0.dev3-py3-none-any.whl'
+        self.manifest['engineVersion'] = '1.4.0.dev3'
+        self.manifest['assets']['engine']['name'] = self.name
+        self.save()
+        with patch.object(self.module, 'open_download', return_value=Response(self.payload)) as request:
+            result = self.fetch()
+        self.assertEqual(result.read_bytes(), self.payload)
+        request.assert_called_once_with('https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev3/' + self.name)
+
     def test_truncated_download_never_promoted(self):
         with patch.object(self.module, 'open_download', return_value=Response(b'short')):
             with self.assertRaisesRegex(ValueError, 'size'):
