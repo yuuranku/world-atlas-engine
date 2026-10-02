@@ -252,13 +252,14 @@ def _province_transition_penalties(
 
     elevation = np.asarray(grid.elevation, dtype=np.float64)
     river_order = np.asarray(grid.river_order)
+    land = grid.water == 0
     roads = np.asarray(road_corridor, dtype=np.float64)
     if roads.shape != grid.shape:
         raise ValueError("province road corridors must match the WorldGrid shape")
     physical = physical_transition_penalties(
         elevation,
         river_order,
-        land_mask=grid.water == 0,
+        land_mask=land,
     )
     terrain_scale = 4.05
     river_scale = 3.10
@@ -290,6 +291,8 @@ def _province_transition_penalties(
             1.0 - 0.10 * crossing_road,
             1.0 - 0.15 * crossing_road,
         )
+        target_land = np.roll(land, shift=shift, axis=(0, 1))
+        penalties[direction, ~(land & target_land)] = 0.0
         if dy < 0:
             penalties[direction, 0, :] = 0.0
         elif dy > 0:
