@@ -51,6 +51,25 @@ def line_geometry(data):
 
 
 class CartographicTilesTests(unittest.TestCase):
+    def test_smaller_requests_preserve_exact_curved_river_and_terrain_geometry(self):
+        land=shapely.box(0,0,32,32)
+        river=shapely.Polygon([(1,14.2),(9,13.7),(16,14.3),(24,15.5),(31,14.8),
+                               (31,15.8),(24,15.9),(16,15.1),(9,14.2),(1,14.4)])
+        terrain=shapely.Polygon([(2,2),(16,3),(30,2),(30,16),(29,30),(16,29),(2,30),(3,16)])
+        features=[TileFeature(river,{'fill':'#8ebdcc'},'rivers'),
+                  TileFeature(terrain,{'fill':'#b7c19b'},'theme-fill','vegetation','theme')]
+        with tempfile.TemporaryDirectory() as target:
+            manifest=write_atlas_tiles(target,32,32,[TileLevel('detail',64,land,features)],tile_size=16)
+            self.assertEqual(manifest['tileSize'],16)
+            self.assertEqual(manifest['stats']['totalTiles'],4)
+            water,faces=[],[]
+            for file in (Path(target)/'tiles/detail').glob('*.json'):
+                payload=json.loads(file.read_text(encoding='utf8'))
+                water.extend(coverage.path_geometry(node.get('d')) for node in document(payload['ink']).iter('path'))
+                faces.extend(coverage.path_geometry(node.get('d')) for node in document(payload['themes']['vegetation']).iter('path'))
+            self.assertLess(shapely.union_all(water).symmetric_difference(river).area,1e-10)
+            self.assertLess(shapely.union_all(faces).symmetric_difference(terrain).area,1e-10)
+
     def test_face_touching_tile_emits_neither_paint_nor_orphan_definition(self):
         pattern='<pattern id="wet" width="8" height="8" patternUnits="userSpaceOnUse"><path d="M0,0h1"/></pattern>'
         feature=TileFeature(shapely.box(31,1,32,2),{"fill":"url(#wet)","clip":"land"},

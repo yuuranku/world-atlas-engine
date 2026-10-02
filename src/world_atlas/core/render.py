@@ -4794,10 +4794,12 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
         raise WorldGridRenderError(f"overview SVG byte budget exceeded: {oversized_overviews}")
     if sum(overview_bytes.values()) > _MAX_THEMATIC_SVG_TOTAL_BYTES:
         raise WorldGridRenderError(f"combined overview SVG byte budget exceeded: {sum(overview_bytes.values())}")
-    manifest = write_atlas_tiles(output_dir, grid.shape[1], grid.shape[0], tile_levels)
+    # Detailed scalar faces and physical channels share each block. Keep the
+    # request footprint small without simplifying any delivered geometry.
+    manifest = write_atlas_tiles(output_dir, grid.shape[1], grid.shape[0], tile_levels, tile_size=16)
     city_relief = derive_city_relief(grid, terrain_field, society.settlements,
         _elevation_thresholds(grid),
-        settlement_locations=city_locations)
+        settlement_locations=city_locations,tile_size=manifest['tileSize'])
     (output_dir / "city-contours.json").write_text(json.dumps({
         "schema": "accepted-physical-minor-curves-v1",
         "coordinateSpace": "native-cell",
