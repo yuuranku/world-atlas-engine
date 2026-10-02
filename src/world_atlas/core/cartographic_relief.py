@@ -4,7 +4,32 @@ import numpy as np
 import shapely
 
 from .implicit_curves import level_bands, polygon_path
-from .implicit_terrain import terrain_level_curves
+from .implicit_terrain import _ROOT_TOLERANCES, terrain_level_curves
+
+
+def _closed_relief_curves(field, curves):
+    """Close interior loops within the source solver's coordinate accuracy.
+
+    The stored roots remain intact. A final segment bridges roundoff between
+    the first and last root, and belongs to both the fill and its ink graph.
+    Open curves on the map frame and gaps beyond root accuracy stay open so
+    the shared-coverage validation still rejects real topology errors.
+    """
+    encoded=[]
+    frame=np.array((field.width,field.height),dtype=float)
+    for paths in curves:
+        rings=[]
+        for chain in paths:
+            ends=chain[[0,-1]]
+            on_frame=np.any((ends==0)|(ends==frame))
+            tolerance=(_ROOT_TOLERANCES['xatol']+
+                       _ROOT_TOLERANCES['xrtol']*np.max(abs(ends),axis=0))
+            if (len(chain)>2 and not on_frame and np.any(ends[0]!=ends[1])
+                    and np.all(abs(ends[0]-ends[1])<=tolerance)):
+                chain=np.vstack((chain,chain[0]))
+            rings.append(chain)
+        encoded.append(rings)
+    return encoded
 
 
 def physical_relief_paths(terrain_field, palette_levels, *, checkpoint_directory=None,
@@ -25,6 +50,7 @@ def physical_relief_paths(terrain_field, palette_levels, *, checkpoint_directory
         from .physical_contour_stage import staged_height_curves
         curves = staged_height_curves(terrain_field, thresholds, checkpoint_directory,
                                      source_identity=source_identity)
+    curves = _closed_relief_curves(terrain_field, curves)
     regions = level_bands(terrain_field, thresholds, curves)
     higher = shapely.GeometryCollection()
     for index in range(len(positive)-1, -1, -1):
