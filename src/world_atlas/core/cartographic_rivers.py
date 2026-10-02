@@ -145,25 +145,27 @@ def river_channel_surface(
     latitude = np.clip(latitude, -math.pi / 2 + latitude_step / 2, math.pi / 2 - latitude_step / 2)
     x_metres = radius * longitude_step * np.cos(latitude)
     y_metres = radius * latitude_step
-    tangent = np.gradient(curve, axis=0)
-    tangent[:, 0] *= x_metres
+    # Sweep each segment separately. A single ring using averaged vertex
+    # tangents can fold across itself at a tight turn and cut the flow line
+    # out of its own water surface when made valid.
+    tangent = np.diff(curve, axis=0)
+    tangent[:, 0] *= (x_metres[:-1] + x_metres[1:]) / 2
     tangent[:, 1] *= y_metres
     length = np.linalg.norm(tangent, axis=1)
     if np.any(length <= 0):
-        raise ValueError("river display curves cannot reverse exactly at a point")
+        raise ValueError("river display segments must have positive ground length")
     normal = np.column_stack((-tangent[:, 1], tangent[:, 0])) / length[:, None]
-    offset = normal * widths[:, None] / 2
-    offset[:, 0] /= x_metres
-    offset[:, 1] /= y_metres
-    strip = shapely.Polygon(np.vstack((curve + offset, (curve - offset)[::-1])))
+    first_offset = normal * widths[:-1, None] / 2
+    last_offset = normal * widths[1:, None] / 2
+    first_offset[:, 0] /= x_metres[:-1]
+    last_offset[:, 0] /= x_metres[1:]
+    first_offset[:, 1] /= y_metres
+    last_offset[:, 1] /= y_metres
+    strips = shapely.polygons(np.stack((curve[:-1] + first_offset,
+        curve[1:] + last_offset, curve[1:] - last_offset,
+        curve[:-1] - first_offset), axis=1))
     angles = np.linspace(0.0, math.tau, 24, endpoint=False)
     unit_cap = np.column_stack((np.cos(angles), np.sin(angles)))
-    caps = [
-        shapely.Polygon(curve[index] + unit_cap * (
-            widths[index] / (2 * x_metres[index]), widths[index] / (2 * y_metres),
-        ))
-        for index in (0, -1)
-    ]
-    if not shapely.is_valid(strip):
-        strip = shapely.make_valid(strip)
-    return shapely.union_all((strip, *caps))
+    radii = np.column_stack((widths / (2 * x_metres), widths / (2 * y_metres)))
+    joints = shapely.polygons(curve[:, None, :] + unit_cap * radii[:, None, :])
+    return shapely.union_all(np.concatenate((strips, joints)))

@@ -25,6 +25,18 @@ def grid_fixture(shape, *, extents=None):
 
 
 class CartographicRiverTests(unittest.TestCase):
+    def test_tight_mouth_turn_keeps_the_whole_flow_line_inside_its_channel(self):
+        grid = grid_fixture((1088, 2176))
+        curve = np.array(((1209.25, 347.), (1209.5, 346.75),
+                          (1209.4607715674263, 346.50949646102475),
+                          (1209.4512751064015, 346.5487248935985)))
+        widths = np.array((198.432354470414, 207.0859240909136,
+                           215.73949371141322, 215.73949371141322))
+        channel = river_channel_surface(grid, curve, widths)
+        self.assertTrue(shapely.is_valid(channel))
+        self.assertEqual(shapely.LineString(curve).difference(channel).length, 0.)
+        self.assertTrue(channel.contains(shapely.Point(curve[-2])))
+
     def test_same_drainage_area_retains_width_when_the_grid_is_refined(self):
         outlet_widths = []
         for shape in ((4, 8), (8, 16)):
