@@ -7,9 +7,11 @@ import shapely
 from dataclasses import replace
 
 
-def derive_harbors(grid, society, locations, terrain_field, *, road_surface):
+def derive_harbors(grid, society, locations, terrain_field, *, road_surface, land_surface):
     """Choose a shore reachable from the city on the shared dry road surface."""
     shapely.prepare(road_surface)
+    sailing_obstacle=land_surface.buffer(1e-6)
+    shapely.prepare(sailing_obstacle)
     result = {}
     for city in society.settlements:
         if city.site_type not in {'port', 'island-port', 'lake-port'}:
@@ -48,6 +50,8 @@ def derive_harbors(grid, society, locations, terrain_field, *, road_surface):
         landings=origin+direction_many*np.maximum(0.,low_many-.07)[:,None]
         approaches=shapely.linestrings(np.stack((np.broadcast_to(origin,landings.shape),landings),axis=1))
         reachable=shapely.covers(road_surface,approaches)
+        seaward=origin+direction_many*(high_many+.12)[:,None]
+        reachable &= ~shapely.covers(sailing_obstacle,shapely.points(seaward))
         if not np.any(reachable):
             raise ValueError(f'{city.identifier}: port has no shore connected to its dry road approach')
         nearby=reachable & (high_many<=high_many[reachable].min()+harbor_scale*2)
@@ -116,30 +120,60 @@ def derive_harbors(grid, society, locations, terrain_field, *, road_surface):
     return result
 
 
-def connect_harbor_routes(routes, harbors, terrain_field):
-    """Join sea routes to real berths with a continuously checked wet approach."""
+def _sea_corridor(grid, points, sea_body, margin):
+    """Use the coarse voyage for support, and the actual shore for eligibility."""
+    from .society.transport import _path_cells
+
+    cells=set(_path_cells(tuple(map(tuple,points)),grid.shape))
+    bounds=shapely.union_all([shapely.box(x,y,x+1,y+1) for y,x in sorted(cells)])
+    return bounds.buffer(margin,join_style='mitre').intersection(sea_body)
+
+
+def connect_harbor_routes(routes, harbors, grid, *, land_surface):
+    """Navigate whole sea routes around real headlands and islands to berths."""
+    from .polygon_navigation import polygon_path
+    from .transport_geometry import _split_sailing_seam
+
+    # Offshore clearance is larger than navigation's eight-decimal coordinate
+    # serialization error. It changes the sailing domain, never the shore.
+    sea_obstacles=land_surface.buffer(1e-6)
+    sea_bodies=shapely.get_parts(shapely.box(0,0,grid.shape[1],grid.shape[0]).difference(sea_obstacles))
+    sea_index=shapely.STRtree(sea_bodies)
     result=[]
     for route in routes:
+        if route.mode!='sea':
+            result.append(route)
+            continue
         points=list(route.path)
-        if route.mode=='sea':
-            for identifier,reverse in ((route.source_settlement_id,False),(route.target_settlement_id,True)):
-                harbor=harbors.get(identifier)
-                if not harbor or harbor['kind']!='sea':
-                    continue
-                values=points[::-1] if reverse else points
-                berth=(harbor['seaPoint']['column'],harbor['seaPoint']['row'])
-                for index,p in enumerate(values):
-                    if terrain_field.sample_points(*p)>0:
-                        continue
-                    t=np.linspace(0.,1.,65)
-                    x=berth[0]+(p[0]-berth[0])*t
-                    y=berth[1]+(p[1]-berth[1])*t
-                    if np.any(terrain_field.sample_points(x,y)>0):
-                        continue
-                    values=[berth]+values[index:]
-                    sailing=[{'column':float(x),'row':float(y)} for x,y in values[:2]]
-                    harbor['sailing']=sailing
-                    break
-                points=values[::-1] if reverse else values
-        result.append(replace(route,path=tuple(points)))
+        for identifier,index in ((route.source_settlement_id,0),(route.target_settlement_id,-1)):
+            harbor=harbors.get(identifier)
+            if harbor is None or harbor['kind'] not in {'sea','lake'}:
+                raise ValueError(f'{route.identifier}: sailing endpoint has no real berth')
+            berth=(harbor['seaPoint']['column'],harbor['seaPoint']['row'])
+            if index==0:points.insert(0,berth)
+            else:points.append(berth)
+        parts=[]
+        for part in _split_sailing_seam(points,grid.shape[1]):
+            owners=set(sea_index.query(shapely.Point(part[0]),predicate='covered_by')) & set(
+                sea_index.query(shapely.Point(part[-1]),predicate='covered_by'))
+            if len(owners)!=1:
+                raise ValueError(f'{route.identifier}: sailing berths belong to disconnected water bodies')
+            sea_body=sea_bodies[next(iter(owners))]
+            anchors=shapely.MultiPoint((part[0],part[-1]))
+            margin=1
+            while True:
+                corridor=_sea_corridor(grid,part,sea_body,margin)
+                connected=[polygon for polygon in shapely.get_parts(corridor)
+                           if polygon.geom_type=='Polygon' and polygon.covers(anchors)]
+                if len(connected)==1:break
+                if margin>=max(grid.shape):
+                    raise ValueError(f'{route.identifier}: sailing corridor does not connect its real berths')
+                margin=min(max(grid.shape),margin*2)
+            path=polygon_path(connected[0],part[0],part[-1])
+            if shapely.LineString(path).intersects(land_surface):
+                raise ValueError(f'{route.identifier}: sailing route enters continuous land')
+            parts.extend(map(tuple,path))
+        for identifier,values in ((route.source_settlement_id,parts),(route.target_settlement_id,parts[::-1])):
+            harbors[identifier]['sailing']=[{'column':float(x),'row':float(y)} for x,y in values[:2]]
+        result.append(replace(route,path=tuple(parts)))
     return tuple(result)

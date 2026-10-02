@@ -14,7 +14,7 @@
 
 首次安装需要已有 Python 3.14、Node.js/npm 和网络；运行阶段离线，不需 API key。Mapshaper 0.7.56 是完整地图共享边界的实际依赖，不能漏列。
 
-分享 [完整轻量 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev6/generate-world-atlas-skill.zip)，不能只发 SKILL.md。这是开发预发布。安装到宿主 skills 目录后重新加载技能；首次新世界仍先问 17 题，确认有效参数后才自动下载。源代码和单独 wheel 见 [版本下载页](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.4.0.dev6)。不要使用原作者的盘符路径。`--target` 必须是全新目录，安装后使用返回的解释器/Mapshaper 路径。仅安装计算 wheel 时，地形模式只需 Python 及 wheel 声明的库；完整人文地图另需锁定的 Node/Mapshaper。
+分享 [完整轻量 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev7/generate-world-atlas-skill.zip)，不能只发 SKILL.md。这是开发预发布。安装到宿主 skills 目录后重新加载技能；首次新世界仍先问 17 题，确认有效参数后才自动下载。源代码和单独 wheel 见 [版本下载页](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.4.0.dev7)。不要使用原作者的盘符路径。`--target` 必须是全新目录，安装后使用返回的解释器/Mapshaper 路径。仅安装计算 wheel 时，地形模式只需 Python 及 wheel 声明的库；完整人文地图另需锁定的 Node/Mapshaper。
 
 ## 入口
 

@@ -50,7 +50,7 @@
   function profile(recipe) {
     const culture=recipe.culture||{},population=recipe.population?.estimate||0,type=recipe.siteType;
     const mobile=['nomadic-camp','khan-court'].includes(type)||culture.mobility==='nomadic'
-      ||culture.government==='nomadic-confederacy'&&recipe.tier==='site'&& !['port','fortress','pass'].includes(type);
+      ||culture.government==='nomadic-confederacy'&&recipe.tier==='site'&& !['port','island-port','lake-port','river-city','fortress','pass'].includes(type);
     const village=!mobile&&(type==='village'||population>0&&population<1800&&!['fortress','pass','port','island-port'].includes(type));
     const small=mobile||village||population<1800;
     const style=mobile?'nomadic':culture.style||'vernacular-mixed';

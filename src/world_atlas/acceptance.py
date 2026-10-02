@@ -3,9 +3,11 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
 import numpy as np
+import shapely
 
 from world_atlas.core.model import WorldGrid
 from world_atlas.core.procedural_planet import load_surface_bundle
@@ -16,25 +18,36 @@ from world_atlas.core.society.world_identity import assign_world_identity, namin
 from world_atlas.core.tectonic_review import derive_tectonic_review
 
 
-def _transport_surface_violations(grid: WorldGrid, routes) -> dict[str, list[dict]]:
+def _transport_surface_violations(grid: WorldGrid, routes, *, sea_land_geometry=None) -> dict[str, list[dict]]:
     """Return any route drawn on the wrong physical surface.
 
-    Sea lanes may begin and end at ports on land, but their intervening cells
-    must remain water.  Roads and rails are independent overland systems and
+    Sea lanes, including their berth endpoints, must stay outside the actual
+    continuous land surface. Roads and rails are independent overland systems and
     must never contain a water cell; bridge eligibility is checked during
     transport generation rather than waived by this release gate.
     """
 
     violations = {"sea": [], "road": [], "rail": []}
+    from world_atlas.core.transport_geometry import _split_sailing_seam
     for route in routes:
         if route.mode not in violations:
             continue
+        if route.mode == 'sea':
+            if sea_land_geometry is None:
+                raise ValueError('sailing audits require the actual continuous land geometry')
+            crossings=[shapely.LineString(part).intersection(sea_land_geometry)
+                       for part in _split_sailing_seam(route.path,grid.shape[1])]
+            crossings=[part for part in crossings if not part.is_empty]
+            if crossings:
+                violations['sea'].append({'route':route.identifier,'count':len(crossings),
+                    'lengthCells':sum(part.length for part in crossings),
+                    'examples':[shapely.to_wkt(part) for part in crossings[:3]]})
+            continue
         cells = _path_cells(route.path, grid.shape)
-        route_cells = cells[1:-1] if route.mode == "sea" else cells
         invalid = [
             cell
-            for cell in route_cells
-            if (grid.water[cell] == 0) == (route.mode == "sea")
+            for cell in cells
+            if grid.water[cell] != 0
         ]
         if invalid:
             violations[route.mode].append(
@@ -84,7 +97,17 @@ def verify_release(output: Path) -> dict:
     extra_names = plate_names + [grid.metadata["worldProfile"]["name"]]
     extra_matches = sorted({(name, old) for name in extra_names for old in forbidden
                             if old == name or (len(old) >= 2 and old in name)})
-    transport_violations = _transport_surface_violations(grid, society.transport.routes)
+    from world_atlas.core.terrain_refinement import terrain_from_source
+    from world_atlas.core.cartographic_surface import continuous_land_surface
+    sea_land_geometry=continuous_land_surface(grid,terrain_field=terrain_from_source(
+        grid,load_surface_bundle(output/'source/physical-fields.npz')))
+    transport_violations = _transport_surface_violations(grid, society.transport.routes,
+        sea_land_geometry=sea_land_geometry)
+    navigation=json.loads((output/'review/navigation-network.json').read_text(encoding='utf8'))
+    sea_navigation=_transport_surface_violations(grid,
+        (SimpleNamespace(identifier=f'navigation-sea-{index}',mode='sea',path=edge['points'])
+         for index,edge in enumerate(navigation['edges']) if edge['kind']=='sea'),
+        sea_land_geometry=sea_land_geometry)['sea']
     settlement_violations = _settlement_surface_violations(grid, society.settlements)
     sea_crossings = transport_violations["sea"]
     road_crossings = transport_violations["road"]
@@ -108,6 +131,7 @@ def verify_release(output: Path) -> dict:
         "plateNames": plate_names, "leftRightLandCells": int(land[~polar_projection_rows][:, [0, -1]].sum()),
         "polarProjectionEdgeLandCells": int(land[polar_projection_rows][:, [0, -1]].sum()), "polarChoiceMismatches": polar_errors,
         "unpartitionedStateCells": unpartitioned, "seaRoutesAcrossLand": sea_crossings,
+        "seaNavigationAcrossLand":sea_navigation,
         "roadsAcrossWater": road_crossings, "railsAcrossWater": rail_crossings,
         "settlementsOnWater": settlement_violations["water"],
         "settlementsOnRiver": settlement_violations["river"],
@@ -121,7 +145,7 @@ def verify_release(output: Path) -> dict:
         json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     assert not record["oldNameMatches"] and not record["duplicateNames"]
     assert not coastline_errors and not plate_errors and not unpartitioned and not record["leftRightLandCells"]
-    assert not sea_crossings and not road_crossings and not rail_crossings, (
+    assert not sea_crossings and not sea_navigation and not road_crossings and not rail_crossings, (
         "transport must remain on its navigable surface"
     )
     assert not settlement_violations["water"] and not settlement_violations["river"], (

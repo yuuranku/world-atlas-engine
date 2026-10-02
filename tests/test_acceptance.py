@@ -2,6 +2,7 @@ from types import SimpleNamespace
 import unittest
 
 import numpy as np
+import shapely
 
 from world_atlas.acceptance import (
     _settlement_surface_violations,
@@ -50,11 +51,24 @@ class ReleaseAcceptanceSurfaceTests(unittest.TestCase):
             ),
         )
 
-        violations = _transport_surface_violations(self.grid, routes)
+        violations = _transport_surface_violations(self.grid, routes,
+            sea_land_geometry=shapely.box(0,0,5,4).difference(shapely.box(2,1,3,2)))
 
         self.assertEqual([item["route"] for item in violations["road"]], ["road-water"])
         self.assertEqual([item["route"] for item in violations["rail"]], ["rail-water"])
         self.assertEqual([item["route"] for item in violations["sea"]], ["sea-land"])
+
+    def test_fine_sea_channels_use_actual_shore_and_reject_tiny_islands(self):
+        route=TransportRoute('sea','sea','regional','a','b',((1.5,.5),(3.5,.5)))
+        empty=shapely.Polygon()
+        self.assertFalse(_transport_surface_violations(self.grid,(route,),sea_land_geometry=empty)['sea'])
+        island=shapely.box(2.001,.499,2.002,.501)
+        self.assertTrue(_transport_surface_violations(self.grid,(route,),sea_land_geometry=island)['sea'])
+
+    def test_sailing_audit_cannot_substitute_the_native_cell_mask(self):
+        route=TransportRoute('sea','sea','regional','a','b',((1.5,.5),(3.5,.5)))
+        with self.assertRaisesRegex(ValueError,'actual continuous land geometry'):
+            _transport_surface_violations(self.grid,(route,))
 
     def test_settlement_surface_checks_reject_water_and_represented_river_cells(self):
         settlements = (

@@ -38,6 +38,12 @@ class CityDetailScriptTests(unittest.TestCase):
             vm.runInNewContext(fs.readFileSync(process.argv[1], 'utf8'), context, { filename: 'city-detail.js' });
             const api = window.WorldAtlasCities;
             assert.ok(api);
+            for(const siteType of ['port','island-port','lake-port','river-city']) {
+              const c=window.WorldAtlasCityCharacter.profile({siteType,tier:'site',era:'preindustrial',
+                population:{estimate:1200},culture:{style:'stone-masonry',government:'nomadic-confederacy'}});
+              assert.equal(c.mobile,false,'permanent waterside settlements keep buildings under a nomadic government');
+              assert.equal(c.style,'stone-masonry');
+            }
             const city = {
               id: 'port-city', name: 'Port City', seed: 991, era: 'industrial', tier: 'metropolis',
               location: { row: 10.5, column: 10.5 },

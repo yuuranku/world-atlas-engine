@@ -4609,9 +4609,9 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
     }
     from .city_harbors import derive_harbors, connect_harbor_routes
     harbors = derive_harbors(grid, society, city_locations, terrain_field,
-        road_surface=land_surface.difference(river_channel_geometry))
+        road_surface=land_surface.difference(river_channel_geometry),land_surface=land_surface)
     society=replace(society,transport=replace(society.transport,
-        routes=connect_harbor_routes(society.transport.routes,harbors,terrain_field)))
+        routes=connect_harbor_routes(society.transport.routes,harbors,grid,land_surface=land_surface)))
     logger.info("Resolving shared roads, river crossings and bridge facilities")
     display_river_geometry = shapely.MultiLineString(river_paths)
     transport_geometry = prepare_transport_geometry(

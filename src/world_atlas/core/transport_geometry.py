@@ -862,10 +862,11 @@ def prepare_transport_geometry(grid, routes, bridges, *, locations, land_surface
             path = tuple(map(tuple,prepared_parts[0]))
         prepared_routes.append(replace(route,path=path))
     anchors = [(column,row) for row,column in locations.values()]+list(positions.values())+[tuple(deck.coords[-1])for group in (*decks.values(),*access_spans.values())for deck in group]
-    paths = tuple((mode,importance,_curved_transport_points(points,mode,land_surface if mode=="sea" else road_surface,river_geometry,
+    sea_obstacles=land_surface.buffer(1e-6)
+    paths = tuple((mode,importance,_curved_transport_points(points,mode,sea_obstacles if mode=="sea" else road_surface,river_geometry,
                       grade_check=grade_check if mode=='road' else None))
                   for mode,importance,points in shared_transport_paths(
-                      grid,prepared_routes,land_geometry=land_surface,road_surface=road_surface,river_geometry=river_geometry,anchors=anchors,
+                      grid,prepared_routes,land_geometry=sea_obstacles,road_surface=road_surface,river_geometry=river_geometry,anchors=anchors,
                       grade_check=grade_check,engineer_path=engineer_path))
     lines = [shapely.LineString(points) for mode,_importance,points in paths if mode in {"road","rail"}]
     network = shapely.union_all(lines)
