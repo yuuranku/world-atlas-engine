@@ -454,22 +454,37 @@ def _bank_route(points, channel_geometry, passages, corridor):
         point=shapely.Point(coordinates)
         if any(polygon.covers(point)for polygon in polygons):
             return tuple(coordinates)
-        # An intersection of two floating-point edges can round one ulp
-        # inside the water while its actual construction lies on the bank.
-        # Continue the same straight deck to the first representable dry
-        # coordinate. No city or facility anchor is shifted, and no physical
-        # width, polygon buffer or acceptance tolerance is introduced.
-        bound=16*float(np.spacing(max(1.,max(abs(value)for value in coordinates))))
-        if not polygons or min(polygon.distance(point)for polygon in polygons)>bound:
+        if not polygons:
             raise ValueError("a bridge portal does not touch its accepted native dry corridor")
         values=np.asarray(coordinates,dtype=float)
         direction=values-np.asarray(centre,dtype=float)
         direction/=np.linalg.norm(direction)
-        for iteration in range(1,17):
-            sample=values+direction*(bound*iteration/16)
+        # The dry overlay can node a nearly collinear bank at a different
+        # represented coordinate than the channel intersection. Resolve the
+        # first dry interval on the same deck, then prove its entire approach
+        # stays in the native corridor and adds no physical water crossing.
+        # This uses the actual two surfaces, rather than a larger tolerance.
+        low_x,low_y,high_x,high_y=corridor.bounds
+        reach=np.hypot(high_x-low_x,high_y-low_y)+np.linalg.norm(
+            values-np.asarray((low_x,low_y)))
+        ray=shapely.LineString((values,values+direction*reach))
+        intervals=_parts(ray.intersection(free))
+        if not intervals:
+            raise ValueError("a bridge portal does not touch its accepted native dry corridor")
+        portal=min((np.asarray(endpoint)for interval in intervals
+                    for endpoint in (interval.coords[0],interval.coords[-1])),
+                   key=lambda endpoint:np.linalg.norm(endpoint-values))
+        bound=16*float(np.spacing(max(1.,float(np.max(np.abs(portal))))))
+        for iteration in range(17):
+            sample=portal+direction*(bound*iteration/16)
             point=shapely.Point(sample)
             if any(polygon.covers(point)for polygon in polygons):
-                return tuple(sample)
+                approach=shapely.LineString((values,sample))
+                water=approach.intersection(channel_geometry).difference(channel_geometry.boundary)
+                certificates=_bank_boundary_roundoff(water,channel_geometry)
+                if corridor.covers(approach) and _uncertified_water(water,certificates).is_empty:
+                    return tuple(sample)
+                raise ValueError("a bridge portal approach leaves its native corridor or crosses physical water")
         raise ValueError("a computed physical bank intersection has no representable dry portal")
     actual_passages=[]
     for station,deck in passages:

@@ -1,6 +1,8 @@
 """Display network topology and tangent corners share the visible coastline."""
 
 from types import SimpleNamespace
+import json
+from pathlib import Path
 import unittest
 
 import numpy as np
@@ -18,6 +20,36 @@ def route(identifier, mode, points, importance="regional"):
 class TransportGeometryTests(unittest.TestCase):
     def setUp(self):
         self.grid = SimpleNamespace(shape=(32, 64))
+
+    def test_bridge_connects_to_overlay_bank_without_adding_a_water_crossing(self):
+        record=json.loads((Path(__file__).parent/'fixtures/bridge-overlay-bank-dev12.json').read_text())
+        corridor=shapely.from_wkb(bytes.fromhex(record['corridorWkb']))
+        channel=shapely.from_wkb(bytes.fromhex(record['channelWkb']))
+        points=np.asarray(record['points'])
+        portal=shapely.Point(record['coordinates'])
+        dry=corridor.difference(channel)
+        # This actual channel bank is outside the dry overlay by 1000 ulps.
+        self.assertFalse(channel.covers(portal))
+        self.assertGreater(dry.distance(portal),16*np.spacing(portal.x))
+        path=_bank_route(points,channel,record['passages'],corridor)
+        line=shapely.LineString(path)
+        self.assertTrue(corridor.covers(line))
+        np.testing.assert_array_equal(path[[0,-1]],points[[0,-1]])
+        self.assertIn(tuple(record['centre']),tuple(map(tuple,path)))
+        decks=shapely.union_all([shapely.LineString(deck)for _station,deck in record['passages']])
+        water=line.intersection(channel).difference(channel.boundary)
+        unlicensed=water.difference(decks)
+        certificates=_bank_boundary_roundoff(unlicensed,channel)
+        from world_atlas.core.transport_geometry import _uncertified_water
+        self.assertTrue(_uncertified_water(unlicensed,certificates).is_empty)
+
+    def test_bridge_portal_extension_cannot_cross_unlicensed_water(self):
+        channel=shapely.box(4.,0.,6.,10.)
+        points=np.asarray(((2.,5.),(8.,5.)))
+        # These claimed bank endpoints are physically inside the river.
+        with self.assertRaisesRegex(ValueError,'crosses physical water'):
+            _bank_route(points,channel,((3.,((4.1,5.),(5.,5.),(5.9,5.))),),
+                        shapely.box(0.,0.,10.,10.))
 
     def test_coastal_access_admits_actual_dry_ground_in_a_coarse_water_cell(self):
         water=np.zeros((3,3),dtype=np.uint8)
