@@ -1,5 +1,5 @@
 {
-  "schema": "world-atlas-world-settings-v1",
+  "schema": "world-atlas-world-settings-v3",
   "humanSeed": 445034353,
   "namingSeed": 3188500066,
   "planet": {
@@ -11,6 +11,7 @@
     "orbitalPeriodDays": 420.0,
     "axialTiltDegrees": 28.0
   },
+  "technologyEra": "preindustrial",
   "society": {
     "settlementCount": 720,
     "civilizationCount": 14,
@@ -21,5 +22,6 @@
     "populationMin": 100000000,
     "populationMax": 160000000,
     "frontierTargetShare": 0.25
-  }
+  },
+  "travelCapabilities": []
 }
