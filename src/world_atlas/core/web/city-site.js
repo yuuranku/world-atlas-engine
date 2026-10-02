@@ -233,8 +233,11 @@
     }
     if(recipe.harbor){
       const h=recipe.harbor,n=h.outward,t={x:-n.y,y:n.x},factor=clamp(M.sqrt(recipe.population.estimate/22000),.34,1.8),
+        capacity=M.max(1,M.min(7,M.round(M.sqrt(recipe.population.estimate/1600)))),span=recipe.population.estimate<1800?.10:.22+capacity*.016,
         at=(x,y)=>({column:h.shore.column+(t.x*x+n.x*y)*factor/metric.column,row:h.shore.row+(t.y*x+n.y*y)*factor/metric.row});
-      recipe={...recipe,harbor:{...h,reservedLand:[[-.42,-.17],[-.42,.012],[.42,.012],[.42,-.17]].map(([x,y])=>at(x,y))}};
+      const half=span+.05;
+      recipe={...recipe,harbor:{...h,berthLayout:{scale:factor,capacity,span},
+        reservedLand:[[-half,-.14],[-half,.012],[half,.012],[half,-.14]].map(([x,y])=>at(x,y))}};
     }
     const relief = contourPaths(coordinates, elevation, land, metric);
     const waterSource = groundwater

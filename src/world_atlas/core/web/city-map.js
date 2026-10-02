@@ -181,7 +181,7 @@
     function drawHarbor(harbor){
       if(!harbor)return svg('g');
       const m=recipe.urban.gridCellKilometres,n=harbor.outward,t={x:-n.y,y:n.x},s=harbor.shore,
-        factor=Math.max(.34,Math.min(1.8,Math.sqrt(recipe.population.estimate/22000))),
+        {scale:factor,capacity,span}=harbor.berthLayout,
         at=(x,y)=>({column:s.column+(t.x*x+n.x*y)*factor/m.column,row:s.row+(t.y*x+n.y*y)*factor/m.row});
       const group=svg('g',{class:'city-harbor','data-harbor-kind':harbor.kind});
       const field=recipe.localSite.surface,b=field.bounds;
@@ -189,8 +189,7 @@
       const inChannel=p=>recipe.localSite.channels.some(channel=>{const q=WorldAtlasCitySite.distanceToChannel(p,channel,m);return q.distance<q.widthMetres/2000;});
       const dry=p=>inside(p)&&WorldAtlasCitySite.isDry(field,p)&&!inChannel(p),wet=p=>inside(p)&&(!WorldAtlasCitySite.isDry(field,p)||inChannel(p));
       const random=salt=>{let x=(recipe.seed^Math.imul(salt,0x9e3779b9))>>>0;x=Math.imul(x^x>>>16,0x21f0aaad);return ((x^x>>>15)>>>0)/4294967296;};
-      const small=recipe.population.estimate<1800,capacity=Math.max(1,Math.min(7,Math.round(Math.sqrt(recipe.population.estimate/1600)))),
-        span=small?.10:.22+capacity*.016,berths=[];
+      const small=recipe.population.estimate<1800,berths=[];
       const bank=x=>{let low=-.16,high=harbor.kind==='river'?harbor.channelWidthMetres/2000/factor:.32;
         if(!dry(at(x,low))||!wet(at(x,high)))return null;
         for(let i=0;i<19;i++){const middle=(low+high)/2;if(dry(at(x,middle)))low=middle;else high=middle;}return (low+high)/2;};
