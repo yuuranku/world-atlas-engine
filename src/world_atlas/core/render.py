@@ -3101,12 +3101,17 @@ def refresh_review_interface(grid: WorldGrid, directory: Path, *, society: Socie
         directory, grid_digest=grid.content_digest(), society_digest=society_content_digest(society))
     from .city_map_assets import write_city_map_assets
     from .terrain_refinement import terrain_from_source
-    from .city_harbors import derive_harbors
     terrain_field=terrain_from_source(grid,physical_source)
     locations=dict(presentation['settlementLocations'])
-    harbors=derive_harbors(grid,society,locations,terrain_field)
-    from .city_harbors import connect_harbor_routes
-    society=replace(society,transport=replace(society.transport,routes=connect_harbor_routes(society.transport.routes,harbors,terrain_field)))
+    transport=json.loads((directory/'transport-crossings.json').read_text(encoding='utf-8'))
+    harbors={}
+    grid_digest=grid.content_digest()
+    for city in society.settlements:
+        saved=json.loads((directory/'city-maps'/f'{city.identifier}.json').read_text(encoding='utf-8'))
+        if saved['gridDigest']!=grid_digest:
+            raise ValueError('saved harbor belongs to a different physical world')
+        if saved['recipe']['harbor']:
+            harbors[city.identifier]=saved['recipe']['harbor']
     overlay=replace_group(overlay,'id','city-layer',_city_overlay(society,locations),required=True)
     document = _html_document(grid, grid.content_digest(), overlay, society=society,
         tectonic_diagnostics=presentation['tectonicDiagnostics'],territorial_qa=presentation['territorialQa'],
@@ -3117,7 +3122,6 @@ def refresh_review_interface(grid: WorldGrid, directory: Path, *, society: Socie
         width=presentation['width'],height=presentation['height'],viewbox_width=presentation['viewboxWidth'],viewbox_height=presentation['viewboxHeight'],
         tectonic_diagnostics=presentation['tectonicDiagnostics'],territorial_qa=presentation['territorialQa'],settlement_locations=locations)
     write_map_app_assets(directory,grid=grid,society=society,settlement_locations=locations)
-    transport=json.loads((directory/'transport-crossings.json').read_text(encoding='utf-8'))
     physical_paths=[(p['mode'],p['importance'],p['geometry']['coordinates']) for p in transport['drawnTransportPaths']]
     write_city_map_assets(directory, grid, society, locations,terrain_field=terrain_field,harbors=harbors,physical_paths=physical_paths)
     _write_map_previews(directory, grid, thematic, society, vegetation_fraction, density)
@@ -4604,7 +4608,8 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
         for settlement in society.settlements
     }
     from .city_harbors import derive_harbors, connect_harbor_routes
-    harbors = derive_harbors(grid, society, city_locations, terrain_field)
+    harbors = derive_harbors(grid, society, city_locations, terrain_field,
+        road_surface=land_surface.difference(river_channel_geometry))
     society=replace(society,transport=replace(society.transport,
         routes=connect_harbor_routes(society.transport.routes,harbors,terrain_field)))
     logger.info("Resolving shared roads, river crossings and bridge facilities")

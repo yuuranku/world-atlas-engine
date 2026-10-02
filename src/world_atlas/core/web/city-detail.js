@@ -176,16 +176,16 @@
         d: members.map(building => pathData(building.points, true) + (building.courtyard ? " " + pathData(building.courtyard, true) : "")).join(" "),
         class: "city-building city-building-" + kind,
         "data-building-count": members.length,
-        fill: members[0].fill, stroke: "#4e534a", "stroke-width": 0.38,
-        "vector-effect": "non-scaling-stroke", "stroke-linejoin": "round", "fill-rule": "evenodd",
+        fill: members[0].fill, stroke: "#596053", "stroke-width": .00045 / cityPlan.gridCellKilometres,
+        "stroke-opacity": .72, "stroke-linejoin": "round", "fill-rule": "evenodd",
       }));
     }
     geometry.appendChild(buildings);
-    appendRoofPaint(geometry,cityPlan.buildings,'city-roof-faces');
+    appendRoofPaint(geometry,cityPlan.buildings,'city-roof-faces',cityPlan.gridCellKilometres);
     geometry.appendChild(svg("path", {class: "city-roof-ridges",
       d: cityPlan.buildings.flatMap(building => building.roofLines || []).map(points => pathData(points, false)).join(" "),
-      fill: "none", stroke: "#eee7cf", "stroke-width": 0.40,
-      "vector-effect": "non-scaling-stroke", "stroke-linecap": "round", opacity: 0.48}));
+      fill: "none", stroke: "#eee7cf", "stroke-width": .00028 / cityPlan.gridCellKilometres,
+      "stroke-linecap": "round", opacity: 0.48}));
     const roadEdges = svg("g", {class: "city-street-edges", fill: "none", stroke: "#c7bca7",
       "stroke-linecap": "round", "stroke-linejoin": "round", opacity: 0.75});
     const minorRoads = svg("g", {
@@ -242,19 +242,22 @@
 
   function appendLandmarks(city, cityPlan) {
     const group = svg("g", {class: "city-landmarks"});
+    group.appendChild(svg('path',{class:'city-landmark-shadows',
+      d:cityPlan.landmarks.map(landmark=>pathData(landmark.points,true)).join(' '),
+      fill:'#38473f',opacity:.23,transform:`translate(${.003/cityPlan.gridCellKilometres} ${.004/cityPlan.gridCellKilometres})`}));
     for (const landmark of cityPlan.landmarks) group.appendChild(svg("path", {
       d: pathData(landmark.points, true), class: "city-landmark city-landmark-" + landmark.kind,
-      fill: landmark.fill, stroke: "#7d6c5b", "stroke-width": 0.65,
-      "vector-effect": "non-scaling-stroke", "stroke-linejoin": "round",
+      fill: landmark.fill, stroke: "#736750", "stroke-width": .0007 / cityPlan.gridCellKilometres,
+      "stroke-linejoin": "round",
     }));
     group.appendChild(svg("path", {d: cityPlan.landmarks.flatMap(landmark => landmark.roofLines || [])
       .map(points => pathData(points, false)).join(" "), fill: "none", stroke: "#f8e3b9",
-      "stroke-width": 0.75, "vector-effect": "non-scaling-stroke"}));
-    appendRoofPaint(group,cityPlan.landmarks,'city-landmark-faces');
+      "stroke-width": .0004 / cityPlan.gridCellKilometres}));
+    appendRoofPaint(group,cityPlan.landmarks,'city-landmark-faces',cityPlan.gridCellKilometres);
     city.appendChild(group);
   }
 
-  function appendRoofPaint(parent,buildings,className){
+  function appendRoofPaint(parent,buildings,className,metric){
     const dark=[],light=[],hipLines=[],flat=[];
     for(const building of buildings){
       const polygon=building.points.map(p=>({x:p.column,y:p.row})),c=polygonCentre(polygon);
@@ -289,8 +292,8 @@
     const group=svg('g',{class:className});
     group.appendChild(svg('path',{d:dark.join(' '),fill:'#233e42',opacity:.18}));
     group.appendChild(svg('path',{d:light.join(' '),fill:'#ffedb9',opacity:.18}));
-    group.appendChild(svg('path',{d:flat.join(' '),fill:'none',stroke:'#f3e8cd',opacity:.55,'stroke-width':.4,'vector-effect':'non-scaling-stroke'}));
-    group.appendChild(svg('path',{d:hipLines.join(' '),fill:'none',stroke:'#f3e8cd',opacity:.5,'stroke-width':.4,'vector-effect':'non-scaling-stroke'}));
+    group.appendChild(svg('path',{d:flat.join(' '),fill:'none',stroke:'#f3e8cd',opacity:.55,'stroke-width':.0003/metric}));
+    group.appendChild(svg('path',{d:hipLines.join(' '),fill:'none',stroke:'#f3e8cd',opacity:.5,'stroke-width':.0003/metric}));
     parent.appendChild(group);
   }
 
@@ -307,6 +310,9 @@
     const group = svg("g", {class: "city-fortifications", "stroke-linejoin": "round"});
     for (const [name, walls, width] of [["outer", cityPlan.walls, 1.8], ["inner", cityPlan.innerWalls, 2.3]]) {
       const d = walls.map(points => pathData(points, false)).join(" ");
+      group.appendChild(svg('path',{d,class:'city-wall-shadow',fill:'none',stroke:'#3d4639',opacity:.22,
+        'stroke-width':cityPlan.streetWidths.collector*(width+.8),
+        transform:`translate(${.0025/cityPlan.gridCellKilometres} ${.0035/cityPlan.gridCellKilometres})`}));
       group.appendChild(svg("path", {d, class: "city-" + name + "-walls", fill: "none", stroke: "#756c57",
         "stroke-width": cityPlan.streetWidths.collector * (width + 0.8)}));
       group.appendChild(svg("path", {d, fill: "none", stroke: "#e8dfc5", "stroke-width": cityPlan.streetWidths.collector * width}));
@@ -356,12 +362,12 @@
       "vector-effect": "non-scaling-stroke", opacity: 0.50}));
     for(const fill of new Set(cityPlan.countryside.map(house=>house.fill)))group.appendChild(svg("path", {
       class: "city-country-houses", d: cityPlan.countryside.filter(house=>house.fill===fill).map(house => pathData(house.points, true)).join(" "),
-      fill, stroke: "#5e6353", "stroke-width": 0.38, "vector-effect": "non-scaling-stroke"}));
-    appendRoofPaint(group,cityPlan.countryside,'city-country-roof-faces');
+      fill, stroke: "#5e6353", "stroke-width": .00045 / cityPlan.gridCellKilometres, "stroke-opacity": .72}));
+    appendRoofPaint(group,cityPlan.countryside,'city-country-roof-faces',cityPlan.gridCellKilometres);
     group.appendChild(svg('path',{class:'city-country-lanes',d:cityPlan.countryLanes.map(points=>pathData(points,false)).join(' '),
       fill:'none',stroke:'#ece5ce','stroke-width':cityPlan.streetWidths.local*1.4,'stroke-linejoin':'round','stroke-linecap':'round'}));
     group.appendChild(svg("path", {d: cityPlan.countryside.flatMap(house => house.roofLines || []).map(points => pathData(points, false)).join(" "),
-      fill: "none", stroke: "#f0d6ac", "stroke-width": 0.55, "vector-effect": "non-scaling-stroke"}));
+      fill: "none", stroke: "#f0d6ac", "stroke-width": .0003 / cityPlan.gridCellKilometres}));
     city.appendChild(group);
   }
 

@@ -3,10 +3,13 @@
 import math
 
 import numpy as np
+import shapely
 from dataclasses import replace
 
 
-def derive_harbors(grid, society, locations, terrain_field):
+def derive_harbors(grid, society, locations, terrain_field, *, road_surface):
+    """Choose a shore reachable from the city on the shared dry road surface."""
+    shapely.prepare(road_surface)
     result = {}
     for city in society.settlements:
         if city.site_type not in {'port', 'island-port', 'lake-port'}:
@@ -28,12 +31,11 @@ def derive_harbors(grid, society, locations, terrain_field):
         eligible = wet.any(axis=1) & (first > 0)
         if not eligible.any():
             raise ValueError(f'{city.identifier}: port has no reachable continuous shoreline')
-        candidates = np.where(eligible, distances[first], np.inf)
         population=(city.population_min+city.population_max)/2
         harbor_scale=min(3., max(.6, .8*math.sqrt(population/15000)))
         # Compare nearby continuous shoreline sites by exposure as well as
         # distance. Land around the seaward half-circle shelters an inlet.
-        options=np.flatnonzero(eligible & (candidates<=candidates.min()+harbor_scale*2))
+        options=np.flatnonzero(eligible)
         low_many=distances[first[options]-1].copy()
         high_many=distances[first[options]].copy()
         direction_many=np.column_stack((np.cos(angles[options])/column_km,np.sin(angles[options])/row_km))
@@ -42,7 +44,15 @@ def derive_harbors(grid, society, locations, terrain_field):
             points=np.array([column,row])+direction_many*middle[:,None]
             dry=terrain_field.sample_points(points[:,0],points[:,1])>0
             low_many=np.where(dry,middle,low_many);high_many=np.where(dry,high_many,middle)
-        coast_many=np.array([column,row])+direction_many*((low_many+high_many)/2)[:,None]
+        origin=np.array([column,row])
+        landings=origin+direction_many*np.maximum(0.,low_many-.07)[:,None]
+        approaches=shapely.linestrings(np.stack((np.broadcast_to(origin,landings.shape),landings),axis=1))
+        reachable=shapely.covers(road_surface,approaches)
+        if not np.any(reachable):
+            raise ValueError(f'{city.identifier}: port has no shore connected to its dry road approach')
+        nearby=reachable & (high_many<=high_many[reachable].min()+harbor_scale*2)
+        options,low_many,high_many,direction_many=(a[nearby] for a in (options,low_many,high_many,direction_many))
+        coast_many=origin+direction_many*((low_many+high_many)/2)[:,None]
         probe_angles=angles[options,None]+np.linspace(-np.pi/2,np.pi/2,17)
         shelter_samples=[]
         for reach in (harbor_scale*.6,harbor_scale*1.2,harbor_scale*2):

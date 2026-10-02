@@ -7,7 +7,7 @@ import numpy as np
 import shapely
 
 from world_atlas.core.transport_geometry import (
-    _anchor_parts, _bank_boundary_roundoff, _bank_route, _curved_transport_points, river_navigation_attributes, river_navigation_segments, shared_transport_paths,
+    _anchor_parts, _bank_boundary_roundoff, _bank_route, _curved_transport_points, _road_native_corridor, river_navigation_attributes, river_navigation_segments, shared_transport_paths,
 )
 
 
@@ -18,6 +18,28 @@ def route(identifier, mode, points, importance="regional"):
 class TransportGeometryTests(unittest.TestCase):
     def setUp(self):
         self.grid = SimpleNamespace(shape=(32, 64))
+
+    def test_coastal_access_admits_actual_dry_ground_in_a_coarse_water_cell(self):
+        water=np.zeros((3,3),dtype=np.uint8)
+        water[:,2]=1
+        grid=SimpleNamespace(shape=water.shape,water=water)
+        points=np.array(((.5,1.5),(1.5,1.5),(2.6,1.5)))
+        access=(((1.5,1.5),(2.6,1.5)),)
+        corridor=_road_native_corridor(grid,points,shapely.box(0,0,2.8,3),endpoint_access=access)
+        self.assertTrue(corridor.covers(shapely.LineString(points)))
+        self.assertFalse(corridor.covers(shapely.Point(2.9,1.5)))
+        limited=_road_native_corridor(grid,points,shapely.box(0,0,2.4,3),endpoint_access=access)
+        self.assertFalse(limited.covers(shapely.Point(2.6,1.5)))
+
+    def test_diagonal_coastal_access_has_a_connected_corridor_at_grid_corners(self):
+        water=np.zeros((3,4),dtype=np.uint8)
+        water[:,2:]=1
+        grid=SimpleNamespace(shape=water.shape,water=water)
+        points=np.array(((.5,.5),(1.5,.5),(3.3,2.3)))
+        corridor=_road_native_corridor(grid,points,shapely.box(0,0,3.8,3),
+            endpoint_access=(((1.5,.5),(3.3,2.3)),))
+        self.assertEqual(corridor.geom_type,'Polygon')
+        self.assertTrue(corridor.covers(shapely.LineString(points)))
 
     def test_bank_roundoff_certifies_only_same_edge_binary64_limits(self):
         channel=shapely.box(0.,0.,1.,1.)

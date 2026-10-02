@@ -109,12 +109,21 @@
       water.setAttribute('clip-path','url(#city-river-dry-ground)');
       const woods=svg('g',{class:'city-local-woodland'});
       woods.append(svg('path',{d:(site.woodland||[]).map(points=>path(points)+'Z').join(' '),fill:'#b8caa5',opacity:.55}));
-      const treePath=(site.trees||[]).map(tree=>{
+      const crowns=(site.trees||[]).map((tree,index)=>{
         const rx=tree.radiusMetres/1000/metric.column,ry=tree.radiusMetres/1000/metric.row,p=tree.point;
-        return `M${p.column-rx} ${p.row}a${rx} ${ry} 0 1 0 ${rx*2} 0a${rx} ${ry} 0 1 0 ${-rx*2} 0`;
-      }).join(' ');
-      woods.append(svg('path',{d:treePath,class:'city-tree-canopies',fill:'#8fac87',stroke:'#739575','stroke-width':.25,
-        'vector-effect':'non-scaling-stroke',opacity:.74,'data-tree-count':(site.trees||[]).length}));
+        return Array.from({length:12},(_,i)=>{
+          const angle=i*Math.PI/6,radius=.80+.12*Math.sin(i*2.7+index*1.9);
+          return {column:p.column+Math.cos(angle)*rx*radius,row:p.row+Math.sin(angle)*ry*radius};
+        });
+      });
+      woods.append(svg('path',{d:crowns.map(points=>path(points)+'Z').join(' '),class:'city-tree-shadows',fill:'#536e54',opacity:.18,
+        transform:`translate(${.002/metric.column} ${.003/metric.row})`}));
+      for(const [index,fill] of ['#8ea67a','#9cb38b','#7e9c78'].entries())woods.append(svg('path',{
+        d:crowns.filter((_,i)=>i%3===index).map(points=>path(points)+'Z').join(' '),class:'city-tree-canopies',fill,
+        stroke:'#668568','stroke-width':.00045/((metric.row+metric.column)/2),opacity:.86,
+        'data-tree-count':crowns.filter((_,i)=>i%3===index).length}));
+      woods.append(svg('path',{d:crowns.map(points=>path(points.slice(6,11))).join(' '),class:'city-tree-highlights',
+        fill:'none',stroke:'#c3cea5','stroke-width':.0008/((metric.row+metric.column)/2),opacity:.5,'stroke-linecap':'round'}));
       const rockPath=(site.rocks||[]).map(p=>path([{column:p.column-.015/metric.column,row:p.row},
         {column:p.column,row:p.row-.01/metric.row},{column:p.column+.018/metric.column,row:p.row+.007/metric.row}])).join(' ');
       woods.append(svg('path',{d:rockPath,fill:'none',stroke:'#9b9b87','stroke-width':.6,'vector-effect':'non-scaling-stroke'}));

@@ -400,7 +400,7 @@ def _curved_transport_points(points, mode, land_geometry, river_geometry, *, gra
     return result[np.r_[True, np.any(np.diff(result, axis=0)!=0.,axis=1)]]
 
 
-def _road_native_corridor(grid, points, land_surface):
+def _road_native_corridor(grid, points, land_surface, *, endpoint_access):
     """Reconstruct the cells admitted by the original wrapped D8 road walk.
 
     Source path compression removes intermediate centre stations. An ink
@@ -410,18 +410,26 @@ def _road_native_corridor(grid, points, land_surface):
     These cells constrain path finding only and are never painted as boxes.
     """
     from .society.transport import _path_cells
-    path=_path_cells(tuple(map(tuple,points)),grid.shape)
-    cells=set(path)
-    for first,last in zip(path[:-1],path[1:]):
-        if first[0]!=last[0] and first[1]!=last[1]:
-            cells.update(cell for cell in ((first[0],last[1]),(last[0],first[1]))if grid.water[cell]==0)
-    # At a diagonal grid corner, floor sampling records the corner's one
-    # orthogonal cell between the two diagonal cells. Restore the other
-    # orthogonal cell required by the same D8 transition as well.
-    for first,last in zip(path[:-2],path[2:]):
-        if abs(first[0]-last[0])==1 and abs(first[1]-last[1])==1:
-            cells.update(cell for cell in ((first[0],last[1]),(last[0],first[1]))if grid.water[cell]==0)
-    cells=sorted(cell for cell in cells if grid.water[cell]==0)
+    def walk_cells(walk):
+        path=_path_cells(tuple(map(tuple,walk)),grid.shape)
+        cells=set(path)
+        for first,last in zip(path[:-1],path[1:]):
+            if first[0]!=last[0] and first[1]!=last[1]:
+                cells.update(((first[0],last[1]),(last[0],first[1])))
+        # Floor sampling can record one orthogonal cell between two diagonal
+        # cells. Retain both sides of that same grid-corner transition.
+        for first,last in zip(path[:-2],path[2:]):
+            if abs(first[0]-last[0])==1 and abs(first[1]-last[1])==1:
+                cells.update(((first[0],last[1]),(last[0],first[1])))
+        return cells
+    cells={cell for cell in walk_cells(points) if grid.water[cell]==0}
+    # Refined coastal anchors may lie on real dry ground within a coarse
+    # water cell. Admit only the explicit settlement access walk there, then
+    # clip it to the same physical land as the accepted native corridor.
+    for access in endpoint_access:
+        for part in _split_seam(access,grid.shape[1]):
+            cells.update(walk_cells(part))
+    cells=sorted(cells)
     if not cells:
         raise ValueError("an accepted road has no native land corridor")
     rows,columns=np.asarray(cells).T
@@ -814,12 +822,16 @@ def prepare_transport_geometry(grid, routes, bridges, *, locations, land_surface
                    for group in (*decks.values(),*access_spans.values())for deck in group]
     openings=shapely.union_all(opening_parts)
     road_surface=land_surface.difference(river_channel_geometry).union(openings)
+    native_routes={route.identifier:route for route in routes}
     prepared_routes = []
     for route in refined_land_routes(routes,locations):
         if route.mode not in {"road","rail"}:
             prepared_routes.append(route)
             continue
         route_parts = _split_seam(route.path,grid.shape[1])
+        native=native_routes[route.identifier]
+        endpoint_access=tuple((old,new) for old,new in (
+            (native.path[0],route.path[0]),(native.path[-1],route.path[-1])) if old!=new)
         prepared_parts = []
         for points in route_parts:
             line = shapely.LineString(points)
@@ -836,7 +848,7 @@ def prepare_transport_geometry(grid, routes, bridges, *, locations, land_surface
                     passages=[entry for entry in passages if abs(entry[0]-distance)>1e-8]
                     passages.append((distance,passage))
             try:
-                corridor=_road_native_corridor(grid,points,land_surface)
+                corridor=_road_native_corridor(grid,points,land_surface,endpoint_access=endpoint_access)
                 local_channel=shapely.union_all(channel_parts[channel_index.query(corridor,predicate="intersects")])
                 banked = _bank_route(points,local_channel,passages,corridor)
             except ValueError as error:
