@@ -59,6 +59,10 @@ def clip_partition_to_surface(faces, labels, land_surface):
     Missing coverage is a rendering error. Clipping outside colors alone is
     insufficient: the resulting faces must also cover every visible land area.
     """
+    # Shared display boundaries retain a fixed GEOS precision model. Clear
+    # that metadata without moving vertices so overlays preserve the exact
+    # physical shore instead of rounding it to the display grid.
+    faces = shapely.set_precision(faces, 0)
     clipped_faces, clipped_labels = [], []
     shapely.prepare(land_surface)
     for face, label in zip(faces, labels, strict=True):

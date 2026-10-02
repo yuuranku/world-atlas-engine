@@ -20,13 +20,13 @@ const assert=require('node:assert/strict');
         const r=cityMap.recipe,p=WorldAtlasCities.plan(r,{grid:{width:2176,height:1088}}),m=r.urban.gridCellKilometres;
         const b=p.buildings.flatMap(b=>b.points),xs=b.map(q=>(q.column-r.location.column)*m.column),ys=b.map(q=>(q.row-r.location.row)*m.row);
         return {...cityMap.stats(),form:r.localSite.form,civicKinds:[...new Set(p.landmarks.map(l=>l.kind))],
-          foundationRelief:Math.max(0,...p.buildings.map(b=>b.foundation?.reliefMetres||0)),palacePrecincts:p.plazas.filter(p=>p.precinct).length,
+          siteType:r.siteType,foundationRelief:Math.max(0,...p.buildings.map(b=>b.foundation?.reliefMetres||0)),palacePrecincts:p.plazas.filter(p=>p.precinct).length,
           palaceParts:p.landmarks.filter(l=>/^royal-palace|^imperial-palace/.test(l.kind)).length,
           extentKm:{x:Math.max(...xs)-Math.min(...xs),y:Math.max(...ys)-Math.min(...ys)},ruralRoads:r.localSite.ruralRoads.length};
       });report.cities.push(stats);
       assert.ok(stats.buildings>0,id+' has buildings on usable ground');
       assert.ok(stats.foundationRelief<=3.5,id+' buildings have coherent foundations');
-      if(['settlement-0041','settlement-0558','settlement-0585'].includes(id))assert.ok(stats.harbor,id+' has an actual harbor');
+      if(['port','island-port','lake-port'].includes(stats.siteType))assert.ok(stats.harbor,id+' has an actual harbor');
       await page.locator('#place-card').screenshot({path:path.join(output,id+'-city.png')});
       await page.locator('#city-map-zoom-in').click();await page.locator('#city-map-zoom-in').click();
       await page.locator('#place-card').screenshot({path:path.join(output,id+'-streets.png')});

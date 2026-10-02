@@ -71,6 +71,6 @@ description: 用可复现的 world-atlas-engine 生成与迭代架空世界地�
 - 城市、交通、文化、宗教、政治、命名：`references/human-world.md`。
 - 对照、调试或交付：`references/acceptance.md`。
 
-当前引擎为 1.4.0.dev3 开发预发布。城市在详情窗口打开时生成，先生成局部地形与水系，再布置道路、宫城、港区、城防、住宅与田地；加入多文化宫殿、屋顶材料色差、局部蓄水湖与支流汇流。世界设置严格使用 v3，显式声明时代与额外交通能力。历史认可地形基准 v38 固定在 1.1.0；配方与指纹见 `assets/terrain-v38.json` 和 `assets/terrain-v38.acceptance.json`。所有基准都不是新世界默认模板或专名词库。
+当前引擎为 1.4.0.dev4 开发预发布。城市在详情窗口打开时生成，先生成局部地形与水系，再布置道路、宫城、港区、城防、住宅与田地；加入多文化宫殿、屋顶材料色差、局部蓄水湖与支流汇流。世界设置严格使用 v3，显式声明时代与额外交通能力。历史认可地形基准 v38 固定在 1.1.0；配方与指纹见 `assets/terrain-v38.json` 和 `assets/terrain-v38.acceptance.json`。所有基准都不是新世界默认模板或专名词库。
 
 源码与版本下载：[world-atlas-engine](https://github.com/yuuranku/world-atlas-engine)。本 skill 不内含计算 wheel 或历史物理数据；只下载当前任务需要的资源。不要求 GitHub 登录或 API key，不自动安装系统级 Python/Node。发布和安装维护任务不等于新建世界，不因此重新提问或重算地图。

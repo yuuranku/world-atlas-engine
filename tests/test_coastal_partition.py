@@ -50,6 +50,19 @@ class CoastalPartitionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "uncovered"):
             clip_partition_to_surface(shortened, (1, 2), land)
 
+    def test_display_precision_does_not_round_the_authoritative_shore(self):
+        outer = shapely.Point(5.031, 5.019).buffer(4.023)
+        lake = shapely.Point(6.317, 5.045).buffer(.827)
+        land = outer.difference(lake)
+        faces = shapely.set_precision(
+            (shapely.box(0, 0, 5, 10), shapely.box(5, 0, 10, 10)), .1)
+        before = shapely.get_coordinates(faces).copy()
+        clipped, labels = clip_partition_to_surface(faces, (1, 2), land)
+        self.assertLess(land.symmetric_difference(shapely.union_all(clipped)).area, 1e-10)
+        self.assertEqual(set(labels), {1, 2})
+        self.assertTrue(np.all(shapely.get_precision(clipped) == 0))
+        np.testing.assert_array_equal(shapely.get_coordinates(faces), before)
+
     def test_foreign_mainland_category_cannot_split_a_native_single_label_island(self):
         mainland = shapely.box(0, 0, 3, 3)
         island = shapely.Point(4.5, 1.5).buffer(.7)
