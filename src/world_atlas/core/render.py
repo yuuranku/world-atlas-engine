@@ -1717,6 +1717,12 @@ def _religion_zones(society: SocietyLayers) -> tuple[tuple[str, str], ...]:
     )
 
 
+def _religion_display_values(society: SocietyLayers) -> np.ndarray:
+    """Paint land outside the religion domain with the neutral legend entry."""
+    values = society.religions.religion_id
+    return np.where(values == -1, 0, values)
+
+
 def _civilization_display_values(
     grid: WorldGrid,
     thematic: ThematicLayers,
@@ -4234,15 +4240,16 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
         language_partition.visible_labels,
     )
     religion_zones = _religion_zones(society)
+    religion_display = _religion_display_values(society)
     religion_partition = _coastal_partition_topology(
-        society.religions.religion_id,
+        religion_display,
         land_mask,
         category_count=len(religion_zones),
         land_surface=land_surface,
     )
     religion_faces, religion_face_ids = religion_partition.faces, religion_partition.labels
     _validate_partition_inventory(
-        society.religions.religion_id,
+        religion_display,
         land_mask,
         religion_face_ids,
         layer_name="religion",
