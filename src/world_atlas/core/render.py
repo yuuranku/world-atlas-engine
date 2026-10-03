@@ -37,6 +37,7 @@ from .polar import polar_continent_mask
 from .globe import write_globe
 from .globe_assets import globe_theme_documents
 from .review_interface import write_interface_snapshot
+from ..timing import measure_stage
 from .governance_render import write_governance_overlay
 from .presentation import society_content_digest
 from .cartographic_symbols import LANDFORM_STYLES, SITE_MARKS, symbol_definitions
@@ -4803,10 +4804,14 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
         raise WorldGridRenderError(f"combined overview SVG byte budget exceeded: {sum(overview_bytes.values())}")
     # Detailed scalar faces and physical channels share each block. Keep the
     # request footprint small without simplifying any delivered geometry.
-    manifest = write_atlas_tiles(output_dir, grid.shape[1], grid.shape[0], tile_levels, tile_size=16)
-    city_relief = derive_city_relief(grid, terrain_field, society.settlements,
-        _elevation_thresholds(grid),
-        settlement_locations=city_locations,tile_size=manifest['tileSize'])
+    logger.info("Publishing shared viewport tiles")
+    with measure_stage(output_dir, "viewport-tiles"):
+        manifest = write_atlas_tiles(output_dir, grid.shape[1], grid.shape[0], tile_levels, tile_size=16)
+    logger.info("Extracting city minor contours")
+    with measure_stage(output_dir, "city-minor-contours"):
+        city_relief = derive_city_relief(grid, terrain_field, society.settlements,
+            _elevation_thresholds(grid),
+            settlement_locations=city_locations,tile_size=manifest['tileSize'])
     (output_dir / "city-contours.json").write_text(json.dumps({
         "schema": "accepted-physical-minor-curves-v1",
         "coordinateSpace": "native-cell",
@@ -4815,7 +4820,8 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
                     "geometry": shapely.geometry.mapping(feature.geometry)}
                    for feature in city_relief.features],
     }, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
-    manifest = write_city_relief_tiles(output_dir, city_relief)
+    with measure_stage(output_dir, "city-relief-tiles"):
+        manifest = write_city_relief_tiles(output_dir, city_relief)
     thematic_overlay_images = re.sub(r'data-source="([^"]+)"',
         lambda match: 'data-source="overview-' + {
             "watersheds.svg": "watershed", "land-potential.svg": "potential",

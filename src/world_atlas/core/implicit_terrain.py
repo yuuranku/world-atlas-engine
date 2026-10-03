@@ -857,15 +857,16 @@ def terrain_level_curves(field,metre_levels,*,query_bounds=None):
     if cells is not None:
         low,high=_selected_ranges(field,cells)
         lower,upper=_cell_boxes(field,cells)
-        return _refined_curves(field,levels,lower,upper,low,high)
-    x,y=_native_axes(field)
-    coarse_low,coarse_high=_coarse_ranges(field)
-    needed=np.zeros_like(coarse_low,dtype=bool)
-    for level in levels:needed|=(coarse_low<=level)&(coarse_high>=level)
-    rows,columns=np.nonzero(needed)
-    lower=np.column_stack((x[columns],y[rows]))
-    upper=np.column_stack((x[columns+1],y[rows+1]))
+    else:
+        x,y=_native_axes(field)
+        coarse_low,coarse_high=_coarse_ranges(field)
+        needed=np.zeros_like(coarse_low,dtype=bool)
+        for level in levels:needed|=(coarse_low<=level)&(coarse_high>=level)
+        rows,columns=np.nonzero(needed)
+        lower=np.column_stack((x[columns],y[rows]))
+        upper=np.column_stack((x[columns+1],y[rows+1]))
+        low,high=coarse_low[rows,columns],coarse_high[rows,columns]
     if len(levels)>1 and len(lower)>2048:
         from .implicit_terrain_parallel import parallel_height_curves
-        return parallel_height_curves(field,levels,lower,upper,coarse_low[rows,columns],coarse_high[rows,columns])
-    return _refined_curves(field,levels,lower,upper,coarse_low[rows,columns],coarse_high[rows,columns])
+        return parallel_height_curves(field,levels,lower,upper,low,high)
+    return _refined_curves(field,levels,lower,upper,low,high)

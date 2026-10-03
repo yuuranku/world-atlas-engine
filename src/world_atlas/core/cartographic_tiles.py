@@ -42,6 +42,24 @@ _PRECISION = COORDINATE_SCALE
 _MAX_TILE_BYTES = 2 * 1024 * 1024
 
 
+class _TileIDs(Mapping):
+    """Namespace only IDs referenced by the current tile's visible features."""
+    def __init__(self, identifiers, suffix):
+        self.identifiers = identifiers
+        self.suffix = suffix
+
+    def __getitem__(self, identifier):
+        if identifier not in self.identifiers:
+            raise KeyError(identifier)
+        return f"{identifier}{self.suffix}"
+
+    def __iter__(self):
+        return iter(self.identifiers)
+
+    def __len__(self):
+        return len(self.identifiers)
+
+
 def _segment(coordinates, *, closed: bool) -> str:
     # Subtract rounded absolute integer coordinates, so long relative paths
     # retain their shared endpoints without cumulative rounding drift.
@@ -241,13 +259,14 @@ def _feature_error(level: str, index: int, feature: TileFeature, reason: str) ->
     )
 
 
-def _write_tile_level(
+def _tile_level_payloads(
     output_dir: str | Path,
     width: int,
     height: int,
     level: TileLevel,
     *,
     tile_size: int = 32,
+    clip_cache: dict,
 ):
     """Publish exact shared-geometry blocks without modifying source features.
 
@@ -288,21 +307,23 @@ def _write_tile_level(
     tiles = target / "tiles" / level.id
     tiles.mkdir(parents=True, exist_ok=True)
     tree = STRtree([feature.geometry for feature in source])
-    source_ids = tuple(dict.fromkeys([feature.attributes["id"] for feature in source if "id" in feature.attributes]
-        + [identifier for feature in source for identifier in (feature.definitions or {})]))
-    stats = {"totalTiles":0,"maxTileBytes":0,"totalTileBytes":0}
+    source_ids = frozenset([feature.attributes["id"] for feature in source if "id" in feature.attributes]
+        + [identifier for feature in source for identifier in (feature.definitions or {})])
     for row in range(rows):
         for column in range(columns):
             west, north = column * tile_size, row * tile_size
             east, south = min(width, west + tile_size), min(height, north + tile_size)
             rectangle = box(west, north, east, south)
             line_rectangle = box(west - .5, north - .5, east + .5, south + .5)
-            physical_land = land_surface.intersection(rectangle)
+            land_key = id(land_surface), "land"
+            if land_key not in clip_cache:
+                clip_cache[land_key] = land_surface.intersection(rectangle)
+            physical_land = clip_cache[land_key]
             land_data = " ".join(data for data, polygon in _geometry_paths(physical_land) if polygon)
             rectangle_data = _segment(rectangle.exterior.coords, closed=True)
             clip_ids = {"land":f"tile-land-{level.id}-{row}-{column}",
                         "water":f"tile-water-{level.id}-{row}-{column}"}
-            id_map = {identifier:f"{identifier}-tile-{level.id}-{row}-{column}" for identifier in source_ids}
+            id_map = _TileIDs(source_ids, f"-tile-{level.id}-{row}-{column}")
             definitions = (
                 '<defs>'
                 + ''.join(
@@ -316,7 +337,13 @@ def _write_tile_level(
             thematic = {theme:[] for theme in themes if theme != "none"}
             for index in sorted(tree.query(rectangle).tolist()):
                 feature = source[index]
-                clipped = feature.geometry if feature.path_data else _clip_geometry(feature.geometry, rectangle, line_rectangle)
+                if feature.path_data:
+                    clipped = feature.geometry
+                else:
+                    key = id(feature.geometry), "feature"
+                    if key not in clip_cache:
+                        clip_cache[key] = _clip_geometry(feature.geometry, rectangle, line_rectangle)
+                    clipped = clip_cache[key]
                 if clipped.is_empty:
                     continue
                 destination = thematic[feature.theme] if feature.section == "theme" else sections[feature.section]
@@ -340,11 +367,7 @@ def _write_tile_level(
                     f"tile JSON byte budget exceeded; level={level.id!r} row={row} column={column} "
                     f"bytes={len(encoded)} limit={_MAX_TILE_BYTES}"
                 )
-            (tiles / f"{row}-{column}.json").write_bytes(encoded)
-            stats["totalTiles"] += 1
-            stats["maxTileBytes"] = max(stats["maxTileBytes"],len(encoded))
-            stats["totalTileBytes"] += len(encoded)
-    return stats
+            yield tiles / f"{row}-{column}.json", encoded
 
 
 def write_atlas_tiles(
@@ -375,11 +398,19 @@ def write_atlas_tiles(
             raise ValueError("every level must publish the same themes in the same order")
         themes = level_themes
     stats = {"totalTiles":0,"maxTileBytes":0,"totalTileBytes":0}
-    for level in prepared:
-        measured = _write_tile_level(output_dir,width,height,level,tile_size=tile_size)
-        stats["totalTiles"] += measured["totalTiles"]
-        stats["maxTileBytes"] = max(stats["maxTileBytes"],measured["maxTileBytes"])
-        stats["totalTileBytes"] += measured["totalTileBytes"]
+    # The levels share the same feature objects except for their coastlines.
+    # Complete all levels of one tile before discarding its exact intersections.
+    # This bounds cache memory to one tile and preserves each level's paint order.
+    clip_cache = {}
+    streams = [_tile_level_payloads(output_dir, width, height, level,
+                                   tile_size=tile_size, clip_cache=clip_cache) for level in prepared]
+    for blocks in zip(*streams, strict=True):
+        for path, encoded in blocks:
+            path.write_bytes(encoded)
+            stats["totalTiles"] += 1
+            stats["maxTileBytes"] = max(stats["maxTileBytes"], len(encoded))
+            stats["totalTileBytes"] += len(encoded)
+        clip_cache.clear()
     manifest = {"width":width, "height":height, "tileSize":tile_size,
                 "columns":math.ceil(width/tile_size), "rows":math.ceil(height/tile_size),
                 "themes":themes,

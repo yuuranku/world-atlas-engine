@@ -51,6 +51,25 @@ def line_geometry(data):
 
 
 class CartographicTilesTests(unittest.TestCase):
+    def test_shared_level_export_matches_separate_exports_byte_for_byte(self):
+        land = shapely.Polygon([(0,0),(60,0),(64,24),(48,32),(0,32)],
+                               [[(29,10),(36,10),(36,16),(29,16)]])
+        features = [
+            TileFeature(land, {"id":"land-face", "fill":"#abc", "clip":"land"}, "land", section="surface"),
+            TileFeature(shapely.box(0,0,64,32), {"fill":"#eee"}, "theme", "political", "theme"),
+            TileFeature(shapely.LineString([(2,2),(32,20),(63,24)]),
+                        {"stroke":"url(#land-face)", "fill":"none", "clip":"water"}, "roads"),
+        ]
+        levels = [TileLevel(name, scale, land, features) for name, scale in
+                  (("regional",8),("local",32),("detail",64))]
+        with tempfile.TemporaryDirectory() as together, tempfile.TemporaryDirectory() as separate:
+            write_atlas_tiles(together,64,32,levels)
+            for level in levels:
+                write_atlas_tiles(separate,64,32,[level])
+                for path in (Path(together)/"tiles"/level.id).glob("*.json"):
+                    self.assertEqual(path.read_bytes(),
+                                     (Path(separate)/"tiles"/level.id/path.name).read_bytes())
+
     def test_smaller_requests_preserve_exact_curved_river_and_terrain_geometry(self):
         land=shapely.box(0,0,32,32)
         river=shapely.Polygon([(1,14.2),(9,13.7),(16,14.3),(24,15.5),(31,14.8),
