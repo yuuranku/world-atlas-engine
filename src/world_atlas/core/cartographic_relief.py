@@ -4,7 +4,8 @@ import numpy as np
 import shapely
 
 from .implicit_curves import level_bands, polygon_path
-from .implicit_terrain import _ROOT_TOLERANCES, terrain_level_curves
+from .implicit_terrain import _ROOT_TOLERANCES
+from .cartographic_contours import cartographic_level_curves
 
 
 def _closed_relief_curves(field, curves):
@@ -45,7 +46,7 @@ def physical_relief_paths(terrain_field, palette_levels, *, checkpoint_directory
         return bands, [], []
     thresholds = metres[positive]
     if checkpoint_directory is None:
-        curves = terrain_level_curves(terrain_field, thresholds)
+        curves = cartographic_level_curves(terrain_field, thresholds)
     else:
         from .physical_contour_stage import staged_height_curves
         curves = staged_height_curves(terrain_field, thresholds, checkpoint_directory,

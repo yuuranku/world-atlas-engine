@@ -284,13 +284,13 @@ class AtlasTilesCoverageTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     coverage.read_city_overlay(review,manifest,0,0)
 
-    def test_city_payload_over_two_mib_is_rejected_by_measured_bytes(self):
+    def test_city_payload_over_three_mib_is_rejected_by_measured_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
             review,_ = fixture(Path(temporary))
             manifest = coverage.read_manifest(review)
             path = review/"tiles"/"city-detail"/"0-0.json"
             path.write_bytes(path.read_bytes()+b" "*coverage.MAX_TILE_BYTES)
-            with self.assertRaisesRegex(ValueError,"2 MiB"):
+            with self.assertRaisesRegex(ValueError,"3 MiB"):
                 coverage.read_city_overlay(review,manifest,0,0)
 
 

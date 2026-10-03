@@ -8,7 +8,8 @@ import shapely
 
 from .cartographic_features import line_features
 from .cartographic_tiles import TileFeature
-from .implicit_terrain import terrain_height_range, terrain_level_curves
+from .implicit_terrain import terrain_height_range
+from .cartographic_contours import CARTOGRAPHIC_CONTOUR_CONTRACT, cartographic_level_curves
 
 
 @dataclass(frozen=True)
@@ -100,7 +101,7 @@ def derive_city_relief(grid, terrain_field, settlements, palette_levels, *, sett
         levels = np.arange(max(100, math.ceil(minimum/100)*100),
                            math.floor(maximum/100)*100+1, 100, dtype=float)
         levels = levels[~np.any(abs(levels[:, None]-major_m[None, :]) < 20, axis=1)]
-    curves = terrain_level_curves(terrain_field, levels, query_bounds=query_bounds) if len(levels) else []
+    curves = cartographic_level_curves(terrain_field, levels, query_bounds=query_bounds) if len(levels) else []
     support_tree = shapely.STRtree([shapely.box(item["x"]-item["rx"], item["y"]-item["ry"],
         item["x"]+item["rx"], item["y"]+item["ry"]) for item in supports])
     features = []
@@ -121,7 +122,8 @@ def derive_city_relief(grid, terrain_field, settlements, palette_levels, *, sett
         if any(_intersects_support(features[int(index)].geometry.intersection(rectangle),
                                    supports, support_tree) for index in feature_tree.query(rectangle)):
             tiles.append((row, column))
-    diagnostics = {"schema":"city-relief-implicit-v2","interpretation":"True 100-metre minor contours on the accepted continuous ground; global colour and major contours remain shared.",
+    diagnostics = {"schema":"city-relief-cartographic-v3","interpretation":"Quarter-cell cartographic topology with true continuous-ground 100-metre edge roots; global colour and major contours remain shared.",
+                   "cartographicContract":dict(CARTOGRAPHIC_CONTOUR_CONTRACT),
                    "placeCounts":{tier:sum(city.tier==tier for city in settlements) for tier in ("metropolis","city","town")},
                    "supportRadiusKm":{"metropolis":50,"city":35,"town":15},"queryPatches":len(patches),
                    "queryLevels":len(levels),"publishedTiles":len(tiles),"minorContourIntervalM":100,"minorContourPoints":contour_points,

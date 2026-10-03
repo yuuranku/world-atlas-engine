@@ -29,7 +29,9 @@ def _band_geometry(paths):
         starts = np.flatnonzero(codes == 1)
         rings = [points[first:last] for first,last in zip(starts,(*starts[1:],len(points)),strict=True)]
         polygons.append(shapely.Polygon(rings[0],rings[1:]))
-    return shapely.union_all(polygons)
+    # These faces belong to one noded scalar arrangement. Coverage union can
+    # dissolve their shared edges without rebuilding that arrangement.
+    return shapely.coverage_union_all(polygons)
 
 
 @dataclass(frozen=True)
@@ -103,9 +105,24 @@ class ContinuousEcologyField:
                          for geometry,radius in zip(sources.river_geometries,radii,strict=True)]
         if not sources.lake_geometry.is_empty:
             self._sources.append((sources.periodic_parts(sources.lake_geometry),self.lake_radius))
-        self._trees = [(shapely.STRtree(parts),radius) for parts,radius in self._sources if len(parts)]
+        self._trees = []
+        for parts,radius in self._sources:
+            if not len(parts):continue
+            line_indices = np.flatnonzero(shapely.get_type_id(parts)==1)
+            polygon_indices = np.flatnonzero(shapely.get_type_id(parts)!=1)
+            coordinates,owner = shapely.get_coordinates(parts[line_indices],return_index=True)
+            same_line = owner[:-1]==owner[1:]
+            segments = shapely.linestrings(np.stack(
+                (coordinates[:-1][same_line],coordinates[1:][same_line]),axis=1))
+            original_owner = np.concatenate((line_indices[owner[:-1][same_line]],polygon_indices))
+            # Every original segment is unchanged. Smaller bounding boxes make
+            # nearest queries local; source parts still own all buffer arcs.
+            tree = shapely.STRtree(np.concatenate((segments,parts[polygon_indices])))
+            self._trees.append((tree,radius,parts,original_owner))
         self._native = None
         self._native_supply = None
+        self._native_y, self._native_x = np.where(self.land_mask)
+        self._native_y.flags.writeable = self._native_x.flags.writeable = False
         identity = hashlib.sha256()
         identity.update(ECOLOGY_MODEL.encode())
         identity.update(background.tobytes());identity.update(ceiling.tobytes());identity.update(land.tobytes())
@@ -124,7 +141,7 @@ class ContinuousEcologyField:
             stop=min(x.size,begin+16384)
             points=shapely.points(x[begin:stop],y[begin:stop])
             local=np.zeros(stop-begin,dtype=float)
-            for tree,radius in self._trees:
+            for tree,radius,_parts,_owner in self._trees:
                 indices,distance=tree.query_nearest(points,max_distance=radius,return_distance=True,all_matches=False)
                 kernel=np.square(1.-np.minimum(distance/radius,1.)**2)*self.supply_capacity
                 np.maximum.at(local,indices[0],kernel)
@@ -138,7 +155,7 @@ class ContinuousEcologyField:
     @property
     def native(self):
         if self._native is None:
-            y,x=np.where(self.land_mask)
+            y,x=self._native_y,self._native_x
             supply=self._supply_observations()
             values=np.zeros((self.height,self.width),dtype=float)
             values[y,x]=np.maximum(self.background.native[y,x],np.minimum(self.ceiling.native[y,x],supply))
@@ -148,7 +165,7 @@ class ContinuousEcologyField:
 
     def _supply_observations(self):
         if self._native_supply is None:
-            y,x=np.where(self.land_mask)
+            y,x=self._native_y,self._native_x
             self._native_supply=self.supply_points(x+.5,y+.5)
             self._native_supply.flags.writeable=False
         return self._native_supply
@@ -161,18 +178,18 @@ class ContinuousEcologyField:
         if level>self.supply_capacity:
             return shapely.GeometryCollection()
         factor=np.sqrt(1.-np.sqrt(level/self.supply_capacity))
-        y,x=np.where(self.land_mask)
+        y,x=self._native_y,self._native_x
         expected=self._supply_observations()>=level
         # GEOS encodes circular source arcs as inscribed chords. Refine that
         # same distance contour until its chords retain every actual native
         # witness. The model, radius and cut stay unchanged; no classified
         # cell or painted patch participates in constructing the geometry.
         groups=[]
-        for parts,radius in self._sources:
-            groups.append((parts,radius*factor,shapely.STRtree(parts),
+        for tree,radius,parts,owner in self._trees:
+            groups.append((parts,radius*factor,tree,owner,
                 parts.copy() if factor==0 else shapely.buffer(parts,radius*factor,quad_segs=16)))
         for resolution in (16,64,256,1024,4096):
-            contour=shapely.union_all(np.concatenate([geometry for _,_,_,geometry in groups])) if groups else shapely.GeometryCollection()
+            contour=shapely.union_all(np.concatenate([geometry for _,_,_,_,geometry in groups])) if groups else shapely.GeometryCollection()
             shapely.prepare(contour)
             observed=shapely.intersects_xy(contour,x+.5,y+.5)
             if np.array_equal(observed,expected):
@@ -181,10 +198,10 @@ class ContinuousEcologyField:
             # Only the original source parts responsible for an unresolved
             # witness need finer circular arcs. All other accepted chords
             # retain their sufficient precision, avoiding global oversampling.
-            for parts,radius,tree,geometry in groups:
+            for parts,radius,tree,owner,geometry in groups:
                 if radius<=0 or not len(witnesses):continue
                 pairs=tree.query_nearest(witnesses,max_distance=radius,all_matches=True)
-                indices=np.unique(pairs[1])
+                indices=np.unique(owner[pairs[1]])
                 if len(indices):geometry[indices]=shapely.buffer(parts[indices],radius,quad_segs=resolution*4)
         raise ValueError("continuous supply arcs must preserve every source native threshold witness")
 
@@ -194,8 +211,8 @@ class ContinuousEcologyField:
             raise ValueError("ecological classes require ordered finite cuts")
         background=[_band_geometry(paths) for paths in scalar_band_paths(self.background.native,self.land_mask,thresholds)]
         ceiling=[_band_geometry(paths) for paths in scalar_band_paths(self.ceiling.native,self.land_mask,thresholds)]
-        return [shapely.union_all((shapely.union_all(background[index+1:]),
-                    shapely.intersection(shapely.union_all(ceiling[index+1:]),self.supply_superlevel(float(level)))))
+        return [shapely.union_all((shapely.coverage_union_all([band for band in background[index+1:] if not band.is_empty]),
+                    shapely.intersection(shapely.coverage_union_all([band for band in ceiling[index+1:] if not band.is_empty]),self.supply_superlevel(float(level)))))
                 for index,level in enumerate(thresholds)]
 
     def superlevel(self,level):

@@ -638,17 +638,15 @@ def _refined_event_sections(field,level,starts,ends,lower,upper,axes,directions,
             axes[new_owners],directions[new_owners])
 
 
-def _refined_branch_paths(field,level,lower,upper,ports,bounds=None):
-    from .implicit_terrain_bounds import directional_bounds, field_range_gradient_bounds
-    if bounds is None:bounds=field_range_gradient_bounds
-
+def _refined_branch_requests(field,level,lower,upper,ports,bounds):
+    """Trace one true-port graph, batching its model queries across cuts."""
     starts,ends,branch_low,branch_high,branch_axes,branch_directions=[],[],[],[],[],[]
     terminal_paths=[]
     depth=0
     # Certification controls termination; a native interval can require more
     # than forty subdivisions before its conservative range excludes a level.
     while len(lower):
-        value_low,value_high,gradient_low,gradient_high=bounds(field,lower,upper)
+        value_low,value_high,gradient_low,gradient_high=yield ("range",lower,upper)
         active=(value_low<=level)&(value_high>=level)&(value_low!=value_high)
         lower,upper,gradient_low,gradient_high=(a[active]for a in
                                                 (lower,upper,gradient_low,gradient_high))
@@ -667,7 +665,7 @@ def _refined_branch_paths(field,level,lower,upper,ports,bounds=None):
             edge_first=corners[ids].reshape(-1,2)
             edge_last=np.roll(corners[ids],-1,axis=1).reshape(-1,2)
             edge_lower=np.minimum(edge_first,edge_last);edge_upper=np.maximum(edge_first,edge_last)
-            elo,ehi,eglo,eghi=bounds(field,edge_lower,edge_upper)
+            elo,ehi,eglo,eghi=yield ("range",edge_lower,edge_upper)
             axes=np.argmax(edge_upper-edge_lower,axis=1)
             edge_monotone=_monotone(eglo,eghi)[np.arange(len(axes)),axes]
             excluded=(elo>level)|(ehi<level)
@@ -687,19 +685,21 @@ def _refined_branch_paths(field,level,lower,upper,ports,bounds=None):
             regular[identifier]=True
         diagonal_ids=np.flatnonzero(~regular & ~np.any(monotone,axis=1))
         if len(diagonal_ids):
-            dlo,dhi=directional_bounds(field,lower[diagonal_ids],upper[diagonal_ids],
-                                      np.array(((1.,1.),(1.,-1.))))
+            dlo,dhi=yield ("direction",lower[diagonal_ids],upper[diagonal_ids],
+                           np.array(((1.,1.),(1.,-1.))))
             signed=_monotone(dlo,dhi)
             candidates=np.broadcast_to(_CHART_DIRECTIONS[2:],(len(diagonal_ids),2,2)).copy()
             proposed_ids=np.flatnonzero(~signed.any(axis=1))
             if len(proposed_ids):
                 ids=diagonal_ids[proposed_ids]
-                proposed=_separating_directions(field,lower[ids],upper[ids],bounds)
+                points=_corner_points(lower[ids],upper[ids]).reshape(-1,2)
+                _,_,glo,ghi=yield ("range",points,points)
+                proposed=_gradient_directions(glo,ghi)
                 valid=np.any(proposed!=0,axis=1)
                 plo,phi=np.zeros(len(ids)),np.zeros(len(ids))
                 if valid.any():
                     matrix=np.stack((proposed[valid],_chart_parameters(proposed[valid])),axis=2)
-                    lo,hi=directional_bounds(field,lower[ids[valid]],upper[ids[valid]],matrix)
+                    lo,hi=yield ("direction",lower[ids[valid]],upper[ids[valid]],matrix)
                     plo[valid],phi[valid]=lo[:,0],hi[:,0]
                 extra=np.zeros((len(diagonal_ids),2));extra[proposed_ids]=proposed
                 candidates=np.concatenate((candidates,extra[:,None]),axis=1)
@@ -826,6 +826,45 @@ def _refined_branch_paths(field,level,lower,upper,ports,bounds=None):
     return terminal_paths+adaptive_curve_paths(starts,ends,sections)
 
 
+def _resolve_branch_requests(field,generators,bounds):
+    """One oracle batch for all simultaneous levels, with separate roots.
+
+    Native source boxes, derivative certificates, branch choices and each
+    height's shared-port encounter order stay unchanged. Only independent
+    array queries are combined; hidden peaks still require the same proofs.
+    """
+    from .implicit_terrain_bounds import directional_bounds
+    output=[None]*len(generators)
+    pending=[]
+    for index,generator in enumerate(generators):
+        try:request=next(generator)
+        except StopIteration as finished:output[index]=finished.value
+        else:pending.append((index,generator,request))
+    while pending:
+        following=[]
+        for kind in ("range","direction"):
+            selected=[entry for entry in pending if entry[2][0]==kind]
+            if not selected:continue
+            lower=np.concatenate([entry[2][1]for entry in selected])
+            upper=np.concatenate([entry[2][2]for entry in selected])
+            if kind=="range":
+                answers=bounds(field,lower,upper)
+            else:
+                directions=np.concatenate([np.broadcast_to(entry[2][3],(len(entry[2][1]),2,2))
+                                           for entry in selected])
+                answers=directional_bounds(field,lower,upper,directions)
+            offset=0
+            for index,generator,request in selected:
+                stop=offset+len(request[1])
+                answer=tuple(values[offset:stop]for values in answers)
+                offset=stop
+                try:next_request=generator.send(answer)
+                except StopIteration as finished:output[index]=finished.value
+                else:following.append((index,generator,next_request))
+        pending=following
+    return output
+
+
 def _refined_curves(field,levels,lower,upper,coarse_low,coarse_high):
     """Share model certificates while each level retains its own true-port graph."""
     cuts=np.nextafter(levels,-np.inf)
@@ -834,12 +873,33 @@ def _refined_curves(field,levels,lower,upper,coarse_low,coarse_high):
     for begin in range(0,len(lower),2048):
         a,b=lower[begin:begin+2048],upper[begin:begin+2048]
         low,high=coarse_low[begin:begin+2048],coarse_high[begin:begin+2048]
-        bounds=_TerrainBatchBounds(field) if len(levels)>1 else None
+        bounds=_TerrainBatchBounds(field)
+        generators=[];owners=[]
         for index,(level,cut)in enumerate(zip(levels,cuts,strict=True)):
             selected=(low<=level)&(high>=level)
             if selected.any():
-                paths[index].extend(_refined_branch_paths(field,float(cut),a[selected],b[selected],ports[index],bounds))
+                generators.append(_refined_branch_requests(field,float(cut),a[selected],b[selected],ports[index],bounds))
+                owners.append(index)
+        for index,parts in zip(owners,_resolve_branch_requests(field,generators,bounds),strict=True):
+            paths[index].extend(parts)
     return [_joined_paths(parts)for parts in paths]
+
+
+def _refined_curve_boxes(field,levels,*,cells=None):
+    """Prepare level-independent native source boxes once for all cuts."""
+    if cells is not None:
+        low,high=_selected_ranges(field,cells)
+        lower,upper=_cell_boxes(field,cells)
+    else:
+        x,y=_native_axes(field)
+        coarse_low,coarse_high=_coarse_ranges(field)
+        needed=np.zeros_like(coarse_low,dtype=bool)
+        for level in levels:needed|=(coarse_low<=level)&(coarse_high>=level)
+        rows,columns=np.nonzero(needed)
+        lower=np.column_stack((x[columns],y[rows]))
+        upper=np.column_stack((x[columns+1],y[rows+1]))
+        low,high=coarse_low[rows,columns],coarse_high[rows,columns]
+    return lower,upper,low,high
 
 
 def terrain_level_curves(field,metre_levels,*,query_bounds=None):
@@ -854,18 +914,7 @@ def terrain_level_curves(field,metre_levels,*,query_bounds=None):
         return _base_level_curves(field,levels,cells)
     if not field._height.edge_count and not field._landforms.count:
         return _base_level_curves(field.base,levels,cells)
-    if cells is not None:
-        low,high=_selected_ranges(field,cells)
-        lower,upper=_cell_boxes(field,cells)
-    else:
-        x,y=_native_axes(field)
-        coarse_low,coarse_high=_coarse_ranges(field)
-        needed=np.zeros_like(coarse_low,dtype=bool)
-        for level in levels:needed|=(coarse_low<=level)&(coarse_high>=level)
-        rows,columns=np.nonzero(needed)
-        lower=np.column_stack((x[columns],y[rows]))
-        upper=np.column_stack((x[columns+1],y[rows+1]))
-        low,high=coarse_low[rows,columns],coarse_high[rows,columns]
+    lower,upper,low,high=_refined_curve_boxes(field,levels,cells=cells)
     if len(levels)>1 and len(lower)>2048:
         from .implicit_terrain_parallel import parallel_height_curves
         return parallel_height_curves(field,levels,lower,upper,low,high)

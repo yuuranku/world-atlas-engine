@@ -8,11 +8,11 @@ from unittest.mock import patch
 import numpy as np
 
 from world_atlas.core.continuous_terrain import PhysicalTerrainField
-from world_atlas.core.implicit_terrain import terrain_level_curves
+from world_atlas.core.cartographic_contours import cartographic_level_curves
 from world_atlas.core.terrain_refinement import RefinedTerrainField
 from world_atlas.core.physical_contour_stage import (
-    _binding, _extract_height, _initialize, _read_graph, _write_graph,
-    staged_height_curves,
+    _binding, _read_graph, _write_graph,
+    current_height_graphs, staged_height_curves,
 )
 
 
@@ -27,11 +27,11 @@ class PhysicalContourStageTests(unittest.TestCase):
     def test_actual_source_graphs_resume_without_repeating_extraction(self):
         source = field()
         levels = np.array((133.25, 189.5))
-        expected = terrain_level_curves(source, levels)
+        expected = cartographic_level_curves(source, levels)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             actual = staged_height_curves(source, levels, root, source_identity={"source": "immutable-fixture"})
-            with patch("world_atlas.core.physical_contour_stage.ProcessPoolExecutor",
+            with patch("world_atlas.core.physical_contour_stage.cartographic_curve_batches",
                        side_effect=AssertionError("complete source graphs must not be recalculated")):
                 resumed = staged_height_curves(source, levels, root, source_identity={"source": "immutable-fixture"})
             for wanted, generated, saved in zip(expected, actual, resumed, strict=True):
@@ -43,6 +43,10 @@ class PhysicalContourStageTests(unittest.TestCase):
             manifest = json.loads((root / "manifest.json").read_text())
             self.assertEqual(manifest["status"], "complete")
             self.assertEqual(manifest["completedHeights"], 2)
+            self.assertTrue(current_height_graphs(root))
+            with patch("world_atlas.core.physical_contour_stage._extraction_runtime_binding",
+                       return_value={"runtime": {"changed": True}}):
+                self.assertFalse(current_height_graphs(root))
             original = source.native_m.copy()
             for cut, paths in zip(levels, resumed, strict=True):
                 for path in paths:
@@ -91,7 +95,8 @@ class PhysicalContourStageTests(unittest.TestCase):
             staged_height_curves(source, [133.25], root, source_identity={"seed": 1})
             path = root / "level-000.npz"
             path.write_bytes(path.read_bytes() + b"changed")
-            with patch("world_atlas.core.physical_contour_stage.ProcessPoolExecutor",
+            self.assertFalse(current_height_graphs(root))
+            with patch("world_atlas.core.physical_contour_stage.cartographic_curve_batches",
                        side_effect=AssertionError("invalid source bytes must fail closed")):
                 with self.assertRaisesRegex(ValueError, "bytes changed"):
                     staged_height_curves(source, [133.25], root, source_identity={"seed": 1})
@@ -100,18 +105,20 @@ class PhysicalContourStageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = field()
-            paths = terrain_level_curves(source, [133.25])[0]
-            _write_graph(root, 0, 133.25, "exact-source", paths)
+            staged_height_curves(source,[133.25,189.5],root,source_identity={"source":"immutable"})
+            paths = cartographic_level_curves(source,[133.25])[0]
             original = (root / "level-000.npz").read_bytes()
-            _initialize(source, root, "exact-source")
-            with patch("world_atlas.core.implicit_terrain.terrain_level_curves",
+            fingerprint = json.loads((root / "manifest.json").read_text())["fingerprint"]
+            (root / "level-001.npz").unlink()
+            (root / "level-001.json").unlink()
+            with patch("world_atlas.core.physical_contour_stage.cartographic_curve_batches",
                        side_effect=ValueError("uncertified physical critical point")):
                 with self.assertRaisesRegex(ValueError, "uncertified"):
-                    _extract_height(1, 189.5)
+                    staged_height_curves(source,[133.25,189.5],root,source_identity={"source":"immutable"})
             self.assertFalse((root / "level-001.json").exists())
             self.assertFalse((root / "level-001.npz").exists())
             self.assertEqual(original, (root / "level-000.npz").read_bytes())
-            saved = _read_graph(root, 0, 133.25, "exact-source")
+            saved = _read_graph(root, 0, 133.25, fingerprint)
             for wanted, actual in zip(paths, saved, strict=True):
                 np.testing.assert_array_equal(wanted.view(np.uint64), actual.view(np.uint64))
 
@@ -124,6 +131,21 @@ class PhysicalContourStageTests(unittest.TestCase):
         with patch("world_atlas.core.physical_contour_stage._sha", return_value="changed-source"):
             third = _binding(source, [133.25], {"seed": 1})
         self.assertNotEqual(second, third)
+
+    def test_cartographic_sampling_contract_is_bound_and_old_exact_schema_rejected(self):
+        source = field()
+        binding = _binding(source,[133.25],{"seed":1})
+        self.assertEqual(binding["cartographicContract"]["subdivisionPerNativeCell"],4)
+        self.assertFalse(binding["cartographicContract"]["physicalResolutionChanged"])
+        with tempfile.TemporaryDirectory() as temporary:
+            staged_height_curves(source,[133.25],temporary,source_identity={"seed":1})
+            path=Path(temporary)/"manifest.json"
+            record=json.loads(path.read_text())
+            record["schema"]="physical-height-graphs-v1"
+            path.write_text(json.dumps(record))
+            self.assertFalse(current_height_graphs(temporary))
+            with self.assertRaisesRegex(ValueError,"obsolete physical contour stage"):
+                staged_height_curves(source,[133.25],temporary,source_identity={"seed":1})
 
 
 if __name__ == "__main__":

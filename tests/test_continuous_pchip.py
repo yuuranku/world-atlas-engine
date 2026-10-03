@@ -77,5 +77,19 @@ class ContinuousPchipTests(unittest.TestCase):
                                               getattr(separate, attribute).view(np.uint64))
 
 
+from world_atlas.core.continuous_pchip import interior_uniform_coefficients
+
+class UniformInteriorPchipTests(unittest.TestCase):
+    def test_middle_coefficients_match_scipy_for_switches_plateaus_and_scales(self):
+        rng = np.random.default_rng(823173)
+        values = rng.normal(size=(4, 4096))*10**rng.uniform(-100,100,(1,4096))
+        values[:, :5] = np.asarray(((0.,0.,0.,0.),(1.,1.,1.,1.),
+                                   (0.,1.,1.,2.),(1.,3.,2.,5.),
+                                   (3.,2.,1.,0.))).T
+        expected = PchipInterpolator(np.arange(-1,3), values, axis=0).c[:,1]
+        actual = interior_uniform_coefficients(values)
+        np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+
+
 if __name__ == '__main__':
     unittest.main()

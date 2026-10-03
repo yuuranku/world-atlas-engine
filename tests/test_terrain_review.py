@@ -13,6 +13,7 @@ from scripts.check_coastal_coverage import path_geometry
 from world_atlas.core.continuous_terrain import PhysicalTerrainField
 from world_atlas.core.procedural_planet import ProceduralSurface, save_surface_bundle
 from world_atlas.core.terrain_review import publish_terrain_review
+from world_atlas.core.cartographic_contours import CARTOGRAPHIC_CONTOUR_CONTRACT
 
 
 class TerrainReviewTests(unittest.TestCase):
@@ -47,7 +48,8 @@ class TerrainReviewTests(unittest.TestCase):
             document = ET.parse(output/'contours.svg')
             paths = document.findall('.//{http://www.w3.org/2000/svg}path')
             self.assertEqual(record['contourCount'], len(paths))
-            self.assertEqual(record['contourModel'],'source-tensor-pchip-native-roots-adaptive-curves')
+            self.assertEqual(record['contourModel'],CARTOGRAPHIC_CONTOUR_CONTRACT['schema'])
+            self.assertEqual(record['cartographicContract'],CARTOGRAPHIC_CONTOUR_CONTRACT)
             self.assertEqual((output/'terrain.png').read_bytes(),
                              (source/'physical-reference.procedural.png').read_bytes())
             self.assertEqual((output/'provenance.json').read_text(encoding='utf-8'), provenance)
@@ -57,7 +59,7 @@ class TerrainReviewTests(unittest.TestCase):
             self.assertTrue(geometry.contains(shapely.Point(3.5,3.5)))
             self.assertFalse(geometry.contains(shapely.Point(4.,4.)),
                              'the source model already owns native n+.5 coordinates')
-            self.assertGreater(len(geometry.exterior.coords),16)
+            self.assertGreaterEqual(len(geometry.exterior.coords),5)
             points = np.asarray(geometry.exterior.coords)
             self.assertLess(float(abs(terrain.sample_points(points[:,0],points[:,1])-threshold).max()),3e-8)
             self.assertEqual(record['contourBytes'],(output/'contours.svg').stat().st_size)

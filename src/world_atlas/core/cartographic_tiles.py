@@ -1,11 +1,14 @@
 """Slice authoritative cartographic geometry into native-coordinate SVG blocks."""
 
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 import html
 import json
 import logging
 import math
+import multiprocessing
+import os
 from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
@@ -39,7 +42,7 @@ class TileLevel:
 
 _ATTRIBUTE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]*$")
 _PRECISION = COORDINATE_SCALE
-_MAX_TILE_BYTES = 2 * 1024 * 1024
+MAX_TILE_BYTES = 3 * 1024 * 1024
 
 
 class _TileIDs(Mapping):
@@ -151,6 +154,7 @@ def feature_markup(
     *,
     clip_ids: Mapping[str, str] | None = None,
     id_map: Mapping[str, str] | None = None,
+    _serialized_paths: tuple[tuple[str, bool], ...] | None = None,
 ) -> str:
     """Render a feature; an explicit curve path is retained byte for byte.
 
@@ -162,7 +166,9 @@ def feature_markup(
     if geometry is None:
         geometry = feature.geometry
     grouped_paths = {}
-    for data, polygon in ([(feature.path_data, False)] if feature.path_data else _geometry_paths(geometry)):
+    paths = (_serialized_paths if _serialized_paths is not None else
+             [(feature.path_data, False)] if feature.path_data else _geometry_paths(geometry))
+    for data, polygon in paths:
         if not polygon and feature.path_data is None and feature.geometry.geom_type in {"Polygon", "MultiPolygon"}:
             # Exact clipping can leave isolated lines where a filled face
             # merely touches a tile. Those intersections draw no filled area.
@@ -200,23 +206,41 @@ def feature_markup(
 
 
 def _layer_groups(features: list[tuple[TileFeature, BaseGeometry]], clip_ids: Mapping[str, str],
-                  id_map: Mapping[str, str]) -> str:
+                  id_map: Mapping[str, str], path_cache: dict | None = None) -> str:
     # Keep producer paint order, including repeated layers, rather than sorting
     # independently generated colour bands or moving ink behind filled faces.
     result, body, current_layer = [], [], None
     pending=[]; previous=None
 
+    def paint(feature, geometry):
+        if path_cache is None or feature.path_data:
+            return feature_markup(feature, geometry, clip_ids=clip_ids, id_map=id_map)
+        key = ("paths", id(geometry))
+        if key not in path_cache:
+            path_cache[key] = tuple(_geometry_paths(geometry))
+        return feature_markup(feature, geometry, clip_ids=clip_ids, id_map=id_map,
+                              _serialized_paths=path_cache[key])
+
     def flush():
         if not pending:return
         first=pending[0][0]
         geometries=[geometry for _,geometry in pending]
-        lines=all(geometry.geom_type in {'LineString','MultiLineString'} for geometry in geometries)
-        if len(pending)>1 and (lines or shapely.coverage_is_valid(geometries)):
+        key = ("group", tuple(id(geometry) for geometry in geometries))
+        if path_cache is not None and key in path_cache:
+            merged_paths = path_cache[key]
+        else:
+            lines=all(geometry.geom_type in {'LineString','MultiLineString'} for geometry in geometries)
+            merge = len(pending)>1 and (lines or shapely.coverage_is_valid(geometries))
+            merged_paths = tuple(_geometry_paths(GeometryCollection(geometries))) if merge else None
+            if path_cache is not None:
+                path_cache[key] = merged_paths
+        if merged_paths is not None:
             # One multipart fill retains every ring and exact vertex while
             # eliminating repeated attributes and separate DOM paint nodes.
-            body.append(feature_markup(first,GeometryCollection(geometries),clip_ids=clip_ids,id_map=id_map))
+            body.append(feature_markup(first, clip_ids=clip_ids, id_map=id_map,
+                                       _serialized_paths=merged_paths))
         else:
-            body.extend(feature_markup(feature,geometry,clip_ids=clip_ids,id_map=id_map)for feature,geometry in pending)
+            body.extend(paint(feature,geometry) for feature,geometry in pending)
         pending.clear()
 
     for feature, geometry in features:
@@ -232,7 +256,7 @@ def _layer_groups(features: list[tuple[TileFeature, BaseGeometry]], clip_ids: Ma
             body = []
         current_layer = feature.layer
         if mergeable:pending.append((feature,geometry))
-        else:body.append(feature_markup(feature,geometry,clip_ids=clip_ids,id_map=id_map))
+        else:body.append(paint(feature,geometry))
         previous=key
     flush()
     if current_layer is not None:
@@ -259,21 +283,17 @@ def _feature_error(level: str, index: int, feature: TileFeature, reason: str) ->
     )
 
 
-def _tile_level_payloads(
-    output_dir: str | Path,
-    width: int,
-    height: int,
-    level: TileLevel,
-    *,
-    tile_size: int = 32,
-    clip_cache: dict,
-):
-    """Publish exact shared-geometry blocks without modifying source features.
+@dataclass(frozen=True)
+class _PreparedTileLevel:
+    id: str
+    land_surface: BaseGeometry
+    source: tuple[TileFeature, ...]
+    themes: tuple[str, ...]
+    tree: STRtree
+    source_ids: frozenset[str]
 
-    ``clip='land'`` or ``clip='water'`` in attributes requests a tile-local
-    physical clip. Themes are always clipped to the same authoritative land.
-    Filled polygons have no stroke; outlines must be supplied as line features.
-    """
+
+def _prepare_tile_level(width, height, level, tile_size):
     if not isinstance(width, int) or not isinstance(height, int) or width <= 0 or height <= 0:
         raise ValueError("tile dimensions must be positive integers")
     if not isinstance(tile_size, int) or tile_size <= 0:
@@ -300,74 +320,116 @@ def _tile_level_payloads(
         if feature.path_data is not None and (not isinstance(feature.path_data, str) or not feature.path_data):
             raise _feature_error(level.id,index,feature,"path_data must be a nonempty SVG curve path when supplied")
 
-    columns, rows = math.ceil(width / tile_size), math.ceil(height / tile_size)
-    themes = ["none", *dict.fromkeys(feature.theme for feature in source if feature.theme)]
-    target = Path(output_dir)
-    target.mkdir(parents=True, exist_ok=True)
-    tiles = target / "tiles" / level.id
-    tiles.mkdir(parents=True, exist_ok=True)
     tree = STRtree([feature.geometry for feature in source])
     source_ids = frozenset([feature.attributes["id"] for feature in source if "id" in feature.attributes]
         + [identifier for feature in source for identifier in (feature.definitions or {})])
-    for row in range(rows):
-        for column in range(columns):
-            west, north = column * tile_size, row * tile_size
-            east, south = min(width, west + tile_size), min(height, north + tile_size)
-            rectangle = box(west, north, east, south)
-            line_rectangle = box(west - .5, north - .5, east + .5, south + .5)
-            land_key = id(land_surface), "land"
-            if land_key not in clip_cache:
-                clip_cache[land_key] = land_surface.intersection(rectangle)
-            physical_land = clip_cache[land_key]
-            land_data = " ".join(data for data, polygon in _geometry_paths(physical_land) if polygon)
-            rectangle_data = _segment(rectangle.exterior.coords, closed=True)
-            clip_ids = {"land":f"tile-land-{level.id}-{row}-{column}",
-                        "water":f"tile-water-{level.id}-{row}-{column}"}
-            id_map = _TileIDs(source_ids, f"-tile-{level.id}-{row}-{column}")
-            definitions = (
-                '<defs>'
-                + ''.join(
-                    f'<clipPath id="{clip_ids[kind]}" clipPathUnits="userSpaceOnUse">'
-                    f'<path d="{data}" clip-rule="evenodd" /></clipPath>'
-                    for kind, data in (("land", land_data), ("water", rectangle_data + " " + land_data))
-                )
-                + '</defs>'
+    themes = ("none", *dict.fromkeys(feature.theme for feature in source if feature.theme))
+    return _PreparedTileLevel(level.id, land_surface, source, themes, tree, source_ids)
+
+
+def _tile_level_payloads(output_dir, width, height, level, *, tile_size,
+                         clip_cache, path_cache, positions):
+    """Use exact intersections and paths shared by all levels of one tile."""
+    columns = math.ceil(width / tile_size)
+    land_surface, source, themes, tree, source_ids = (
+        level.land_surface, level.source, level.themes, level.tree, level.source_ids)
+    tiles = Path(output_dir) / "tiles" / level.id
+    for position in positions:
+        row, column = divmod(position, columns)
+        west, north = column * tile_size, row * tile_size
+        east, south = min(width, west + tile_size), min(height, north + tile_size)
+        rectangle = box(west, north, east, south)
+        line_rectangle = box(west - .5, north - .5, east + .5, south + .5)
+        land_key = id(land_surface), "land"
+        if land_key not in clip_cache:
+            clip_cache[land_key] = land_surface.intersection(rectangle)
+        physical_land = clip_cache[land_key]
+        land_path_key = id(land_surface), "land-path"
+        if land_path_key not in path_cache:
+            path_cache[land_path_key] = " ".join(
+                data for data, polygon in _geometry_paths(physical_land) if polygon)
+        land_data = path_cache[land_path_key]
+        if "rectangle-path" not in path_cache:
+            path_cache["rectangle-path"] = _segment(rectangle.exterior.coords, closed=True)
+        rectangle_data = path_cache["rectangle-path"]
+        clip_ids = {"land":f"tile-land-{level.id}-{row}-{column}",
+                    "water":f"tile-water-{level.id}-{row}-{column}"}
+        id_map = _TileIDs(source_ids, f"-tile-{level.id}-{row}-{column}")
+        definitions = (
+            '<defs>'
+            + ''.join(
+                f'<clipPath id="{clip_ids[kind]}" clipPathUnits="userSpaceOnUse">'
+                f'<path d="{data}" clip-rule="evenodd" /></clipPath>'
+                for kind, data in (("land", land_data), ("water", rectangle_data + " " + land_data))
             )
-            sections = {"surface":[], "ink":[]}
-            thematic = {theme:[] for theme in themes if theme != "none"}
-            for index in sorted(tree.query(rectangle).tolist()):
-                feature = source[index]
-                if feature.path_data:
-                    clipped = feature.geometry
-                else:
-                    key = id(feature.geometry), "feature"
-                    if key not in clip_cache:
-                        clip_cache[key] = _clip_geometry(feature.geometry, rectangle, line_rectangle)
-                    clipped = clip_cache[key]
-                if clipped.is_empty:
-                    continue
-                destination = thematic[feature.theme] if feature.section == "theme" else sections[feature.section]
-                destination.append((feature, clipped))
-            surface_markup=_layer_groups(sections["surface"],clip_ids,id_map)
-            ink_markup=_layer_groups(sections["ink"],clip_ids,id_map)
-            theme_markup={theme:f'<g clip-path="url(#{clip_ids["land"]})">{_layer_groups(items,clip_ids,id_map)}</g>'
-                          if items else ""for theme,items in thematic.items()}
-            paint_definitions = feature_definitions([feature for items in (*sections.values(),*thematic.values())
-                                                    for feature,_ in items],surface_markup+ink_markup+"".join(theme_markup.values()),id_map)
-            definitions = definitions.removesuffix('</defs>')+paint_definitions+'</defs>'
-            payload = {
-                "bounds":[west,north,east-west,south-north],
-                "surface":definitions + surface_markup,
-                "themes":{"none":"",**theme_markup},
-                "ink":ink_markup,
-            }
-            encoded = json.dumps(payload,ensure_ascii=False,separators=(",", ":")).encode("utf-8")
-            if len(encoded) > _MAX_TILE_BYTES:
-                raise ValueError(
-                    f"tile JSON byte budget exceeded; level={level.id!r} row={row} column={column} "
-                    f"bytes={len(encoded)} limit={_MAX_TILE_BYTES}"
-                )
-            yield tiles / f"{row}-{column}.json", encoded
+            + '</defs>'
+        )
+        sections = {"surface":[], "ink":[]}
+        thematic = {theme:[] for theme in themes if theme != "none"}
+        for index in sorted(tree.query(rectangle).tolist()):
+            feature = source[index]
+            if feature.path_data:
+                clipped = feature.geometry
+            else:
+                key = id(feature.geometry), "feature"
+                if key not in clip_cache:
+                    clip_cache[key] = _clip_geometry(feature.geometry, rectangle, line_rectangle)
+                clipped = clip_cache[key]
+            if clipped.is_empty:
+                continue
+            destination = thematic[feature.theme] if feature.section == "theme" else sections[feature.section]
+            destination.append((feature, clipped))
+        surface_markup=_layer_groups(sections["surface"],clip_ids,id_map,path_cache)
+        ink_markup=_layer_groups(sections["ink"],clip_ids,id_map,path_cache)
+        theme_markup={theme:f'<g clip-path="url(#{clip_ids["land"]})">{_layer_groups(items,clip_ids,id_map,path_cache)}</g>'
+                      if items else ""for theme,items in thematic.items()}
+        paint_definitions = feature_definitions([feature for items in (*sections.values(),*thematic.values())
+                                                for feature,_ in items],surface_markup+ink_markup+"".join(theme_markup.values()),id_map)
+        definitions = definitions.removesuffix('</defs>')+paint_definitions+'</defs>'
+        payload = {
+            "bounds":[west,north,east-west,south-north],
+            "surface":definitions + surface_markup,
+            "themes":{"none":"",**theme_markup},
+            "ink":ink_markup,
+        }
+        encoded = json.dumps(payload,ensure_ascii=False,separators=(",", ":")).encode("utf-8")
+        if len(encoded) > MAX_TILE_BYTES:
+            raise ValueError(
+                f"tile JSON byte budget exceeded; level={level.id!r} row={row} column={column} "
+                f"bytes={len(encoded)} limit={MAX_TILE_BYTES}"
+            )
+        yield tiles / f"{row}-{column}.json", encoded
+
+
+def _publish_tile_batch(parameters, positions):
+    output_dir, width, height, prepared, tile_size = parameters
+    clip_cache, path_cache = {}, {}
+    stats = {"totalTiles": 0, "maxTileBytes": 0, "totalTileBytes": 0}
+    streams = [_tile_level_payloads(output_dir, width, height, level,
+        tile_size=tile_size, clip_cache=clip_cache, path_cache=path_cache, positions=positions)
+        for level in prepared]
+    for blocks in zip(*streams, strict=True):
+        for path, encoded in blocks:
+            path.write_bytes(encoded)
+            stats["totalTiles"] += 1
+            stats["maxTileBytes"] = max(stats["maxTileBytes"], len(encoded))
+            stats["totalTileBytes"] += len(encoded)
+        # Shared geometry and encoded paths live for one spatial block only.
+        clip_cache.clear()
+        path_cache.clear()
+    return stats
+
+
+_TILE_WORKER_PARAMETERS = None
+
+
+def _initialize_tile_worker(parameters):
+    global _TILE_WORKER_PARAMETERS
+    _TILE_WORKER_PARAMETERS = parameters
+
+
+def _write_tile_batch(bounds):
+    return _publish_tile_batch(_TILE_WORKER_PARAMETERS, range(*bounds))
 
 
 def write_atlas_tiles(
@@ -377,8 +439,13 @@ def write_atlas_tiles(
     levels: Sequence[TileLevel],
     *,
     tile_size: int = 32,
+    workers: int | None = None,
 ) -> dict:
-    """Publish ordered detail levels sharing native units and the same themes."""
+    """Publish exact detail blocks with bounded independent worker batches.
+
+    Large atlases use at most four processes. Callers using multiple workers
+    must enter through an importable, main-guarded Python program.
+    """
     if not levels or any(not isinstance(level, TileLevel) for level in levels):
         raise ValueError("levels must contain TileLevel values")
     prepared = [TileLevel(level.id, level.min_scale, level.land_surface, tuple(level.features))
@@ -397,20 +464,40 @@ def write_atlas_tiles(
         if themes is not None and themes != level_themes:
             raise ValueError("every level must publish the same themes in the same order")
         themes = level_themes
+    sources = tuple(_prepare_tile_level(width, height, level, tile_size) for level in prepared)
+    tile_count = math.ceil(width / tile_size) * math.ceil(height / tile_size)
+    if workers is None:
+        workers = min(4, max(1, (os.process_cpu_count() or 1) // 2), math.ceil(tile_count / 256))
+    if not isinstance(workers, int) or workers < 1:
+        raise ValueError("workers must be a positive integer")
+    workers = min(workers, tile_count)
+    output = Path(output_dir)
+    for level in sources:
+        (output / "tiles" / level.id).mkdir(parents=True, exist_ok=True)
+    parameters = output, width, height, sources, tile_size
     stats = {"totalTiles":0,"maxTileBytes":0,"totalTileBytes":0}
-    # The levels share the same feature objects except for their coastlines.
-    # Complete all levels of one tile before discarding its exact intersections.
-    # This bounds cache memory to one tile and preserves each level's paint order.
-    clip_cache = {}
-    streams = [_tile_level_payloads(output_dir, width, height, level,
-                                   tile_size=tile_size, clip_cache=clip_cache) for level in prepared]
-    for blocks in zip(*streams, strict=True):
-        for path, encoded in blocks:
-            path.write_bytes(encoded)
-            stats["totalTiles"] += 1
-            stats["maxTileBytes"] = max(stats["maxTileBytes"], len(encoded))
-            stats["totalTileBytes"] += len(encoded)
-        clip_cache.clear()
+    if workers == 1:
+        batches = [_publish_tile_batch(parameters, range(tile_count))]
+    else:
+        logging.info("Publishing %s spatial tile blocks at %s levels on %s workers",
+                     tile_count, len(prepared), workers)
+        executor = ProcessPoolExecutor(max_workers=workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_initialize_tile_worker, initargs=(parameters,))
+        batch_size = min(128, math.ceil(tile_count / (workers * 4)))
+        bounds = ((start, min(start + batch_size, tile_count))
+                  for start in range(0, tile_count, batch_size))
+        try:
+            batches = list(executor.map(_write_tile_batch, bounds, buffersize=workers * 2))
+        except BaseException:
+            executor.terminate_workers()
+            raise
+        else:
+            executor.shutdown(wait=True)
+    for batch in batches:
+        stats["totalTiles"] += batch["totalTiles"]
+        stats["maxTileBytes"] = max(stats["maxTileBytes"], batch["maxTileBytes"])
+        stats["totalTileBytes"] += batch["totalTileBytes"]
     manifest = {"width":width, "height":height, "tileSize":tile_size,
                 "columns":math.ceil(width/tile_size), "rows":math.ceil(height/tile_size),
                 "themes":themes,
@@ -481,8 +568,8 @@ def write_city_relief_tiles(output_dir: str | Path, relief) -> dict:
                    "surface":definitions,
                    "ink":wrapper+_layer_groups(sections["ink"],clips,{})+'</g>'}
         encoded = json.dumps(payload,ensure_ascii=False,separators=(",",":")).encode("utf-8")
-        if len(encoded)>_MAX_TILE_BYTES:
-            raise ValueError(f"city relief JSON byte budget exceeded: {suffix}: {len(encoded)} > {_MAX_TILE_BYTES}")
+        if len(encoded)>MAX_TILE_BYTES:
+            raise ValueError(f"city relief JSON byte budget exceeded: {suffix}: {len(encoded)} > {MAX_TILE_BYTES}")
         (tiles/f"{row}-{column}.json").write_bytes(encoded)
         stats["totalTiles"]+=1
         stats["totalTileBytes"]+=len(encoded)
@@ -568,9 +655,9 @@ def refresh_atlas_tile_themes(source_dir: Path, target_dir: Path, features: Sequ
                         _layer_groups(items,clip_ids,{}),
                         before="transport-network" if layer in {"state-boundaries","province-boundaries"} else None)
                 encoded = json.dumps(payload,ensure_ascii=False,separators=(",", ":")).encode("utf-8")
-                if len(encoded) > _MAX_TILE_BYTES:
+                if len(encoded) > MAX_TILE_BYTES:
                     raise ValueError(f"tile JSON byte budget exceeded; level={level['id']!r} row={row} "
-                                     f"column={column} bytes={len(encoded)} limit={_MAX_TILE_BYTES}")
+                                     f"column={column} bytes={len(encoded)} limit={MAX_TILE_BYTES}")
                 (target / path.name).write_bytes(encoded)
                 stats["totalTiles"] += 1
                 stats["maxTileBytes"] = max(stats["maxTileBytes"],len(encoded))

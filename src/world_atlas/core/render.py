@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from collections.abc import Mapping, Sequence
 import colorsys
 import html
@@ -11,9 +12,11 @@ import io
 import json
 import logging
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import re
+import time
 from dataclasses import replace
 from typing import Any
 
@@ -26,6 +29,7 @@ from .model import (
     _atomic_replace_files,
     _file_identity,
     _temporary_file,
+    _thaw_json,
     _unlink_owned_file,
 )
 from .hypsometry import (
@@ -60,7 +64,7 @@ from .continuous_terrain import PhysicalTerrainField
 from .terrain_refinement import terrain_from_source
 from .continuous_scalar import scalar_band_paths
 from .continuous_ecology import FreshwaterCorridors
-from .vegetation import derive_vegetation_cover, derive_vegetation_field, VEGETATION_THRESHOLDS
+from .vegetation import VegetationCover, derive_vegetation_field, VEGETATION_THRESHOLDS
 from .cartographic_relief import physical_relief_paths
 from .cartographic_generalization import generalize_display_surface
 from .procedural_planet import ProceduralSurface
@@ -923,6 +927,40 @@ def _scalar_working_surface(working_surface):
     """
     outer = shapely.union_all(shapely.get_parts(working_surface))
     return shapely.set_precision(shapely.set_precision(outer, 1e-8), 0)
+
+
+def _numeric_ecology_paths(grid, climate, sources, working_surface, output_dir):
+    """Build independent numeric themes with one field per theme.
+
+    GEOS and NumPy release the GIL; bounded threads share the immutable source
+    river trees and ground arrays instead of copying a world into processes.
+    """
+    jobs = (
+        ("land-potential", derive_land_potential_field, LAND_POTENTIAL_THRESHOLDS),
+        ("habitability", derive_habitability_field, HABITABILITY_THRESHOLDS),
+        ("vegetation", derive_vegetation_field, VEGETATION_THRESHOLDS),
+    )
+
+    def build(name, derive, thresholds):
+        started = time.perf_counter()
+        field = derive(grid, climate, ecological_sources=sources)
+        cover = VegetationCover(field.native) if name == "vegetation" else None
+        paths = field.band_paths(thresholds, working_surface=working_surface)
+        elapsed = time.perf_counter() - started
+        logging.getLogger(__name__).info("Numeric theme %s complete: %.1f s", name, elapsed)
+        return paths, cover, elapsed
+
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        futures = [executor.submit(build, *job) for job in jobs]
+        results = [future.result() for future in futures]
+    (output_dir / "numeric-themes-timing.json").write_text(json.dumps({
+        "elapsedSeconds": round(time.perf_counter() - started, 3),
+        "parallelWorkers": len(jobs),
+        "themes": [{"name": job[0], "elapsedSeconds": round(result[2], 3)}
+                   for job, result in zip(jobs, results, strict=True)],
+    }, indent=2) + "\n", encoding="utf-8")
+    return [result[0] for result in results], results[-1][1]
 
 
 def _scalar_zone_paths(values, land_mask, thresholds, *, working_surface):
@@ -3999,8 +4037,76 @@ def _html_document(
 '''
 
 
+def _render_grid_payload(grid):
+    """Transfer immutable grid arrays with JSON metadata to spawned workers."""
+    return {**{name: getattr(grid, name) for name in grid._ARRAY_NAMES},
+            "metadata": _thaw_json(grid.metadata)}
+
+
+def _render_relief_stage(output_dir, terrain_field, levels, source_identity):
+    with measure_stage(output_dir, "physical-relief"):
+        return physical_relief_paths(
+            terrain_field, levels,
+            checkpoint_directory=output_dir.parent / "physical-contours",
+            source_identity=source_identity)
+
+
+def _render_ecology_stage(output_dir, grid_payload, climate, sources, working_surface):
+    grid = WorldGrid(**grid_payload)
+    with measure_stage(output_dir, "numeric-ecology-themes"):
+        return _numeric_ecology_paths(
+            grid, climate, sources, _scalar_working_surface(working_surface), output_dir)
+
+
+def _render_population_stage(output_dir, density, land_mask, working_surface):
+    with measure_stage(output_dir, "numeric-population-theme"):
+        return _population_zone_paths(density, land_mask, working_surface=working_surface)
+
+
+def _render_transport_stage(output_dir, grid_payload, society, locations, terrain_field,
+                            land_surface, river_source_paths, river_paths,
+                            river_channel_geometry, raw_elevation_m):
+    from .city_harbors import derive_harbors, connect_harbor_routes
+    from .transport_artifacts import write_transport_sources
+
+    grid = WorldGrid(**grid_payload)
+    with measure_stage(output_dir, "transport-geometry"):
+        harbors = derive_harbors(grid, society, locations, terrain_field,
+            road_surface=land_surface.difference(river_channel_geometry), land_surface=land_surface)
+        society = replace(society, transport=replace(society.transport,
+            routes=connect_harbor_routes(society.transport.routes, harbors, grid,
+                                        land_surface=land_surface)))
+        display_river_geometry = shapely.MultiLineString(river_paths)
+        prepared = prepare_transport_geometry(
+            grid, society.transport.routes, society.transport.bridges,
+            locations=locations, land_surface=land_surface,
+            river_source_geometry=shapely.MultiLineString(river_source_paths),
+            river_geometry=display_river_geometry,
+            river_channel_geometry=river_channel_geometry,
+            raw_elevation_m=raw_elevation_m, terrain_field=terrain_field)
+        roads, proof = write_transport_sources(output_dir, grid, prepared,
+            river_geometry=display_river_geometry, channel_geometry=river_channel_geometry)
+    return society.transport.routes, locations, harbors, prepared, roads, proof["checks"]
+
+
 def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: ProceduralSurface,
                   society: SocietyLayers | None = None, travel_capabilities: tuple[str,...] = ()) -> dict[str, Any]:
+    """Render independent geometry stages on three bounded worker processes."""
+    executor = ProcessPoolExecutor(max_workers=3, mp_context=multiprocessing.get_context("spawn"))
+    try:
+        return _render_review(grid, output_dir, physical_source=physical_source,
+                              society=society, travel_capabilities=travel_capabilities,
+                              executor=executor)
+    except BaseException:
+        executor.terminate_workers()
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: ProceduralSurface,
+                   society: SocietyLayers | None, travel_capabilities: tuple[str,...],
+                   executor: ProcessPoolExecutor) -> dict[str, Any]:
     """Write a raster export and an inline SVG review page from canonical arrays.
 
     The raster is retained as an export/debug artifact; the visible map base
@@ -4052,29 +4158,24 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
 
     logger = logging.getLogger(__name__)
     logger.info("Reconstructing the accepted physical ground")
-    terrain_field = terrain_from_source(grid, physical_source)
+    with measure_stage(output_dir, "physical-ground"):
+        terrain_field = terrain_from_source(grid, physical_source)
     logger.info("Extracting the shared physical shoreline")
-    land_surface = continuous_land_surface(grid, terrain_field=terrain_field)
-    land_surface_paths = _geometry_filled_paths(land_surface)
-    coast_paths = _surface_outline_paths(land_surface_paths, grid.shape)
-    lake_fill_paths = _geometry_filled_paths(_lake_surface(grid, land_surface))
-    lake_paths = _surface_outline_paths(lake_fill_paths, grid.shape)
+    with measure_stage(output_dir, "physical-shoreline"):
+        land_surface = continuous_land_surface(grid, terrain_field=terrain_field)
+        land_surface_paths = _geometry_filled_paths(land_surface)
+        coast_paths = _surface_outline_paths(land_surface_paths, grid.shape)
+        lake_fill_paths = _geometry_filled_paths(_lake_surface(grid, land_surface))
+        lake_paths = _surface_outline_paths(lake_fill_paths, grid.shape)
     # Every water boundary is already a physical coast. Separate lake and
     # inland-sea outlines used to draw misaligned duplicates of that shore.
     inland_sea_paths: list[np.ndarray] = []
     logger.info("Extracting continuous physical relief")
-    relief_bands, contour_paths, contour_path_levels = physical_relief_paths(
+    relief_future = executor.submit(_render_relief_stage, output_dir,
         terrain_field, _elevation_thresholds(grid),
-        checkpoint_directory=output_dir.parent / "physical-contours",
-        source_identity={"gridDigest": digest,
-                         "rawElevationSha256": hashlib.sha256(
-                             np.ascontiguousarray(physical_source.relative_elevation_m).tobytes()).hexdigest(),
-                         "physicalDiagnostics": dict(physical_source.diagnostics)})
-    # Base colours cover the common land clip. Repeating its half-million
-    # vertices in both base bands adds no terrain information.
-    frame_paths = _geometry_filled_paths(shapely.box(0, 0, grid.shape[1], grid.shape[0]))
-    elevation_band_paths = [frame_paths] + [
-        frame_paths if band is None else band for band in relief_bands]
+        {"rawElevationSha256": hashlib.sha256(
+            np.ascontiguousarray(physical_source.relative_elevation_m).tobytes()).hexdigest(),
+         "physicalDiagnostics": dict(physical_source.diagnostics)})
     snow_fill_paths = _filled_mask_paths(grid.snow & (grid.water == 0))
     snow_paths = _surface_outline_paths(snow_fill_paths, grid.shape)
     polar_land_mask = polar_continent_mask(grid)
@@ -4148,6 +4249,16 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
     }, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
     capital_ids = {item.core_settlement_id for item in society.politics.states}
     territorial_qa = _territorial_quality_metrics(grid, thematic, society)
+    city_locations = {
+        settlement.identifier: (settlement.row + 0.5, settlement.column + 0.5)
+        for settlement in society.settlements
+    }
+    logger.info("Resolving shared roads, river crossings and bridge facilities")
+    grid_payload = _render_grid_payload(grid)
+    transport_future = executor.submit(_render_transport_stage, output_dir,
+        grid_payload, society, city_locations, terrain_field, land_surface,
+        river_source_paths, river_paths, river_channel_geometry,
+        physical_source.relative_elevation_m)
     climate_zones = thematic.climate.koppen_code
     land_mask = grid.water == 0
     climate_zone_paths = _categorical_partition_paths(
@@ -4160,6 +4271,11 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
         geometry for band in climate_zone_paths
         for geometry in filled_geometries(band)
     ])
+    ecology_future = executor.submit(_render_ecology_stage, output_dir,
+        grid_payload, thematic.climate, ecological_sources, numeric_working_surface)
+    density = population_density(grid, society.population)
+    population_future = executor.submit(_render_population_stage, output_dir,
+        density, land_mask, numeric_working_surface)
     biome_zone_paths = _categorical_partition_paths(
         thematic.biome_zone,
         land_mask,
@@ -4172,13 +4288,6 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
         category_count=len(_WATERSHED_ZONES),
         land_surface=land_surface,
     )
-    potential_zone_paths = derive_land_potential_field(grid,thematic.climate,ecological_sources=ecological_sources).band_paths(
-        LAND_POTENTIAL_THRESHOLDS,working_surface=_scalar_working_surface(numeric_working_surface))
-    habitability_zone_paths = derive_habitability_field(grid,thematic.climate,ecological_sources=ecological_sources).band_paths(
-        HABITABILITY_THRESHOLDS,working_surface=_scalar_working_surface(numeric_working_surface))
-    vegetation = derive_vegetation_cover(grid,thematic.climate,ecological_sources=ecological_sources)
-    vegetation_zone_paths = derive_vegetation_field(grid,thematic.climate,ecological_sources=ecological_sources).band_paths(
-        VEGETATION_THRESHOLDS,working_surface=_scalar_working_surface(numeric_working_surface))
     population_band_count = int(
         np.unique(society.population.population_band[land_mask]).size
     )
@@ -4188,9 +4297,6 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
         _POPULATION_ZONES,
         opacity=0.74,
     )
-    density = population_density(grid, society.population)
-    population_zone_paths = _population_zone_paths(
-        density, land_mask, working_surface=numeric_working_surface)
     civilization_zones = _culture_zones(society)
     civilization_display = _civilization_display_values(grid, thematic, society)
     civilization_partition = _coastal_partition_topology(
@@ -4413,6 +4519,15 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
         zones=_WATERSHED_ZONES,
         fill_opacity=0.70,
     )
+    numeric_paths, vegetation = ecology_future.result()
+    potential_zone_paths, habitability_zone_paths, vegetation_zone_paths = numeric_paths
+    population_zone_paths = population_future.result()
+    relief_bands, contour_paths, contour_path_levels = relief_future.result()
+    # Base colours cover the common land clip. Repeating its half-million
+    # vertices in both base bands adds no terrain information.
+    frame_paths = _geometry_filled_paths(shapely.box(0, 0, grid.shape[1], grid.shape[0]))
+    elevation_band_paths = [frame_paths] + [
+        frame_paths if band is None else band for band in relief_bands]
     land_potential_svg = _partition_overlay_svg_document(
         grid,
         potential_zone_paths,
@@ -4611,31 +4726,13 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
         )
         + '</g>'
     )
-    city_locations = {
-        settlement.identifier: (settlement.row + 0.5, settlement.column + 0.5)
-        for settlement in society.settlements
-    }
-    from .city_harbors import derive_harbors, connect_harbor_routes
-    harbors = derive_harbors(grid, society, city_locations, terrain_field,
-        road_surface=land_surface.difference(river_channel_geometry),land_surface=land_surface)
-    society=replace(society,transport=replace(society.transport,
-        routes=connect_harbor_routes(society.transport.routes,harbors,grid,land_surface=land_surface)))
-    logger.info("Resolving shared roads, river crossings and bridge facilities")
-    display_river_geometry = shapely.MultiLineString(river_paths)
-    transport_geometry = prepare_transport_geometry(
-        grid, society.transport.routes, society.transport.bridges,
-        locations=city_locations, land_surface=land_surface,
-        river_source_geometry=shapely.MultiLineString(river_source_paths),
-        river_geometry=display_river_geometry,
-        river_channel_geometry=river_channel_geometry,
-        raw_elevation_m=physical_source.relative_elevation_m,
-        terrain_field=terrain_field,
-    )
-    from .transport_artifacts import write_transport_sources
-    display_roads,transport_proof=write_transport_sources(output_dir,grid,transport_geometry,
-        river_geometry=display_river_geometry,channel_geometry=river_channel_geometry)
-    road_errors=transport_proof['checks']['bridgesOffRoad']
-    river_errors=transport_proof['checks']['bridgesOffRiver']
+    routes, city_locations, harbors, transport_geometry, display_roads, transport_checks = transport_future.result()
+    society = replace(society, transport=replace(society.transport, routes=routes))
+    # Geometry stages have finished. Release their processes before the tile
+    # writer starts its own bounded pool instead of nesting worker pools.
+    executor.shutdown(wait=True)
+    road_errors=transport_checks['bridgesOffRoad']
+    river_errors=transport_checks['bridgesOffRiver']
     territorial_qa["sourceBridgeRasterMismatches"] = territorial_qa.pop("bridgesOffRoadOrRiver")
     territorial_qa["bridgesOffRoadOrRiver"] = road_errors + river_errors
     from .navigation import write_navigation_assets,travel_profile
@@ -4806,7 +4903,7 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
     # request footprint small without simplifying any delivered geometry.
     logger.info("Publishing shared viewport tiles")
     with measure_stage(output_dir, "viewport-tiles"):
-        manifest = write_atlas_tiles(output_dir, grid.shape[1], grid.shape[0], tile_levels, tile_size=16)
+        manifest = write_atlas_tiles(output_dir, grid.shape[1], grid.shape[0], tile_levels)
     logger.info("Extracting city minor contours")
     with measure_stage(output_dir, "city-minor-contours"):
         city_relief = derive_city_relief(grid, terrain_field, society.settlements,

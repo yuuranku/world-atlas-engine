@@ -19,3 +19,24 @@ def periodic_horizontal_coefficients(native):
         coefficients[:, begin:begin+64] = polynomial.c[:, 1:width+1].transpose(0, 2, 1)
     coefficients.flags.writeable = False
     return coefficients
+
+
+def interior_uniform_coefficients(values):
+    """The middle interval of SciPy's four-node, unit-spaced PCHIP.
+
+    Point queries only use this interior interval. Its two slopes depend on
+    the neighbouring three secants; constructing endpoint rules, validating
+    fixed axes and allocating an interpolator for every root iteration adds
+    no information. Keep SciPy's harmonic arithmetic and coefficient order,
+    including its zero/sign-switch branch, exactly.
+    """
+    slopes = values[1:] - values[:-1]
+    condition = ((np.sign(slopes[1:]) != np.sign(slopes[:-1]))
+                 | (slopes[1:] == 0) | (slopes[:-1] == 0))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        harmonic = (3/slopes[:-1] + 3/slopes[1:])/6
+    derivatives = np.zeros_like(slopes[:2])
+    derivatives[~condition] = 1/harmonic[~condition]
+    cubic = derivatives[0]+derivatives[1]-2*slopes[1]
+    return np.stack((cubic, slopes[1]-derivatives[0]-cubic,
+                     derivatives[0], values[1]))

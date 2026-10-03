@@ -59,27 +59,42 @@ class CartographicTilesTests(unittest.TestCase):
             TileFeature(shapely.box(0,0,64,32), {"fill":"#eee"}, "theme", "political", "theme"),
             TileFeature(shapely.LineString([(2,2),(32,20),(63,24)]),
                         {"stroke":"url(#land-face)", "fill":"none", "clip":"water"}, "roads"),
+            TileFeature(shapely.box(25,5,40,10), {"fill":"url(#hatch)", "clip":"land"},
+                        "textures", section="surface", definitions={"hatch":
+                        '<pattern id="hatch" width="8" height="8"><path d="M0,0h1"/></pattern>'}),
         ]
         levels = [TileLevel(name, scale, land, features) for name, scale in
                   (("regional",8),("local",32),("detail",64))]
         with tempfile.TemporaryDirectory() as together, tempfile.TemporaryDirectory() as separate:
-            write_atlas_tiles(together,64,32,levels)
+            write_atlas_tiles(together,64,32,levels,workers=2)
             for level in levels:
                 write_atlas_tiles(separate,64,32,[level])
                 for path in (Path(together)/"tiles"/level.id).glob("*.json"):
                     self.assertEqual(path.read_bytes(),
                                      (Path(separate)/"tiles"/level.id/path.name).read_bytes())
 
-    def test_smaller_requests_preserve_exact_curved_river_and_terrain_geometry(self):
+    def test_tile_worker_failure_does_not_publish_manifest(self):
+        feature = TileFeature(shapely.box(0,0,64,32),
+            {"fill":"red", "data-description":"x" * (3 * 1024 * 1024)}, "large", section="surface")
+        with tempfile.TemporaryDirectory() as target:
+            with self.assertRaisesRegex(ValueError, "tile JSON byte budget exceeded"):
+                write_atlas_tiles(target,64,32,
+                    [TileLevel("detail",64,feature.geometry,[feature])],workers=2)
+            self.assertFalse((Path(target)/"atlas-manifest.json").exists())
+
+    def test_larger_blocks_preserve_exact_curved_river_and_terrain_geometry(self):
         land=shapely.box(0,0,32,32)
         river=shapely.Polygon([(1,14.2),(9,13.7),(16,14.3),(24,15.5),(31,14.8),
                                (31,15.8),(24,15.9),(16,15.1),(9,14.2),(1,14.4)])
         terrain=shapely.Polygon([(2,2),(16,3),(30,2),(30,16),(29,30),(16,29),(2,30),(3,16)])
+        from shapely.affinity import scale
+        land,river,terrain = (scale(geometry,xfact=2,yfact=2,origin=(0,0))
+                              for geometry in (land,river,terrain))
         features=[TileFeature(river,{'fill':'#8ebdcc'},'rivers'),
                   TileFeature(terrain,{'fill':'#b7c19b'},'theme-fill','vegetation','theme')]
         with tempfile.TemporaryDirectory() as target:
-            manifest=write_atlas_tiles(target,32,32,[TileLevel('detail',64,land,features)],tile_size=16)
-            self.assertEqual(manifest['tileSize'],16)
+            manifest=write_atlas_tiles(target,64,64,[TileLevel('detail',64,land,features)])
+            self.assertEqual(manifest['tileSize'],32)
             self.assertEqual(manifest['stats']['totalTiles'],4)
             water,faces=[],[]
             for file in (Path(target)/'tiles/detail').glob('*.json'):
@@ -401,9 +416,9 @@ class CartographicTilesTests(unittest.TestCase):
 
     def test_single_oversized_json_fails_the_measured_utf8_budget(self):
         land = shapely.box(0,0,32,32)
-        feature = TileFeature(land,{"fill":"#abc","aria-label":"海" * 700_000},"land")
+        feature = TileFeature(land,{"fill":"#abc","aria-label":"海" * 1_050_000},"land")
         with tempfile.TemporaryDirectory() as target:
-            with self.assertRaisesRegex(ValueError,r"tile JSON byte budget exceeded.*limit=2097152"):
+            with self.assertRaisesRegex(ValueError,r"tile JSON byte budget exceeded.*limit=3145728"):
                 write_atlas_tiles(target,32,32,[TileLevel("detail",4,land,[feature])])
 
     def test_numeric_working_cover_fills_each_lod_shore_without_changing_other_payloads(self):
@@ -472,7 +487,7 @@ class CartographicTilesTests(unittest.TestCase):
     def test_numeric_tile_refresh_keeps_current_byte_budget_and_requires_a_stage(self):
         land = shapely.box(0,0,32,32)
         original = TileFeature(land,{"fill":"#abc","clip":"land"},"theme-fill","potential","theme")
-        oversized = TileFeature(land,{"fill":"#abc","clip":"land","aria-label":"海"*700_000},
+        oversized = TileFeature(land,{"fill":"#abc","clip":"land","aria-label":"海"*1_050_000},
                                 "theme-fill","potential","theme")
         with tempfile.TemporaryDirectory() as directory:
             source, stage = Path(directory)/"source", Path(directory)/"stage"
@@ -480,7 +495,7 @@ class CartographicTilesTests(unittest.TestCase):
             before = (source/"tiles/detail/0-0.json").read_bytes()
             with self.assertRaisesRegex(ValueError,"separate staging directory"):
                 refresh_atlas_tile_themes(source,source,[original])
-            with self.assertRaisesRegex(ValueError,"tile JSON byte budget exceeded.*limit=2097152"):
+            with self.assertRaisesRegex(ValueError,"tile JSON byte budget exceeded.*limit=3145728"):
                 refresh_atlas_tile_themes(source,stage,[oversized])
             self.assertEqual((source/"tiles/detail/0-0.json").read_bytes(),before)
 

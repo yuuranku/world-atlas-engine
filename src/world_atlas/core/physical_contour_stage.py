@@ -1,9 +1,7 @@
-"""Persist complete source height graphs before assembling map artwork."""
-from concurrent.futures import ProcessPoolExecutor, as_completed
+"""Persist continuous-root cartographic height graphs before map artwork."""
 import hashlib
 import json
 import logging
-import multiprocessing
 import os
 from pathlib import Path
 import sys
@@ -13,15 +11,18 @@ import time
 import numpy as np
 import scipy
 import shapely
+import contourpy
+
+from .cartographic_contours import CARTOGRAPHIC_CONTOUR_CONTRACT, cartographic_curve_batches
 
 
-_SCHEMA = "physical-height-graphs-v1"
-_SOURCE = None
+_SCHEMA = "physical-cartographic-height-graphs-v2"
 _CURVE_MODULES = (
-    "continuous_terrain", "continuous_scalar", "hypsometry", "terrain_refinement", "river_network",
+    "continuous_terrain", "continuous_scalar", "continuous_pchip", "hypsometry", "terrain_refinement", "river_network",
     "implicit_terrain", "implicit_terrain_bounds", "implicit_curves",
     "implicit_pchip", "implicit_warp_events", "implicit_river_events",
     "implicit_terrain_parallel", "physical_contour_stage",
+    "cartographic_contours",
 )
 
 
@@ -84,10 +85,22 @@ def _refinement_binding(field):
     }
 
 
+def _extraction_runtime_binding():
+    root = Path(__file__).parent
+    return {
+        "sourceModulesSha256": {
+            **{name: _sha(root / (name + ".py")) for name in _CURVE_MODULES},
+            "physical/hydrology": _sha(root.parent / "physical" / "hydrology.py"),
+        },
+        "runtime": {"python": list(sys.version_info[:3]), "numpy": np.__version__,
+                    "scipy": scipy.__version__, "shapely": shapely.__version__,
+                    "geos": shapely.geos_version_string,"contourpy":contourpy.__version__},
+    }
+
+
 def _binding(field, levels, identity):
     if not isinstance(identity, dict) or not identity:
         raise ValueError("source height graphs require an explicit physical input identity")
-    root = Path(__file__).parent
     return {
         "physicalInput": json.loads(json.dumps(identity)),
         "fieldClass": type(field).__name__,
@@ -96,13 +109,8 @@ def _binding(field, levels, identity):
         "refinement": _refinement_binding(field),
         "datum": [float(field.sea_level_m), float(field.elevation_scale_m), float(field.elevation_exponent)],
         "heightLevelsHex": [float(level).hex() for level in levels],
-        "sourceModulesSha256": {
-            **{name: _sha(root / (name + ".py")) for name in _CURVE_MODULES},
-            "physical/hydrology": _sha(root.parent / "physical" / "hydrology.py"),
-        },
-        "runtime": {"python": list(sys.version_info[:3]), "numpy": np.__version__,
-                    "scipy": scipy.__version__, "shapely": shapely.__version__,
-                    "geos": shapely.geos_version_string},
+        "cartographicContract": dict(CARTOGRAPHIC_CONTOUR_CONTRACT),
+        **_extraction_runtime_binding(),
     }
 
 
@@ -156,22 +164,39 @@ def _read_graph(directory, index, level, fingerprint):
     return [points[begin:end] for begin, end in zip(offsets[:-1], offsets[1:], strict=True)]
 
 
-def _initialize(field, directory, fingerprint):
-    global _SOURCE
-    _SOURCE = field, Path(directory), fingerprint
+def current_height_graphs(directory):
+    """Check reusable bytes/code before copying; the field binding follows.
 
-
-def _extract_height(index, level):
-    from .implicit_terrain import terrain_level_curves
-    field, directory, fingerprint = _SOURCE
-    started = time.monotonic()
-    paths = terrain_level_curves(field, np.asarray((level,), dtype=float))[0]
-    record = _write_graph(directory, index, level, fingerprint, paths)
-    return record, time.monotonic() - started
+    This never rewrites an extraction identity. A new output must still enter
+    ``staged_height_curves`` with its actual field and physical source identity.
+    """
+    directory = Path(directory)
+    try:
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        binding = manifest["binding"]
+        current = _extraction_runtime_binding()
+        if (manifest["schema"] != _SCHEMA
+                or binding["cartographicContract"] != CARTOGRAPHIC_CONTOUR_CONTRACT
+                or any(binding[key] != value for key, value in current.items())):
+            return False
+        fingerprint = hashlib.sha256(json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if manifest["fingerprint"] != fingerprint:
+            return False
+        levels = np.asarray([float.fromhex(value) for value in binding["heightLevelsHex"]])
+        if not np.isfinite(levels).all() or np.any(np.diff(levels) <= 0):
+            return False
+        completed = 0
+        for index, level in enumerate(levels):
+            if (directory / f"level-{index:03d}.json").exists():
+                _read_graph(directory, index, level, fingerprint)
+                completed += 1
+        return completed > 0
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
 
 
 def staged_height_curves(field, levels, directory, *, source_identity):
-    """Resume only complete graphs bound to identical inputs, code and levels.
+    """Resume only cartographic graphs bound to identical inputs and contract.
 
     A changed extraction is rejected. There is no older-format reader or
     substituted geometry. Failed tasks never commit a complete graph header.
@@ -201,19 +226,19 @@ def staged_height_curves(field, levels, directory, *, source_identity):
     _json(manifest, record)
     logger = logging.getLogger(__name__)
     if pending:
-        workers = min(12, max(1, (os.process_cpu_count() or 1) // 2), len(pending))
-        logger.info("Extracting %s height graphs on %s workers; %s exact graphs already saved", len(pending), workers, completed)
-        executor = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
-                                       initializer=_initialize, initargs=(field, directory, fingerprint))
+        logger.info("Extracting %s cartographic height graphs from one shared quarter-cell sample; %s source graphs already saved", len(pending), completed)
         current_index = None
         try:
-            futures = {executor.submit(_extract_height, index, float(levels[index])): index for index in pending}
-            for future in as_completed(futures):
-                current_index = futures[future]
-                item, elapsed = future.result()
+            graphs = iter(cartographic_curve_batches(field, levels[pending]))
+            for index in pending:
+                current_index = index
+                started = time.monotonic()
+                paths = next(graphs)
+                item = _write_graph(directory, index, levels[index], fingerprint, paths)
+                elapsed = time.monotonic()-started
                 completed += 1
                 logger.info("Height graph complete %s/%s: %.12g m, %s paths, %s vertices, %.1f s",
-                            completed, len(levels), levels[item["index"]], item["paths"], item["vertices"], elapsed)
+                            completed, len(levels), levels[index], item["paths"], item["vertices"], elapsed)
                 record["completedHeights"] = completed
                 _json(manifest, record)
         except BaseException as error:
@@ -221,12 +246,9 @@ def staged_height_curves(field, levels, directory, *, source_identity):
                           failedHeightIndex=current_index,
                           failedHeightM=None if current_index is None else float(levels[current_index]))
             _json(manifest, record)
-            logger.exception("Physical height graph extraction failed at height index %s (%s m); complete source graphs remain saved",
-                             current_index, record["failedHeightM"])
-            executor.terminate_workers()
+            logger.exception("Cartographic height graph extraction failed at height index %s; complete source graphs remain saved",
+                             current_index)
             raise
-        else:
-            executor.shutdown(wait=True)
         for index in pending:
             result[index] = _read_graph(directory, index, levels[index], fingerprint)
     if _binding(field, levels, source_identity) != binding:

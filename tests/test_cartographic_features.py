@@ -160,6 +160,14 @@ class CartographicFeaturesTests(unittest.TestCase):
         self.assertTrue(result[1].equals(shapely.box(2,0,4,2)))
         self.assertTrue(shapely.coverage_is_valid(result))
 
+    def test_completely_overpainted_owner_retains_its_empty_category_slot(self):
+        surface = shapely.box(0, 0, 4, 2)
+        result = shared_display_coverage([surface, surface])
+        self.assertEqual(len(result), 2)
+        self.assertTrue(result[0].is_empty)
+        self.assertTrue(result[1].equals(surface))
+        self.assertTrue(shapely.coverage_is_valid(result))
+
     def test_population_intersection_is_noded_once_on_the_delivery_grid(self):
         # Actual v97 population contours produced two intersection nodes
         # separated by one output quantum when floating noding was followed

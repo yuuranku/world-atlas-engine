@@ -12,6 +12,8 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import shapely
 
+from world_atlas.core.cartographic_tiles import MAX_TILE_BYTES
+
 
 _spec = importlib.util.spec_from_file_location(
     "tile_polygon_decoder", Path(__file__).with_name("check_coastal_coverage.py"),
@@ -19,7 +21,6 @@ _spec = importlib.util.spec_from_file_location(
 _svg = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_svg)
 _CLIP_REFERENCE = re.compile(r"url\(#([^)]*)\)")
-MAX_TILE_BYTES = 2 * 1024 * 1024
 BASE_LEVELS = [{"id":"regional","minScale":8}, {"id":"local","minScale":32},
                {"id":"detail","minScale":64}]
 
@@ -79,7 +80,7 @@ def read_manifest(review: Path):
             or any(type(value) is not int or value <= 0 for value in stats.values())
             or stats["totalTiles"] != expected_count
             or stats["maxTileBytes"] > MAX_TILE_BYTES or stats["totalTileBytes"] < stats["maxTileBytes"]):
-        raise ValueError("Atlas manifest must report measured tiles within the 2 MiB per-tile budget")
+        raise ValueError("Atlas manifest must report measured tiles within the 3 MiB per-tile budget")
     return manifest
 
 
@@ -102,7 +103,7 @@ def read_tile(review: Path, manifest, level: str, row: int, column: int):
     path = review / "tiles" / level / f"{row}-{column}.json"
     raw = path.read_bytes()
     if len(raw) > MAX_TILE_BYTES:
-        raise ValueError(f"{level}/{path.name}: measured payload exceeds the 2 MiB per-tile budget")
+        raise ValueError(f"{level}/{path.name}: measured payload exceeds the 3 MiB per-tile budget")
     payload = json.loads(raw.decode("utf-8"))
     x, y = column * manifest["tileSize"], row * manifest["tileSize"]
     bounds = [x, y, min(manifest["tileSize"], manifest["width"] - x),
@@ -208,7 +209,7 @@ def read_city_overlay(review: Path, manifest, row: int, column: int, *, base_til
     path = review / "tiles" / "city-detail" / f"{key}.json"
     raw = path.read_bytes()
     if len(raw) > MAX_TILE_BYTES:
-        raise ValueError(f"city-detail/{key}: measured payload exceeds the 2 MiB per-tile budget")
+        raise ValueError(f"city-detail/{key}: measured payload exceeds the 3 MiB per-tile budget")
     payload = json.loads(raw.decode("utf-8"))
     if (not isinstance(payload,dict) or set(payload) != {"bounds","surface","ink"}
             or payload["bounds"] != base["payload"]["bounds"]

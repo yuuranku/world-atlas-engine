@@ -11,7 +11,7 @@ from scipy.optimize import elementwise
 
 from .implicit_curves import adaptive_curve_paths, level_bands, polygon_path
 from .implicit_pchip import split_pchip_branches
-from .continuous_pchip import periodic_horizontal_coefficients
+from .continuous_pchip import interior_uniform_coefficients, periodic_horizontal_coefficients
 
 
 class ContinuousScalarField:
@@ -90,7 +90,7 @@ class ContinuousScalarField:
             coefficients = self.horizontal_coefficients[:, rows, column % self.width]
             tx = xx-.5-column
             horizontal = ((coefficients[0]*tx+coefficients[1])*tx+coefficients[2])*tx+coefficients[3]
-            coefficients = PchipInterpolator(np.arange(-1, 3), horizontal, axis=0).c[:, 1]
+            coefficients = interior_uniform_coefficients(horizontal)
             ty = yy-.5-row
             result[begin:stop] = ((coefficients[0]*ty+coefficients[1])*ty+coefficients[2])*ty+coefficients[3]
         return result.reshape(shape)

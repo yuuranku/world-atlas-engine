@@ -23,9 +23,11 @@ def _up(value):
 def _product(first, last):
     a, b = first
     c, d = last
-    values = np.stack(np.broadcast_arrays(a*c, a*d, b*c, b*d))
+    ac, ad, bc, bd = a*c, a*d, b*c, b*d
+    low = np.minimum(np.minimum(ac, ad), np.minimum(bc, bd))
+    high = np.maximum(np.maximum(ac, ad), np.maximum(bc, bd))
     exact_zero = ((a==0)&(b==0))|((c==0)&(d==0))
-    return np.where(exact_zero,0,_down(values.min(axis=0))),np.where(exact_zero,0,_up(values.max(axis=0)))
+    return np.where(exact_zero,0,_down(low)),np.where(exact_zero,0,_up(high))
 
 
 class _Dual:
@@ -202,14 +204,17 @@ def _hermite(values,position,differences):
     # Collect the repeated slope terms before differentiating. Differentiating
     # their separate Horner appearances loses the dependency between +m, -2m
     # and +m, and invents opposite x gradients at a genuine PCHIP slope switch.
-    def basis(coefficients,low,high):
-        coefficients = np.broadcast_to(np.asarray(coefficients)[:,None],(4,len(position.low)))
-        value = _polynomial(coefficients,position)
-        value.low = np.maximum(low,value.low);value.high = np.minimum(high,value.high)
-        return value
-    weights = (basis((-2,3,0,0),0,1),
-               basis((1,-2,1,0),0,_up(4/27)),
-               basis((1,-1,0,0),_down(-4/27),0))
+    # All three Hermite basis functions use the same abscissa. Evaluate their
+    # unchanged interval polynomials together instead of repeating the full
+    # Bernstein and derivative construction three times.
+    coefficients = np.asarray(((-2.,3.,0.,0.),(1.,-2.,1.,0.),(1.,-1.,0.,0.))).T
+    coefficients = np.broadcast_to(coefficients[:,:,None],(4,3,len(position.low)))
+    parameter = _Dual(position.low[None,:],position.high[None,:],
+                      position.gradient_low[None,:,:],position.gradient_high[None,:,:])
+    values = _polynomial(coefficients,parameter)
+    values.low = np.maximum(np.asarray((0.,0.,_down(-4/27)))[:,None],values.low)
+    values.high = np.minimum(np.asarray((1.,_up(4/27),0.))[:,None],values.high)
+    weights = tuple(values[index] for index in range(3))
     gradient = first.gradient_low,first.gradient_high
     for value,weight in zip((delta,before,after),weights,strict=True):
         gradient = _value_add(gradient,_product((value.gradient_low,value.gradient_high),
@@ -382,8 +387,8 @@ def _minimum_groups(size,owner,value):
 
 
 def _segment_distance_squared(x,y,start,end,east=1.,north=1.,*,denominator_floor=0.):
-    ax,ay = (start[:,0]-x)*east,(start[:,1]-y)*north
-    dx,dy = _Dual(end[:,0]-start[:,0])*east,_Dual((end[:,1]-start[:,1])*north)
+    ax,ay = (start[...,0]-x)*east,(start[...,1]-y)*north
+    dx,dy = _Dual(end[...,0]-start[...,0])*east,_Dual((end[...,1]-start[...,1])*north)
     denominator = dx.square()+dy.square()
     if denominator_floor:
         denominator = _clip(denominator,denominator_floor,np.inf)
@@ -435,7 +440,7 @@ def _protection(field,x,y):
         pairs = field._rivers.query(shapely.box(x.low-.5,y.low-.5,x.high+.5,y.high+.5))
         if pairs.shape[1]:
             owner,edge = pairs
-            segments = np.asarray([line.coords for line in field._rivers.geometries[edge]])
+            segments = shapely.get_coordinates(field._rivers.geometries[edge]).reshape(-1,2,2)
             distances = _segment_distance_squared(x[owner],y[owner],segments[:,0],segments[:,1])
             grouped = _minimum_groups(len(x.low),owner,distances)
             present = np.unique(owner)
@@ -482,9 +487,14 @@ def _drainage(drainage,x,y):
         return _Dual(np.zeros(len(x.low)))
     owner,edge = pairs
     curve = drainage.curves[edge]
-    squared = _minimum([_segment_distance_squared(x[owner],y[owner],curve[:,index],curve[:,index+1],
-                            east[owner],drainage.cell_y_km,denominator_floor=1e-15)
-                        for index in range(4)])
+    # Every compact valley uses four line pieces. Their distance formula and
+    # directional arithmetic are independent and share x/y intervals, so one
+    # array batch preserves all four ownership candidates without four Python
+    # evaluations of the same expression tree.
+    distances = _segment_distance_squared(x[owner][None,:],y[owner][None,:],
+        curve[:,:-1].transpose(1,0,2),curve[:,1:].transpose(1,0,2),
+        east[owner][None,:],drainage.cell_y_km,denominator_floor=1e-15)
+    squared = _minimum([distances[index] for index in range(4)])
     breadth = drainage.breadth[edge]
     first = np.clip(np.sqrt(squared.low)/breadth,0,1)
     last = np.clip(np.sqrt(squared.high)/breadth,0,1)

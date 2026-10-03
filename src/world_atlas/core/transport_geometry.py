@@ -14,7 +14,7 @@ import shapely
 from shapely.ops import substring
 from scipy.sparse import csr_array
 from scipy.sparse.csgraph import connected_components
-from .polygon_navigation import polygon_path
+from .polygon_navigation import PolygonNavigator
 
 from .river_crossings import (
     endpoint_bank_direction, river_bank_owner as _river_bank_owner,
@@ -222,6 +222,8 @@ def _split_sailing_seam(points, width):
 
 
 def _river_safe_line(line, river_geometry):
+    if not shapely.intersects(river_geometry, line):
+        return True
     intersection = shapely.intersection(line, river_geometry)
     if intersection.is_empty:
         return True
@@ -302,17 +304,16 @@ def _network_paths(lines, importances, fixed):
     # a few ulps off their source segment. A subpixel tolerance identifies
     # its owning route without treating a transverse crossing as overlap.
     source_corridors = shapely.buffer(lines, 1e-7)
+    shapely.prepare(source_corridors)
     anchor_index = shapely.STRtree([shapely.Point(point) for point in sorted(fixed)])
     network = shapely.line_merge(shapely.union_all(lines))
     result = []
     for line in _parts(network):
         for points in _anchor_parts(line, anchor_index):
             piece = shapely.LineString(points)
-            covering = [
-                index for index in source_index.query(piece.buffer(1e-7), predicate="intersects")
-                if shapely.covers(source_corridors[index], piece)
-            ]
-            if not covering:
+            candidates = source_index.query(piece, predicate="dwithin", distance=1e-7)
+            covering = candidates[shapely.covers(source_corridors[candidates], piece)]
+            if not len(covering):
                 raise ValueError(f"network segment has no source route: {piece.wkt}")
             importance = max((importances[index] for index in covering), key=_RANK.__getitem__)
             result.append((importance, points))
@@ -329,6 +330,8 @@ def shared_transport_paths(grid, routes: Iterable, *, land_geometry, road_surfac
     """
 
     shapely.prepare(land_geometry)
+    shapely.prepare(road_surface)
+    shapely.prepare(river_geometry)
     routes = tuple(routes)
     result = []
     for mode in ("road", "rail", "sea"):
@@ -437,6 +440,25 @@ def _road_native_corridor(grid, points, land_surface, *, endpoint_access):
     return shapely.intersection(shapely.coverage_union_all(boxes),land_surface)
 
 
+def _dry_bank_navigation_surface(corridor, channel_geometry):
+    """Reserve only numerical clearance on the dry side of the real channel.
+
+    Overlay noding can place a bank vertex a few ulps inside water. Bridge
+    decks and the final crossing audit keep the original physical channel.
+    """
+    free = corridor.difference(channel_geometry)
+    coordinates = shapely.get_coordinates(free)
+    if not len(coordinates):
+        return free
+    points = shapely.points(coordinates)
+    inside = shapely.contains(channel_geometry, points)
+    drift = float(np.max(shapely.distance(points[inside], channel_geometry.boundary), initial=0.))
+    scale = max(1., float(np.max(np.abs(shapely.get_coordinates(channel_geometry)))))
+    clearance = max(32 * float(np.spacing(scale)), 2 * drift)
+    obstacle = channel_geometry.buffer(clearance, join_style="mitre")
+    return corridor.difference(obstacle)
+
+
 def _bank_route(points, channel_geometry, passages, corridor):
     """Navigate dry banks between the source route's explicit bridge portals.
 
@@ -448,8 +470,10 @@ def _bank_route(points, channel_geometry, passages, corridor):
     source=shapely.LineString(points)
     if not passages and not source.intersects(channel_geometry):
         return np.asarray(points)
-    free=corridor.difference(channel_geometry)
+    free=_dry_bank_navigation_surface(corridor,channel_geometry)
     polygons=[polygon for polygon in shapely.get_parts(free)if polygon.geom_type=="Polygon"]
+    shapely.prepare(polygons)
+    navigators = {}
     def bank_port(coordinates,centre):
         point=shapely.Point(coordinates)
         if any(polygon.covers(point)for polygon in polygons):
@@ -490,11 +514,11 @@ def _bank_route(points, channel_geometry, passages, corridor):
     for station,deck in passages:
         deck=list(deck)
         if len(deck)==3:
-            deck[0]=bank_port(deck[0],deck[1]);deck[2]=bank_port(deck[2],deck[1])
+            deck=[bank_port(deck[0],deck[1]),*deck,bank_port(deck[2],deck[1])]
         elif station==0.:
-            deck[-1]=bank_port(deck[-1],deck[0])
+            deck.append(bank_port(deck[-1],deck[0]))
         else:
-            deck[0]=bank_port(deck[0],deck[-1])
+            deck.insert(0,bank_port(deck[0],deck[-1]))
         actual_passages.append((station,deck))
     result=[tuple(points[0])]
     def navigate(last):
@@ -505,7 +529,10 @@ def _bank_route(points, channel_geometry, passages, corridor):
         if not candidates:
             raise ValueError(f"accepted corridor has disconnected banks between portals {first} and {last}")
         polygon=max(candidates,key=lambda polygon:polygon.area)
-        result.extend(map(tuple,polygon_path(polygon,first,last)[1:]))
+        key = id(polygon)
+        if key not in navigators:
+            navigators[key] = PolygonNavigator(polygon)
+        result.extend(map(tuple,navigators[key].path(first,last)[1:]))
     for _station,deck in sorted(actual_passages,key=lambda entry:entry[0]):
         navigate(deck[0])
         result.extend(tuple(point)for point in deck[1:]if tuple(point)!=result[-1])

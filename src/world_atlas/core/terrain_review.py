@@ -13,7 +13,7 @@ import numpy as np
 
 from world_atlas.core.procedural_planet import load_surface_bundle
 from world_atlas.core.continuous_terrain import PhysicalTerrainField
-from world_atlas.core.implicit_terrain import terrain_level_curves
+from world_atlas.core.cartographic_contours import CARTOGRAPHIC_CONTOUR_CONTRACT, cartographic_level_curves
 from world_atlas.core.svg_paths import COORDINATE_SCALE, integer_subpath_data
 
 
@@ -40,7 +40,7 @@ def publish_terrain_review(
         elevation_exponent=diagnostics["elevationExponent"])
     palette_levels = np.linspace(0.06, 0.96, 19)
     metre_levels = terrain.contour_height_m(palette_levels)
-    curves = terrain_level_curves(terrain, metre_levels)
+    curves = cartographic_level_curves(terrain, metre_levels)
     paths = []
     for palette, metres, branches in zip(palette_levels, metre_levels, curves, strict=True):
         for points in branches:
@@ -71,7 +71,8 @@ def publish_terrain_review(
         "height": height,
         "sourceSha256": image_digest,
         "contourCount": len(paths),
-        "contourModel": "source-tensor-pchip-native-roots-adaptive-curves",
+        "contourModel": CARTOGRAPHIC_CONTOUR_CONTRACT["schema"],
+        "cartographicContract": dict(CARTOGRAPHIC_CONTOUR_CONTRACT),
         "contourBytes": len(svg.encode("utf-8")),
         "review": str(output / "index.html"),
     }

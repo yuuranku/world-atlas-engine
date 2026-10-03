@@ -12,7 +12,7 @@ from functools import cached_property
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
-from .continuous_pchip import periodic_horizontal_coefficients
+from .continuous_pchip import interior_uniform_coefficients, periodic_horizontal_coefficients
 
 
 class PhysicalTerrainField:
@@ -110,7 +110,7 @@ class PhysicalTerrainField:
         tx = x - .5 - column
         horizontal = ((x_coefficients[0] * tx + x_coefficients[1]) * tx
                       + x_coefficients[2]) * tx + x_coefficients[3]
-        y_coefficients = PchipInterpolator(np.arange(-1, 3), horizontal, axis=0).c[:, 1]
+        y_coefficients = interior_uniform_coefficients(horizontal)
         ty = y - .5 - row
         result = ((y_coefficients[0] * ty + y_coefficients[1]) * ty
                   + y_coefficients[2]) * ty + y_coefficients[3]

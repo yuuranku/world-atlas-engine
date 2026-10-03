@@ -93,4 +93,6 @@ def level_bands(field, levels, paths):
     faces = shapely.get_parts(faces)
     probes = shapely.get_coordinates(shapely.point_on_surface(faces))
     owner = np.searchsorted(levels, field.sample_points(probes[:,0],probes[:,1]), side="right")
-    return [shapely.union_all(faces[owner == band]) for band in range(len(levels)+1)]
+    # Polygonization already nodes every common edge. A coverage union drops
+    # internal edges directly instead of intersecting that graph again.
+    return [shapely.coverage_union_all(faces[owner == band]) for band in range(len(levels)+1)]

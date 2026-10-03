@@ -3,17 +3,32 @@
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import shapely
 
-from world_atlas.core.polygon_navigation import polygon_path
+from world_atlas.core.polygon_navigation import PolygonNavigator, polygon_path
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class PolygonNavigationTests(unittest.TestCase):
+    def test_bank_passages_share_a_mesh_without_changing_exact_paths(self):
+        polygon = shapely.Polygon(((0,0),(5,0),(5,5),(0,5)),
+                                  holes=[((2,1),(3,1),(3,4),(2,4))])
+        passages = (((.5,2.5),(4.5,2.5)), ((4.5,3),(.5,3)))
+        expected = [polygon_path(polygon, first, last) for first, last in passages]
+        navigator = PolygonNavigator(polygon)
+        before = polygon.wkb
+        with patch('world_atlas.core.polygon_navigation.shapely.constrained_delaunay_triangles',
+                   wraps=shapely.constrained_delaunay_triangles) as triangulate:
+            for (first, last), path in zip(passages, expected, strict=True):
+                np.testing.assert_array_equal(navigator.path(first, last), path)
+            self.assertEqual(triangulate.call_count, 1)
+        self.assertEqual(polygon.wkb, before)
+
     def check_path(self, polygon, first, last):
         before = polygon.wkb
         first, last = np.asarray(first, dtype=float), np.asarray(last, dtype=float)

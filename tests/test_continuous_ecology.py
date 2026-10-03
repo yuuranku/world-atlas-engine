@@ -75,6 +75,26 @@ class ContinuousEcologyTests(unittest.TestCase):
         self.assertGreater(float(field.supply_points(3.5,3.5)),level)
         self.assertTrue(field.supply_superlevel(level).covers(shapely.Point(3.5,3.5)))
 
+    def test_segment_index_retains_original_supply_and_lake_interior(self):
+        shape=(32,64)
+        x=np.linspace(2.,62.,160)
+        river=shapely.LineString(np.column_stack((x,15.+7.*np.sin(x*.13))))
+        lake=shapely.box(44.,4.,50.,9.)
+        sources=FreshwaterCorridors(64,32,(2,),(river,),lake)
+        def make_field():
+            return ContinuousEcologyField(np.full(shape,.1),np.ones(shape),np.ones(shape,bool),sources,
+                supply_capacity=.72,river_radii=(2.7,),lake_radius=2.)
+        original,indexed=make_field(),make_field()
+        original._trees=[(shapely.STRtree(parts),radius,parts,np.arange(len(parts)))
+                         for parts,radius in original._sources if len(parts)]
+        y,x=np.indices(shape,dtype=float)
+        np.testing.assert_allclose(indexed.supply_points(x+.5,y+.5),
+                                   original.supply_points(x+.5,y+.5),atol=2e-14,rtol=0)
+        np.testing.assert_array_equal(indexed.native,original.native)
+        self.assertEqual(float(indexed.supply_points(47.,6.)),indexed.supply_capacity)
+        self.assertEqual(shapely.to_wkb(indexed.supply_superlevel(.35)),
+                         shapely.to_wkb(original.supply_superlevel(.35)))
+
 
 if __name__=='__main__':
     unittest.main()

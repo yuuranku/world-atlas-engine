@@ -9,6 +9,8 @@ from pathlib import Path
 import shutil
 import time
 
+import numpy as np
+
 from world_atlas.inputs import attach_world_metadata
 from world_atlas.core.baseline import compute_input_fingerprint, load_baseline
 from world_atlas.core.config import load_world_config
@@ -27,6 +29,31 @@ from world_atlas import __version__
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest().upper()
+
+
+def _reusable_physical_contours(config_path, bundle, config, settings, physical_source):
+    """Choose only unmodified extraction records for the same physical source.
+
+    The extractor still verifies its entire field binding when it opens the
+    copy. This check never rebinds a manifest or accepts changed source code.
+    """
+    planet = config["planet"]
+    if planet != {**planet, **settings.planet}:
+        return None
+    from world_atlas.core.physical_contour_stage import current_height_graphs
+    identity = {
+        "rawElevationSha256": hashlib.sha256(
+            np.ascontiguousarray(physical_source.relative_elevation_m).tobytes()).hexdigest(),
+        "physicalDiagnostics": dict(physical_source.diagnostics),
+    }
+    for directory in dict.fromkeys((config_path.parent / "physical-contours",
+                                   bundle.parent / "physical-contours")):
+        if not current_height_graphs(directory):
+            continue
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        if manifest["binding"]["physicalInput"] == identity:
+            return directory
+    return None
 
 
 def prepare_regeneration(
@@ -49,7 +76,9 @@ def prepare_regeneration(
     bundle = (config_path.parent / field_record["path"]).resolve()
     if sha256(bundle) != field_record["sha256"].upper():
         raise ValueError("accepted physical field hash mismatch")
-    load_surface_bundle(bundle)
+    physical_source = load_surface_bundle(bundle)
+    contour_checkpoint = _reusable_physical_contours(
+        config_path, bundle, config, settings, physical_source)
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     forbidden = {"埃瑞诺", "中洛", "中洛天", "米斯拉"}
     inventory = []
@@ -65,6 +94,8 @@ def prepare_regeneration(
     source_checkpoint = bundle.parent / "physical-grid"
     if source_checkpoint.is_dir():
         shutil.copytree(source_checkpoint, output / "source/physical-grid")
+    if contour_checkpoint is not None:
+        shutil.copytree(contour_checkpoint, output / "physical-contours")
     config["source"]["path"] = "source/physical-reference.png"
     config["source"]["fieldBundle"]["path"] = "source/physical-fields.npz"
     config["output"]["directory"] = "."
@@ -77,6 +108,10 @@ def prepare_regeneration(
         "provenance": provenance,
         "forbidden": tuple(sorted(forbidden)),
         "settings": settings,
+        "physicalContoursCheckpoint": {
+            "state": "hit" if contour_checkpoint is not None else "miss",
+            "source": str(contour_checkpoint) if contour_checkpoint is not None else None,
+        },
     }
 
 
@@ -139,7 +174,8 @@ def build_accepted_world(
         "terrainSeed": recipe.seed, "terrainSchema": provenance["schema"], "status": "building",
         "sourceSha256": sha256(output / "source/physical-reference.png"),
         "fieldSha256": sha256(output / "source/physical-fields.npz"),
-        "settingsSha256": sha256(output / "world-settings.json")})
+        "settingsSha256": sha256(output / "world-settings.json"),
+        "physicalContoursCheckpoint": prepared["physicalContoursCheckpoint"]})
     print(f"Accepted terrain verified; {len(prepared['forbidden'])} old names excluded. Building climate and hydrology.", flush=True)
     checkpoint = output / "source/physical-grid"
     with measure_stage(output, "climate-hydrology"):

@@ -2,16 +2,16 @@
 
 从板块、海陆与连续地形，到水系、城市、交通、文化、宗教、国家和省份的可复现世界生成器。计算代码与 AI 工作流分离：引擎离线计算，skill 负责先问 17 个世界设定问题、解释参数、参考研究和看图验收。
 
-当前版本 **1.4.0.dev15** 为开发预发布，缓存地形插值系数、批量计算范围证书，并减少重复生成与验收；性能对照见[生成提速与流程优化](docs/generation-performance-dev15.md)。保留按需城市地图、多文化宫城、屋顶材料色差、真实岸线港区、局部蓄水湖与支流合流，以及道路、建筑和城防的统一避让。保留大陆连通修复、柯本气候、文明命名、交通依据的政区边界、坡度约束道路和离线 Three.js 球体。城市改动及验证边界见[城市精细化](docs/city-refinement-v101.md)；上一稳定版本是 [1.3.0](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.3.0)。
+当前版本 **1.4.0.dev17** 为开发预发布，批量提取制图等高线、共享精确切片编码、索引道路约束，并并行调度独立绘制阶段。物理模拟分辨率保持不变；制图分支在四倍密度网格发现，交点仍由原连续地形求根，采样格内部的微小闭环不再逐一认证。流程与计时见[单次生成](docs/generation-workflow-speed.md)，实测见[生成性能](docs/generation-performance-dev17.md)。保留按需城市地图、多文化宫城、屋顶材料色差、真实岸线港区、局部蓄水湖与支流合流，以及道路、建筑和城防的统一避让。保留大陆连通修复、柯本气候、文明命名、交通依据的政区边界、坡度约束道路和离线 Three.js 球体。城市改动及验证边界见[城市精细化](docs/city-refinement-v101.md)；上一稳定版本是 [1.3.0](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.3.0)。
 
 ![v38 引擎实际生成的地形底图](docs/images/v38-terrain.png)
 
 ## 下载与开始
 
-- [下载 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev15/generate-world-atlas-skill.zip)：内含问卷、规则、下载与安装脚本。
-- [下载计算 wheel](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev15/world_atlas_engine-1.4.0.dev15-py3-none-any.whl)：供 Python/CLI 直接调用。
-- [下载独立源码包](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev15/world-atlas-engine-1.4.0.dev15-source.zip)。
-- [全部附件与 SHA-256 清单](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.4.0.dev15)。
+- [下载 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev17/generate-world-atlas-skill.zip)：内含问卷、规则、下载与安装脚本。
+- [下载计算 wheel](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev17/world_atlas_engine-1.4.0.dev17-py3-none-any.whl)：供 Python/CLI 直接调用。
+- [下载独立源码包](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev17/world-atlas-engine-1.4.0.dev17-source.zip)。
+- [全部附件与 SHA-256 清单](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.4.0.dev17)。
 
 ### 使用 skill
 
@@ -28,9 +28,9 @@ skill 的自动入口也可手动执行（在解压后的 skill 文件夹内）�
 python scripts/install_engine.py --target ./atlas-runtime
 ```
 
-安装器仅创建本地虚拟环境和 renderer，不修改系统 Python/npm。输出 `atlas-runtime/runtime.json`，包含可直接调用的 Python 与 Mapshaper 绝对路径。已有环境沿用并运行 `doctor` 检查；不要对同一个目录重复安装。
+安装器仅创建本地虚拟环境和 renderer，不修改系统 Python/npm。输出 `atlas-runtime/runtime.json`，包含可直接调用的 Python 与 Mapshaper 绝对路径。已有合格环境直接沿用；环境改变时才运行 `doctor`，不要对同一个目录重复安装。
 
-包按固定 tag + SHA-256 下载，不追踪 `latest`。成功下载缓存在 `.world-atlas-downloads/1.4.0.dev15`；使用前再次校验。网络中断、文件截断或哈希不符会停止，未经验证的 wheel 不会安装。缓存需支持硬链接的本地文件系统（已测 NTFS）。已安装成功的环境可离线计算；缓存 wheel 不等于缓存了全部第三方依赖。
+包按固定 tag + SHA-256 下载，不追踪 `latest`。成功下载缓存在 `.world-atlas-downloads/1.4.0.dev17`；使用前再次校验。网络中断、文件截断或哈希不符会停止，未经验证的 wheel 不会安装。缓存需支持硬链接的本地文件系统（已测 NTFS）。已安装成功的环境可离线计算；缓存 wheel 不等于缓存了全部第三方依赖。
 
 ### 直接使用计算包
 
@@ -50,11 +50,12 @@ Pop-Location
 ```text
 python -m world_atlas terrain --recipe examples/terrain.json --output runs/terrain-001
 python -m world_atlas world --terrain runs/terrain-001 --settings examples/world-settings.json --output runs/world-001 --mapshaper runtime/node_modules/mapshaper/bin/mapshaper
-python -m world_atlas verify runs/world-001
 python -m world_atlas seeds --root-seed 2116268501 --count 6
 ```
 
 `terrain-v38.json` 是复现样本，不是所有新世界的默认模板。改种子/已支持参数即可产生新候选；`seeds` 只挑代表种子，不表示已经通过地理和审美检查。
+
+普通生成复用 `world` 已生成的机器检查，不另跑 `verify` 或独立重算；需要专项审计或复现时再显式调用。
 
 打开输出的 `review/index.html`。若宿主不能打开 file URL，可在该 review 目录运行 `python -m http.server 8000 --bind 127.0.0.1`，浏览器访问 `http://127.0.0.1:8000`。这是本机预览，不会自动发布到公网。
 
@@ -87,7 +88,7 @@ flowchart TD
   R --> N[国家 / 行政中心 / 道路约束迭代]
   N --> A[边境要塞 / 省份 / 架空命名]
   A --> M[共享拓扑边界 / SVG 与分层地图]
-  M --> E[机器检查 + 复现检查 + 实际浏览器验收]
+  M --> E[复用内建检查 / 打开一次网页 / 交付]
 ```
 
 详见 [技术路线与实现边界](docs/TECHNICAL_ROUTE.md)、[1.3.0 地形迭代记录](docs/terrain-1.3.0.md)、[1.2.1 性能与两极设置实测](docs/performance-1.2.0.md)、[海岸改进记录](docs/coastline-1.1.0.md)、[历史抽取与验证](docs/VALIDATION.md)。

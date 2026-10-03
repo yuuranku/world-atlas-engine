@@ -38,16 +38,19 @@ def shared_display_coverage(geometries):
     # Rounding polygon inputs separately can invent the same T-node hole
     # that the common linework above prevents.
     covered = shapely.set_precision(shapely.union_all(source), 1e-8)
-    unowned = shapely.union_all(faces[owners == -1])
+    # Polygonize produced disjoint faces of one noded graph. Dissolving a
+    # subset therefore needs no second intersection overlay.
+    unowned = shapely.coverage_union_all(faces[owners == -1])
     if shapely.intersection(unowned, covered, grid_size=1e-8).area != 0:
         raise ValueError("display noding must assign every originally painted face")
     result = shapely.set_precision(np.asarray([
-        shapely.union_all(faces[owners == index]) for index in range(len(source))
+        shapely.coverage_union_all(faces[owners == index]) for index in range(len(source))
     ], dtype=object), 1e-8)
-    if not shapely.symmetric_difference(covered, shapely.union_all(result), grid_size=1e-8).is_empty:
-        raise ValueError("display noding must retain the complete delivered coverage")
     if not bool(shapely.coverage_is_valid(result)):
         raise ValueError("display category boundaries must form a shared exact coverage")
+    if not shapely.symmetric_difference(covered, shapely.coverage_union_all(
+            result[~shapely.is_empty(result)]), grid_size=1e-8).is_empty:
+        raise ValueError("display noding must retain the complete delivered coverage")
     return result
 
 
