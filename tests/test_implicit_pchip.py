@@ -28,19 +28,19 @@ class ImplicitPchipTests(unittest.TestCase):
                             np.full(6, 4.), np.full(6, 5.)))
         field = field_for(native)
         lower, upper = np.array(((1.5, 1.5), (2.5, 1.5))), np.array(((2.5, 2.5), (3.5, 2.5)))
-        events = pchip_native_switch_abscissae(field, field.native_m, lower, upper)
+        events = pchip_native_switch_abscissae(field, lower, upper)
         self.assertTrue(all(2.5 in event for event in events))
         self.assertTrue(all(len(event) == 0 for event in pchip_switch_abscissae(
-            field, field.native_m, lower, upper)))
+            field, lower, upper)))
         field = field_for(np.tile(np.arange(6.), (5, 1)))
         self.assertTrue(all(len(event) == 0 for event in pchip_native_switch_abscissae(
-            field, field.native_m, lower, upper)))
+            field, lower, upper)))
 
     def test_public_event_longitudes_are_true_adjacent_row_equalities(self):
         native = np.random.default_rng(89323).uniform(100, 2000, (9, 11))
         field = field_for(native)
         lower, upper = np.array(((3.5, 1.5),)), np.array(((4.5, 2.5),))
-        events = pchip_switch_abscissae(field, field.native_m, lower, upper)[0]
+        events = pchip_switch_abscissae(field, lower, upper)[0]
         self.assertGreater(len(events), 0)
         self.assertLess(float(np.min(abs(events-4.27165524165717))), 1e-12)
         self.assertTrue(np.all((events > 3.5) & (events < 4.5)))

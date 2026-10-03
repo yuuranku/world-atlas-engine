@@ -204,7 +204,7 @@ class ImplicitTerrainTests(unittest.TestCase):
         field=RefinedTerrainField(base,seed=1,radius_km=12,flow_to=flow,discharge=discharge,
                                   river_segments=np.empty((0,2,2)),river_anchors=np.empty((0,2)))
         lower,upper=np.array(((3.5,1.5),)),np.array(((4.5,2.5),))
-        events=pchip_switch_abscissae(base,native,lower,upper)[0]
+        events=pchip_switch_abscissae(base,lower,upper)[0]
         event=float(events[np.argmin(abs(events-4.27165524165717))])
         ordinate=1.9827907997308
         level=float(field.sample_points(event,ordinate))

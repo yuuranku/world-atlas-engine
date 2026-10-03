@@ -8,10 +8,10 @@ polynomial solver owns their positions; the unchanged field owns ordinates.
 """
 
 import numpy as np
-from scipy.interpolate import PchipInterpolator, PPoly
+from scipy.interpolate import PPoly
 
 
-def pchip_native_switch_abscissae(field, native, lower, upper):
+def pchip_native_switch_abscissae(field, lower, upper):
     """Return isolated slope switches, including native-interval endpoints.
 
     These belong to the source tensor PCHIP model, independent of any level
@@ -32,10 +32,8 @@ def pchip_native_switch_abscissae(field, native, lower, upper):
     offsets = np.arange(-1, 3)
     for begin in range(0, len(cells), 16384):
         local_cells = cells[begin:begin+16384]
-        columns = (local_cells[:, 0][None, :]+offsets[:, None]) % field.width
         rows = np.clip(local_cells[:, 1][None, :]+offsets[:, None], 0, field.height-1)
-        local = native[rows[:, None, :], columns[None, :, :]]
-        coefficients = PchipInterpolator(np.arange(-1, 3), local, axis=1).c[:, 1]
+        coefficients = field.horizontal_coefficients[:, rows, local_cells[:, 0]]
         differences = np.diff(coefficients, axis=1)
         roots = PPoly(differences[:, None, :, :], [0., 1.], extrapolate=False).solve(
             discontinuity=False, extrapolate=False)
@@ -54,12 +52,12 @@ def pchip_native_switch_abscissae(field, native, lower, upper):
     return result
 
 
-def pchip_switch_abscissae(field, native, lower, upper):
+def pchip_switch_abscissae(field, lower, upper):
     """Return interior switches; the base adapter already owns native ports."""
     lower, upper = np.asarray(lower, dtype=float), np.asarray(upper, dtype=float)
     return [x[(x > first[0]) & (x < last[0])]
             for x, first, last in zip(
-                pchip_native_switch_abscissae(field, native, lower, upper),
+                pchip_native_switch_abscissae(field, lower, upper),
                 lower, upper, strict=True)]
 
 
@@ -77,7 +75,7 @@ def split_pchip_branches(field, native, segments, lower, upper, level):
     if (segments.shape[1:] != (2, 2) or lower.shape != (len(segments), 2)
             or upper.shape != lower.shape):
         raise ValueError("PCHIP sections require paired native branches and brackets")
-    events = pchip_switch_abscissae(field, native, lower, upper)
+    events = pchip_switch_abscissae(field, lower, upper)
 
     # Import at the call boundary: the scalar adapter itself consumes this
     # model-section helper, while its public ordinate solver owns root finding.

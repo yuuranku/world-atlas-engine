@@ -30,7 +30,7 @@ def _disk_sections(field, patch):
     periods = columns-primary
     lower = np.column_stack((primary+.5, np.maximum(0., rows+.5)))
     upper = np.column_stack((primary+1.5, np.minimum(field.height, rows+1.5)))
-    roots = pchip_native_switch_abscissae(field.base, field.base.native_m, lower, upper)
+    roots = pchip_native_switch_abscissae(field.base, lower, upper)
     sections, seen = [], set()
     for interval, (events, period) in enumerate(zip(roots, periods, strict=True)):
         for canonical_x in events:

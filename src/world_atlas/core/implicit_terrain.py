@@ -578,8 +578,8 @@ def _refined_event_sections(field,level,starts,ends,lower,upper,axes,directions,
     """Insert true ports at the original model's explicit switching events."""
     from .implicit_river_events import interior_river_medials, interior_medial_is_nearest
     from .implicit_warp_events import warped_pchip_events
-    height_events=pchip_switch_abscissae(field,field._height.pchip.native_m,lower,upper)
-    base_events=pchip_switch_abscissae(field,field.native_m,lower,upper)
+    height_events=pchip_switch_abscissae(field._height.pchip,lower,upper)
+    base_events=pchip_switch_abscissae(field.base,lower,upper)
     events=[np.unique(np.r_[height,base])for height,base in zip(height_events,base_events,strict=True)]
     owners,first,last,height_switch=[],[],[],[]
     for owner,xvalues in enumerate(events):

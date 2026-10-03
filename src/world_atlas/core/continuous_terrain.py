@@ -7,9 +7,12 @@ contain independent vertical lake-level observations.
 """
 
 import math
+from functools import cached_property
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator
+
+from .continuous_pchip import periodic_horizontal_coefficients
 
 
 class PhysicalTerrainField:
@@ -40,6 +43,21 @@ class PhysicalTerrainField:
         self.sea_level_m = float(sea_level_m)
         self.elevation_scale_m = float(elevation_scale_m)
         self.elevation_exponent = float(elevation_exponent)
+
+    @cached_property
+    def horizontal_coefficients(self):
+        return periodic_horizontal_coefficients(self.native_m)
+
+    def __getstate__(self):
+        # Workers reconstruct this derived cache locally; do not transfer a
+        # full four-coefficient raster with every spawned terrain field.
+        state = self.__dict__.copy()
+        state.pop('horizontal_coefficients', None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.native_m.flags.writeable = False
 
     def sample_rect(self, x, y):
         """Sample native map coordinates, whose original centres are n + .5.
@@ -75,9 +93,8 @@ class PhysicalTerrainField:
     def sample_points(self, x, y):
         """Sample paired coordinates using the same tensor PCHIP definition.
 
-        Each containing interval needs just four neighbours. SciPy computes
-        their existing polynomial coefficients in batches; paired polynomial
-        evaluation avoids constructing a large Cartesian product of points.
+        Longitude polynomials are shared by every query of the immutable
+        native field. Only the latitude coefficients depend on longitude.
         """
         x, y = np.broadcast_arrays(np.asarray(x, dtype=np.float64),
                                    np.asarray(y, dtype=np.float64))
@@ -88,10 +105,8 @@ class PhysicalTerrainField:
         x, y = x.ravel(), y.ravel()
         column, row = np.floor(x - .5).astype(np.int64), np.floor(y - .5).astype(np.int64)
         offsets = np.arange(-1, 3)[:, None]
-        columns = (column[None, :] + offsets) % self.width
         rows = np.clip(row[None, :] + offsets, 0, self.height - 1)
-        local = self.native_m[rows[:, None, :], columns[None, :, :]]
-        x_coefficients = PchipInterpolator(np.arange(-1, 3), local, axis=1).c[:, 1]
+        x_coefficients = self.horizontal_coefficients[:, rows, column % self.width]
         tx = x - .5 - column
         horizontal = ((x_coefficients[0] * tx + x_coefficients[1]) * tx
                       + x_coefficients[2]) * tx + x_coefficients[3]

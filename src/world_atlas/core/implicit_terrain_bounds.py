@@ -7,7 +7,6 @@ branch, so a strictly signed directional interval certifies monotonicity.
 """
 import numpy as np
 import shapely
-from scipy.interpolate import PchipInterpolator
 
 from .continuous_terrain import PhysicalTerrainField
 from .terrain_refinement import RefinedTerrainField
@@ -262,7 +261,7 @@ def _polynomial(coefficients,position):
     middle=_value_add(da,_product(width,_value_add(_product(_value_scale(bounds[0],3),first),bounds[1])))
     derivative_controls=(da,middle,db)
     dl=np.minimum.reduce([v[0]for v in derivative_controls]);dh=np.maximum.reduce([v[1]for v in derivative_controls])
-    gradient = _product((position.gradient_low,position.gradient_high),(dl[:,None],dh[:,None]))
+    gradient = _product((position.gradient_low,position.gradient_high),(dl[...,None],dh[...,None]))
     return _Dual(low,high,*gradient)
 
 
@@ -285,7 +284,7 @@ def _restrict(value,indices,low,high):
                  value.gradient_low[indices],value.gradient_high[indices])
 
 
-def _raster(native,x,y,*,bilinear=False):
+def _raster(native,x,y,*,horizontal_coefficients):
     """Union every intersected native coefficient patch after the true warp."""
     height,width = native.shape
     column,row = np.floor(x.low-.5).astype(int),np.floor(y.low-.5).astype(int)
@@ -303,31 +302,26 @@ def _raster(native,x,y,*,bilinear=False):
             yy = _restrict(y,indices,rr[indices]+.5,rr[indices]+1.5)-(rr[indices]+.5)
             xx.low,xx.high = np.maximum(0,xx.low),np.minimum(1,xx.high)
             yy.low,yy.high = np.maximum(0,yy.low),np.minimum(1,yy.high)
-            if bilinear:
+            if horizontal_coefficients is None:
                 a,b = native[np.clip(rr[indices],0,height-1),(cc[indices])%width],native[np.clip(rr[indices],0,height-1),(cc[indices]+1)%width]
                 c,d = native[np.clip(rr[indices]+1,0,height-1),(cc[indices])%width],native[np.clip(rr[indices]+1,0,height-1),(cc[indices]+1)%width]
                 result = (1-yy)*((1-xx)*a+xx*b)+yy*((1-xx)*c+xx*d)
             else:
-                rows,polynomials,roundoff = [],[],[]
-                for offset in (-1,0,1,2):
-                    values = np.stack([native[np.clip(rr[indices]+offset,0,height-1),
-                                              (cc[indices]+j)%width] for j in (-1,0,1,2)])
-                    coefficients = PchipInterpolator(np.arange(-1,3),values,axis=0).c[:,1]
-                    polynomials.append(coefficients)
-                    roundoff.append(_polynomial_roundoff(coefficients,xx))
-                    rows.append(_polynomial(coefficients,xx))
-                differences = []
-                for j in range(3):
-                    # The four rows share one abscissa. Subtract coefficients
-                    # before evaluation to preserve that exact dependency.
-                    difference = _polynomial(_Dual(polynomials[j+1])-_Dual(polynomials[j]),xx)
-                    allowance = roundoff[j+1]+roundoff[j]
-                    rounded = allowance!=0
-                    allowance = np.where(rounded,_up(allowance),0)
-                    difference.low = np.where(rounded,_down(difference.low-allowance),difference.low)
-                    difference.high = np.where(rounded,_up(difference.high+allowance),difference.high)
-                    differences.append(difference)
-                result = _hermite(rows,yy,differences)
+                rows = np.clip(rr[indices][None,:]+np.arange(-1,3)[:,None],0,height-1)
+                polynomials = horizontal_coefficients[:,rows,cc[indices]%width]
+                roundoff = _polynomial_roundoff(polynomials,xx)
+                values = _polynomial(polynomials,xx)
+                # Rows share one abscissa. Batch their three differences while
+                # retaining the same outward rounding at every operation.
+                differences = _polynomial(_Dual(polynomials[:,1:])-_Dual(polynomials[:,:-1]),xx)
+                allowance = roundoff[1:]+roundoff[:-1]
+                rounded = allowance!=0
+                allowance = np.where(rounded,_up(allowance),0)
+                differences.low = np.where(rounded,_down(differences.low-allowance),differences.low)
+                differences.high = np.where(rounded,_up(differences.high+allowance),differences.high)
+                rows = [values[j] for j in range(4)]
+                result = _hermite(rows,yy,
+                                  [differences[j] for j in range(3)])
                 # Shape-preserving vertical interpolation stays between its
                 # two containing horizontal rows. Their intervals already
                 # include the source polynomial's complete evaluation error.
@@ -512,11 +506,13 @@ def _evaluate(field,lower,upper,*,directions=None):
         dx,dy = directions[:,0,:],directions[:,1,:]
     x,y = _Dual(lower[:,0],upper[:,0],dx),_Dual(lower[:,1],upper[:,1],dy)
     if isinstance(field,PhysicalTerrainField):
-        return _raster(field.native_m,x,y)
+        return _raster(field.native_m,x,y,horizontal_coefficients=field.horizontal_coefficients)
     warped_x,warped_y = _warp(field,x,y)
-    ground = _raster(field.base.native_m,warped_x,warped_y)
-    detail = _drainage(field._height,x,y)-_raster(field._height.pchip.native_m,x,y)
-    amplitude = _raster(field._amplitude,x,y,bilinear=True)*_protection(field,x,y)
+    ground = _raster(field.base.native_m,warped_x,warped_y,
+                     horizontal_coefficients=field.base.horizontal_coefficients)
+    detail = _drainage(field._height,x,y)-_raster(field._height.pchip.native_m,x,y,
+                     horizontal_coefficients=field._height.pchip.horizontal_coefficients)
+    amplitude = _raster(field._amplitude,x,y,horizontal_coefficients=None)*_protection(field,x,y)
     gain = 1+.45*_tanh(amplitude/(_absolute(ground)+30))*detail
     result = ground*gain
     # The model explicitly pins native centres, including their binary64

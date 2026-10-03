@@ -14,7 +14,7 @@
 
 首次安装需要已有 Python 3.14、Node.js/npm 和网络；运行阶段离线，不需 API key。Mapshaper 0.7.56 是完整地图共享边界的实际依赖，不能漏列。
 
-分享 [完整轻量 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev14/generate-world-atlas-skill.zip)，不能只发 SKILL.md。这是开发预发布。安装到宿主 skills 目录后重新加载技能；首次新世界仍先问 17 题，确认有效参数后才自动下载。源代码和单独 wheel 见 [版本下载页](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.4.0.dev14)。不要使用原作者的盘符路径。`--target` 必须是全新目录，安装后使用返回的解释器/Mapshaper 路径。仅安装计算 wheel 时，地形模式只需 Python 及 wheel 声明的库；完整人文地图另需锁定的 Node/Mapshaper。
+分享 [完整轻量 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev15/generate-world-atlas-skill.zip)，不能只发 SKILL.md。这是开发预发布。安装到宿主 skills 目录后重新加载技能；首次新世界仍先问 17 题，确认有效参数后才自动下载。源代码和单独 wheel 见 [版本下载页](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.4.0.dev15)。不要使用原作者的盘符路径。`--target` 必须是全新目录，安装后使用返回的解释器/Mapshaper 路径。仅安装计算 wheel 时，地形模式只需 Python 及 wheel 声明的库；完整人文地图另需锁定的 Node/Mapshaper。
 
 ## 入口
 
@@ -33,7 +33,7 @@ python -m world_atlas verify <完整世界目录>
 
 `terrain` 产出 source NPZ/PNG、`worldgen.json` 及 `review/index.html`。地形认可后，把已确认的行星、人文、地形/人文/命名种子写进严格的世界设置 JSON，再运行 `world`；不改已发布输入或 fieldBundle 哈希。设置会复制进成品并参与 SHA-256 校验。
 
-`world` 重算物理网格和人文，保存 source、grid、society、review、命名及语义检查。`verify` 写检查报告，不修改计算数组。
+`world` 重算物理网格和人文，保存 source、grid、society、review、命名及语义检查。普通生成复用这些内建记录，不额外重复 `verify` 或 `reproduce`。`verify` 用于交付文件有疑点或明确要求专项检查时，写检查报告，不修改计算数组。
 
 `reproduce` 固定地形，重建后续链路并比较四项语义指纹：物理数组、人文数组、人文实体及导航网络；这不代表“所有新种子均已验证”。
 
@@ -56,4 +56,4 @@ Python API 与 CLI 共用实现：`from world_atlas import generate_terrain, gen
 
 中断后先查 `regeneration.json` 和 checkpoint。仅在 `status=building`、源/配置/引擎版本不变时，使用 `world_atlas.rebuild.publish_accepted_world(output)` 从物理 checkpoint 继续，或 `finish_accepted_world(output)` 从验证过的 society checkpoint 继续。不是忽略错误的备用算法。
 
-不确定时保留 checkpoint 并新建输出重算。续跑后同样做 `verify`；复现还须与原预期语义指纹比较。
+不确定时保留 checkpoint，先定位失效的输入或阶段；不得默认从头重新生成整个世界。版本和输入绑定相同才续跑，绑定不符时说明需要重算的具体阶段。续跑复用已有有效检查，只补受影响或缺失部分；玩家明确要求复现时再与原预期语义指纹比较。

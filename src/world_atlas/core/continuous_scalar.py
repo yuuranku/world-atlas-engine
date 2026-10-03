@@ -1,6 +1,7 @@
 """Trace continuous thematic quantities before assigning display classes."""
 
 import math
+from functools import cached_property
 
 import numpy as np
 import shapely
@@ -10,6 +11,7 @@ from scipy.optimize import elementwise
 
 from .implicit_curves import adaptive_curve_paths, level_bands, polygon_path
 from .implicit_pchip import split_pchip_branches
+from .continuous_pchip import periodic_horizontal_coefficients
 
 
 class ContinuousScalarField:
@@ -36,6 +38,19 @@ class ContinuousScalarField:
             self.native[~land] = values[rows[~land], columns[~land] % self.width]
         self.native.flags.writeable = False
 
+    @cached_property
+    def horizontal_coefficients(self):
+        return periodic_horizontal_coefficients(self.native)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop('horizontal_coefficients', None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.native.flags.writeable = False
+
     def sample_rect(self, x, y):
         x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
         if (x.ndim != 1 or y.ndim != 1 or not x.size or not y.size
@@ -55,9 +70,8 @@ class ContinuousScalarField:
     def sample_points(self, x, y):
         """Evaluate paired points on exactly the same tensor PCHIP surface.
 
-        Four neighbours determine each containing interval. SciPy constructs
-        their coefficients in bounded batches; paired Horner evaluation does
-        not allocate the Cartesian product of all requested coordinates.
+        Cached longitude coefficients and bounded latitude batches avoid
+        reconstructing fixed polynomials or a Cartesian product of points.
         """
         x, y = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
         if (not np.all(np.isfinite(x)) or not np.all(np.isfinite(y))
@@ -72,10 +86,8 @@ class ContinuousScalarField:
             xx, yy = x[begin:stop], y[begin:stop]
             column = np.floor(xx-.5).astype(np.int64)
             row = np.floor(yy-.5).astype(np.int64)
-            columns = (column[None, :]+offsets) % self.width
             rows = np.clip(row[None, :]+offsets, 0, self.height-1)
-            local = self.native[rows[:, None, :], columns[None, :, :]]
-            coefficients = PchipInterpolator(np.arange(-1, 3), local, axis=1).c[:, 1]
+            coefficients = self.horizontal_coefficients[:, rows, column % self.width]
             tx = xx-.5-column
             horizontal = ((coefficients[0]*tx+coefficients[1])*tx+coefficients[2])*tx+coefficients[3]
             coefficients = PchipInterpolator(np.arange(-1, 3), horizontal, axis=0).c[:, 1]
@@ -155,7 +167,7 @@ def _vertical_coefficients(field, native, longitude, lower):
         rows = np.clip(rr[None, :]+offsets, 0, field.height-1)
         local = native[rows[:, None, :], columns[None, :, :]]
         native_scale[begin:stop] = np.max(abs(local), axis=(0,1))
-        horizontal_coefficients = PchipInterpolator(np.arange(-1, 3), local, axis=1).c[:, 1]
+        horizontal_coefficients = field.horizontal_coefficients[:, rows, column % field.width]
         tx = xx-.5-column
         horizontal = ((horizontal_coefficients[0]*tx+horizontal_coefficients[1])*tx
                       + horizontal_coefficients[2])*tx+horizontal_coefficients[3]
