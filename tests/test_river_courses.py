@@ -126,6 +126,28 @@ class RiverCourseTests(unittest.TestCase):
         self.assertGreater(float(base.sample_points(dense[:, 0], dense[:, 1]).min()), 0.)
         np.testing.assert_array_equal(result[[0, -1]], source)
 
+    def test_disconnected_diagonal_outlet_meets_the_upstream_continuous_shore(self):
+        data = json.loads((Path(__file__).parent/'fixtures/river-disconnected-outlet.json').read_text())
+        grid, base = fixture(data['ground'])
+        source = np.asarray(data['source'])
+        original_flow = grid.flow_to.copy()
+        t = np.linspace(0., 1., 65)
+        original = (source[:-1, None]+np.diff(source, axis=0)[:, None]*t[None, :, None]).reshape(-1, 2)
+        self.assertLess(float(base.sample_points(original[:, 0], original[:, 1]).min()), 0.)
+        courses = solve_river_courses(grid, base, source_paths=(source,))
+        self.assertEqual(len(courses.paths), 1)
+        path = courses.paths[0]
+        self.assertFalse(np.array_equal(path[-1], source[-1]))
+        np.testing.assert_array_equal(path[0], source[0])
+        np.testing.assert_array_equal(path[-1], courses.source_paths[0][-1])
+        self.assertLess(abs(float(base.sample_points(*path[-1]))), 1e-7)
+        dense = (path[:-1, None]+np.diff(path, axis=0)[:, None]*t[None, :-1, None]).reshape(-1, 2)
+        self.assertGreater(float(base.sample_points(dense[:, 0], dense[:, 1]).min()), 0.)
+        direction = path[-1]-path[-2]
+        self.assertLess(float(base.sample_points(*(path[-1]+direction*.001))), 0.)
+        self.assertTrue(np.all(np.diff(courses.beds[0]) <= 0))
+        np.testing.assert_array_equal(grid.flow_to, original_flow)
+
     def test_between_station_ground_trough_cannot_create_an_uphill_bed(self):
         y, x = np.indices((32, 32), dtype=float)+.5
         grid, base = fixture(200.+20*(y-16.5)**2+20*(x-16.5)**2)

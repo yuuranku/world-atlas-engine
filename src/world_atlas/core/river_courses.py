@@ -243,6 +243,39 @@ def _node_key(point, width):
     return (round(float(point[0] % width), 10), round(float(point[1]), 10))
 
 
+def _shore_approach(base, points, reference, limits, blocked):
+    """End a terminal channel at the dry component's actual water boundary.
+
+    A D8 diagonal can join two positive native centres whose continuous dry
+    ground is disconnected. An outlet must meet the first shore of its
+    upstream land, rather than cross sea to a detached terminal land sample.
+    """
+    heights = base.sample_points(points[:, 0], points[:, 1])
+    positive = np.flatnonzero(heights[:blocked+1] > 0)
+    if not len(positive) or abs(float(heights[-1])) > 1e-7:
+        raise ValueError("the logical river corridor has no dry subcell shore approach")
+    first = int(positive[-1])
+    delta = points[first+1]-points[first]
+    fractions = np.linspace(0., 1., 65)
+    samples = points[first]+fractions[:, None]*delta
+    wet = np.flatnonzero(base.sample_points(samples[:, 0], samples[:, 1]) <= 0)
+    if not len(wet):
+        raise ValueError("a blocked outlet approach must meet a continuous water boundary")
+    index = int(wet[0])
+    low, high = fractions[index-1], fractions[index]
+    for _ in range(48):
+        middle = (low+high)/2
+        point = points[first]+middle*delta
+        if base.sample_points(*point) > 0:
+            low = middle
+        else:
+            high = middle
+    mouth = points[first]+((low+high)/2)*delta
+    return (np.vstack((points[:first+1], mouth)),
+            np.vstack((reference[:first+1], mouth)),
+            np.r_[limits[:first+1], 0.])
+
+
 def _dry_course_spans(base, points, reference, limits):
     """Route short shore approaches around actual subcell water pockets."""
     for _ in range(5):
@@ -273,7 +306,8 @@ def _dry_course_spans(base, points, reference, limits):
             height[inside] = base.sample_points(candidates[inside, 0], candidates[inside, 1])
             selected = np.flatnonzero(height > 0)
             if not len(selected):
-                raise ValueError("the logical river corridor has no dry subcell shore approach")
+                points, reference, limits = _shore_approach(base, points, reference, limits, index)
+                break
             selected = selected[np.argsort(np.abs(shifts[selected]), kind="stable")]
             leg_t = np.linspace(0., 1., 17)[1:-1]
             last = candidates[selected, None]+(points[index+1]-candidates[selected])[:, None]*leg_t[:, None]
@@ -283,13 +317,14 @@ def _dry_course_spans(base, points, reference, limits):
             accepted = np.flatnonzero(supports > 0)
             chosen = selected[int(accepted[0])] if len(accepted) else selected[int(np.argmax(supports))]
             inserts[int(index)] = (candidates[chosen], source, radius)
-        output, source_output, radius_output = [], [], []
-        for index, point in enumerate(points):
-            output.append(point); source_output.append(reference[index]); radius_output.append(limits[index])
-            if index in inserts:
-                candidate, source, radius = inserts[index]
-                output.append(candidate); source_output.append(source); radius_output.append(radius)
-        points, reference, limits = np.asarray(output), np.asarray(source_output), np.asarray(radius_output)
+        else:
+            output, source_output, radius_output = [], [], []
+            for index, point in enumerate(points):
+                output.append(point); source_output.append(reference[index]); radius_output.append(limits[index])
+                if index in inserts:
+                    candidate, source, radius = inserts[index]
+                    output.append(candidate); source_output.append(source); radius_output.append(radius)
+            points, reference, limits = np.asarray(output), np.asarray(source_output), np.asarray(radius_output)
     raise ValueError("a continuous river shore approach must remain on positive ground")
 
 
@@ -392,6 +427,7 @@ def solve_river_courses(grid, base, *, source_paths=None, locked_points=()):
     stations = [_source_stations(grid, path) for path in prepared]
     limits = _station_limits(stations)
     paths = []
+    resolved_sources = []
     locks = np.asarray(locked_points, dtype=float).reshape(-1, 2)
     for (points, _, _), allowed in zip(stations, limits, strict=True):
         fixed = np.zeros(len(points), dtype=bool); fixed[[0, -1]] = True
@@ -400,11 +436,20 @@ def solve_river_courses(grid, base, *, source_paths=None, locked_points=()):
             fixed |= np.any(np.linalg.norm(points[:, None]-locks[None], axis=2) <= 1e-7, axis=1)
         allowed[fixed] = 0.
         course = _valley_course(grid, base, points, allowed, fixed)
-        paths.append(_dry_course_spans(base, course, points, allowed))
+        course = _dry_course_spans(base, course, points, allowed)
+        source = np.asarray(sources[len(paths)])
+        if not np.array_equal(course[-1], source[-1]):
+            # The source and displayed reaches share the same resolved mouth;
+            # no consumer retains the disconnected native terminal approach.
+            station = shapely.LineString(source).project(shapely.Point(course[-1]))
+            along = np.r_[0., np.cumsum(np.linalg.norm(np.diff(source, axis=0), axis=1))]
+            source = np.vstack((source[along < station], course[-1]))
+        resolved_sources.append(source.copy())
+        paths.append(course)
     paths, geometric_crossings = _shared_course_stations(paths, base.width)
     beds, raw, height_cycles = _descending_beds(paths, base)
     incision = [heights-bed for heights, bed in zip(raw, beds, strict=True)]
-    return RiverCourses(tuple(np.asarray(path).copy() for path in sources), tuple(paths), beds,
+    return RiverCourses(tuple(resolved_sources), tuple(paths), beds,
         {"schema": "continuous-river-course-bed-v1", "reaches": len(paths),
          "courseModel": "continuous-base-valley-minima-with-shared-corridor",
          "bedModel": "greatest-nonincreasing-positive-ground-cap",

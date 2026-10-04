@@ -2,18 +2,20 @@
 
 从板块、海陆与连续地形，到水系、城市、交通、文化、宗教、国家和省份的可复现世界生成器。计算代码与 AI 工作流分离：引擎离线计算，skill 负责先问 17 个世界设定问题、解释参数、参考研究和看图验收。
 
-当前版本 **1.4.0.dev22** 为开发预发布。国省区划保留自然控制单元、机构实力、时代响应时间和真实交通联系形成的结果，绘制读取权威省份归属，国界由省份父国合并；删除末尾等权首府竞速覆盖。河道由连续地形横断面低谷和受河网间距限制的曲率求解，河床、细地形、桥梁与生态用水共用一份结果，不添加装饰波浪。保存世界恢复保留国家与省份身份、城市和专名，旧错误父国由真实控制联系纠正。合同与限制见[机构区划与连续河道](docs/institutional-boundaries-and-river-courses-dev21.md)，共边绘制见[dev20 制图修复](docs/administrative-drawing-dev20.md)。沿用批量等高线、共享切片编码、道路空间索引和并行绘制；新河床合同重新提取等高线，不改写旧绑定。保留按需城市地图、多文化宫城、港区、蓄水湖与汇流。上一稳定版本是 [1.3.0](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.3.0)。
+当前版本 **1.4.0.dev23** 为开发预发布。国省区划保留自然控制单元、机构实力、时代响应时间和真实交通联系形成的结果，绘制读取权威省份归属，国界由省份父国合并；删除末尾等权首府竞速覆盖。河道由连续地形横断面低谷和受河网间距限制的曲率求解，河床、细地形、桥梁与生态用水共用一份结果，不添加装饰波浪。保存世界恢复保留国家与省份身份、城市和专名，旧错误父国由真实控制联系纠正。合同与限制见[机构区划与连续河道](docs/institutional-boundaries-and-river-courses-dev21.md)，共边绘制见[dev20 制图修复](docs/administrative-drawing-dev20.md)。沿用批量等高线、共享切片编码、道路空间索引和并行绘制；新河床合同重新提取等高线，不改写旧绑定。保留按需城市地图、多文化宫城、港区、蓄水湖与汇流。上一稳定版本是 [1.3.0](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.3.0)。
 
 dev22 还修复大陆构造只尝试四个运动时长后停止的问题：一次计算板块运动历史，由引擎内部确定性地求解真实大陆数量和面积约束，原生地貌层继续使用同一认证条件。配方和种子不由助手换抽，最终连通验收保留。见[确定性大陆构造](docs/continental-construction-dev22.md)。
+
+dev23 修复 D8 对角河段跨海连接薄小陆点时的河岸接近失败，源河段与实际课程共用首个真实岸线零点；原生物理数组保持不变。见[连续河口](docs/river-mouths-dev23.md)。
 
 ![v38 引擎实际生成的地形底图](docs/images/v38-terrain.png)
 
 ## 下载与开始
 
-- [下载 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev22/generate-world-atlas-skill.zip)：内含问卷、规则、下载与安装脚本。
-- [下载计算 wheel](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev22/world_atlas_engine-1.4.0.dev22-py3-none-any.whl)：供 Python/CLI 直接调用。
-- [下载独立源码包](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev22/world-atlas-engine-1.4.0.dev22-source.zip)。
-- [全部附件与 SHA-256 清单](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.4.0.dev22)。
+- [下载 skill ZIP](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev23/generate-world-atlas-skill.zip)：内含问卷、规则、下载与安装脚本。
+- [下载计算 wheel](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev23/world_atlas_engine-1.4.0.dev23-py3-none-any.whl)：供 Python/CLI 直接调用。
+- [下载独立源码包](https://github.com/yuuranku/world-atlas-engine/releases/download/v1.4.0.dev23/world-atlas-engine-1.4.0.dev23-source.zip)。
+- [全部附件与 SHA-256 清单](https://github.com/yuuranku/world-atlas-engine/releases/tag/v1.4.0.dev23)。
 
 ### 使用 skill
 
@@ -32,7 +34,7 @@ python scripts/install_engine.py --target ./atlas-runtime
 
 安装器仅创建本地虚拟环境和 renderer，不修改系统 Python/npm。输出 `atlas-runtime/runtime.json`，包含可直接调用的 Python 与 Mapshaper 绝对路径。已有合格环境直接沿用；环境改变时才运行 `doctor`，不要对同一个目录重复安装。
 
-包按固定 tag + SHA-256 下载，不追踪 `latest`。成功下载缓存在 `.world-atlas-downloads/1.4.0.dev22`；使用前再次校验。网络中断、文件截断或哈希不符会停止，未经验证的 wheel 不会安装。缓存需支持硬链接的本地文件系统（已测 NTFS）。已安装成功的环境可离线计算；缓存 wheel 不等于缓存了全部第三方依赖。
+包按固定 tag + SHA-256 下载，不追踪 `latest`。成功下载缓存在 `.world-atlas-downloads/1.4.0.dev23`；使用前再次校验。网络中断、文件截断或哈希不符会停止，未经验证的 wheel 不会安装。缓存需支持硬链接的本地文件系统（已测 NTFS）。已安装成功的环境可离线计算；缓存 wheel 不等于缓存了全部第三方依赖。
 
 ### 直接使用计算包
 
