@@ -4186,7 +4186,8 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
     # A channel's banks use native ground widths. Minimum overview ink is a
     # separate centreline, never a replacement for the river's actual surface.
     logger.info("Extracting the physical river network")
-    river_source_paths = _river_paths(grid, coast_paths, raw_elevation_m=physical_source.relative_elevation_m)
+    with measure_stage(output_dir, "river-network"):
+        river_source_paths = _river_paths(grid, coast_paths, raw_elevation_m=physical_source.relative_elevation_m)
     river_seasonal_strengths = _river_seasonal_strengths(grid, river_source_paths)
     river_orders = []
     for path in river_source_paths:
@@ -4200,7 +4201,8 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
         }
         for index, strengths in enumerate(river_seasonal_strengths)
     ]
-    river_paths = terrain_channel_paths(grid, river_source_paths, terrain_field=terrain_field)
+    with measure_stage(output_dir, "river-centrelines"):
+        river_paths = terrain_channel_paths(grid, river_source_paths, terrain_field=terrain_field)
     wind_overlay, wind_arrow_counts = _wind_arrow_groups(grid)
     graticule_paths, graticule_major_flags, graticule_labels = _graticule_paths(grid)
     elevation_palette, _ = _elevation_palette_for(grid)
@@ -4374,11 +4376,12 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
     political_zones = _political_zones(society)
     province_zones = _province_zones(society)
     from .society.administrations import administrative_source, administrative_paint_coverage
-    administrative_front = administrative_source(grid, thematic, society)
-    administrative_faces, province_face_ids = administrative_paint_coverage(
-        administrative_front, land_mask)
-    administrative_visible_faces, administrative_visible_ids = clip_partition_to_surface(
-        administrative_faces, province_face_ids, land_surface)
+    with measure_stage(output_dir, "administrative-geometry"):
+        administrative_front = administrative_source(grid, thematic, society)
+        administrative_faces, province_face_ids = administrative_paint_coverage(
+            administrative_front, land_mask)
+        administrative_visible_faces, administrative_visible_ids = clip_partition_to_surface(
+            administrative_faces, province_face_ids, land_surface)
     administrative_partition = CoastalPartition(administrative_faces, province_face_ids,
         administrative_visible_faces, administrative_visible_ids)
     administrative_faces, province_face_ids = administrative_partition.faces, administrative_partition.labels

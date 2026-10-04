@@ -145,6 +145,65 @@ def _terrain_channel(grid, samples, limits, *, terrain_field):
     return samples
 
 
+def _rounded_channel(grid, samples, limits, *, terrain_field):
+    """Round supported elbows inside the solved network's remaining clearance.
+
+    A corner's quadratic replaces only the inner 45 percent of its two
+    adjacent chords. Confluences and mouths remain unchanged. Each candidate
+    stays within the original corridor and on positive native land, never
+    above the corresponding old ground or with an additional uphill step.
+    Unsupported elbows retain their terrain-owned channel.
+    """
+    if len(samples) < 3:
+        return samples
+    vectors = np.diff(samples, axis=0)
+    lengths = np.linalg.norm(vectors, axis=1)
+    directions = vectors / lengths[:, None]
+    turn = np.linalg.norm(directions[1:] - directions[:-1], axis=1)
+    # A quadratic differs from the same-parametrized source elbow by at
+    # most cut * turn / 4. The cut consumes <45% of either source chord, so
+    # its interpolated clearance retains at least 55% of the corner limit.
+    cuts = np.minimum(.45 * np.minimum(lengths[:-1], lengths[1:]),
+                      np.divide(2.2 * limits[1:-1], turn,
+                                out=np.zeros_like(turn), where=turn > 1e-8))
+    selected = np.flatnonzero((cuts > 1e-6) & (turn < 2-1e-10))
+    if not len(selected):
+        return samples
+    corner = samples[selected+1]
+    first = corner - cuts[selected, None] * directions[selected]
+    last = corner + cuts[selected, None] * directions[selected+1]
+    t = np.linspace(0., 1., 9)[None, :, None]
+    candidate = ((1-t)**2 * first[:, None] + 2*(1-t)*t * corner[:, None]
+                 + t*t * last[:, None])
+    reference = np.where(t <= .5, first[:, None] + 2*t*(corner-first)[:, None],
+                         corner[:, None] + (2*t-1)*(last-corner)[:, None])
+    height, width = grid.shape
+    inside = ((candidate[:, :, 0] >= 0) & (candidate[:, :, 0] < width)
+              & (candidate[:, :, 1] >= 0) & (candidate[:, :, 1] < height))
+    columns = np.clip(np.floor(candidate[:, :, 0]).astype(int), 0, width-1)
+    rows = np.clip(np.floor(candidate[:, :, 1]).astype(int), 0, height-1)
+    supported = np.all(inside & (grid.water[rows, columns] == 0), axis=1)
+    valid = np.flatnonzero(supported)
+    if not len(valid):
+        return samples
+    ground = terrain_field.sample_points(candidate[valid, :, 0], candidate[valid, :, 1])
+    previous = terrain_field.sample_points(reference[valid, :, 0], reference[valid, :, 1])
+    difference, previous_difference = np.diff(ground, axis=1), np.diff(previous, axis=1)
+    grade_agrees = np.where(previous_difference > 1e-9, difference >= -1e-9,
+                           np.where(previous_difference < -1e-9, difference <= 1e-9,
+                                    np.abs(difference) <= 1e-9))
+    accepted = ((ground > 0).all(axis=1)
+                & (ground <= previous+1e-9).all(axis=1)
+                & grade_agrees.all(axis=1))
+    rounded = {int(selected[index]+1): candidate[index]
+               for index in valid[accepted]}
+    if not rounded:
+        return samples
+    return np.vstack([samples[:1],
+                      *[rounded.get(index, samples[index:index+1])
+                        for index in range(1, len(samples)-1)], samples[-1:]])
+
+
 def terrain_channel_paths(grid, paths, *, terrain_field):
     """Solve terrain sections inside one topology-preserving river network.
 
@@ -153,11 +212,20 @@ def terrain_channel_paths(grid, paths, *, terrain_field):
     intersections retain their native connectivity; distant valley bottoms
     can move within their source clearance. Flat and concave ground retain
     the original centre. Endpoints, native land and true positive ground
-    remain mandatory, with no independent-reach reconstruction path.
+    remain mandatory. Supported elbows are rounded using the same field and
+    network clearance before that centreline owns channels and crossings.
     """
     if terrain_field.native_m.shape != grid.shape:
         raise ValueError("river reconstruction requires aligned physical ground")
     stations = [_source_stations(grid, points) for points in paths]
     limits = _network_corridor_limits(stations)
-    return [_terrain_channel(grid, samples, allowed, terrain_field=terrain_field)
-            for (samples, _ids, _segments), allowed in zip(stations, limits, strict=True)]
+    solved = [_terrain_channel(grid, samples, allowed, terrain_field=terrain_field)
+              for (samples, _ids, _segments), allowed in zip(stations, limits, strict=True)]
+    # The transverse solve already consumed part of the source clearance.
+    # Recompute on its actual chords before permitting any elbow movement.
+    solved_stations = [(points, np.arange(max(0, len(points)-1), dtype=np.int32),
+                        np.stack((points[:-1], points[1:]), axis=1))
+                       for points in solved]
+    clearance = _network_corridor_limits(solved_stations)
+    return [_rounded_channel(grid, points, allowed, terrain_field=terrain_field)
+            for points, allowed in zip(solved, clearance, strict=True)]

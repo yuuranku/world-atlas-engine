@@ -12,6 +12,13 @@ from .administrative_front import AdministrativeFront
 from .territorial_simulation import _NEIGHBORS
 
 
+_SUBDIVISIONS = 4
+
+
+def _bilinear_weights(x, y):
+    return np.stack(((1-x)*(1-y), x*(1-y), x*y, (1-x)*y), axis=-1)
+
+
 def _local_fields(front, identifiers, row_indices, column_indices):
     """Extend a missing competitor only by an evidenced neighbouring edge.
 
@@ -94,11 +101,32 @@ def _cell_samples(front, west, north, east, south):
     corner_columns=np.stack((column,column+1,column+1,column),axis=1)
     corners=np.stack((x[corner_columns],y[corner_rows]),axis=2)
     corner_values=values[:,corner_rows,corner_columns].transpose(1,0,2)
+    # Normalize before interpolation so an exact equal-time sample uses the
+    # same scores for mixed-cell selection and triangle clipping. Converting
+    # two nearly tied interpolated margins separately can reverse their last
+    # binary64 bit and drop a complete boundary lying on a subdivision edge.
+    corner_scores=1-corner_values/(front.absent_time+1)
+    # Only competitive native cells need a subcell front. A bilinear field
+    # retains every measured corner potential without the long horizontal
+    # and vertical plateaux invented by a single mean-centre triangle fan.
+    fraction=np.linspace(0.,1.,_SUBDIVISIONS+1)
+    sy,sx=np.meshgrid(fraction,fraction,indexing='ij')
+    weights=_bilinear_weights(sx.ravel(),sy.ravel())
+    sampled_points=np.einsum('nqd,pq->npd',corners,weights)
+    sampled_scores=np.einsum('nkq,pq->nkp',corner_scores,weights)
+    rr,cc=np.indices((_SUBDIVISIONS,_SUBDIVISIONS))
+    first=(rr*(_SUBDIVISIONS+1)+cc).ravel()
+    quad=np.stack((first,first+1,first+_SUBDIVISIONS+2,first+_SUBDIVISIONS+1),axis=1)
+    corners=sampled_points[:,quad].reshape(-1,4,2)
+    corner_scores=sampled_scores[:,:,quad].transpose(0,2,1,3).reshape(-1,len(identifiers),4)
+    winners=np.argmax(corner_scores,axis=1)
+    mixed=np.any(winners!=winners[:,:1],axis=1)
+    corners=corners[mixed];corner_scores=corner_scores[mixed]
     points=np.concatenate((corners,corners.mean(axis=1)[:,None]),axis=1)
     # A common positive affine rescaling preserves the exact lower envelope;
     # dimensionless unit scores avoid cancellation of large travel times in
     # the generic shared-envelope clipping primitive.
-    scores=1-np.concatenate((corner_values,corner_values.mean(axis=2)[:,:,None]),axis=2)/(front.absent_time+1)
+    scores=np.concatenate((corner_scores,corner_scores.mean(axis=2)[:,:,None]),axis=2)
     fan=np.array(((0,1,4),(1,2,4),(2,3,4),(3,0,4)))
     segments=_triangle_boundaries(points[:,fan].reshape(-1,3,2),
                   scores[:,:,fan].transpose(0,2,1,3).reshape(-1,len(identifiers),3))
@@ -119,13 +147,21 @@ def _face_owner(front, face):
     hc=np.arange(cols.min()-1,cols.max()+2)%width
     ids=np.unique(np.r_[0,front.owners[:,hr[:,None],hc].ravel()])
     ids=ids[ids>=0]
-    values=_local_fields(front,ids,rows,cols)[:,(0,0,1,1),(0,1,1,0)]
+    values=1-_local_fields(front,ids,rows,cols)[:,(0,0,1,1),(0,1,1,0)]/(front.absent_time+1)
     sx=(point.x-west)/(east-west);sy=(point.y-north)/(south-north)
+    # Classify against the very same sampled triangle that authored this
+    # face, rather than the coarser native-cell fan.
+    ix=min(_SUBDIVISIONS-1,int(sx*_SUBDIVISIONS))
+    iy=min(_SUBDIVISIONS-1,int(sy*_SUBDIVISIONS))
+    x=np.array((ix,ix+1,ix+1,ix))/_SUBDIVISIONS
+    y=np.array((iy,iy,iy+1,iy+1))/_SUBDIVISIONS
+    values=values@_bilinear_weights(x,y).T
+    sx=sx*_SUBDIVISIONS-ix;sy=sy*_SUBDIVISIONS-iy
     distances=(sy,1-sx,1-sy,sx);edge=int(np.argmin(distances))
     first,last=((0,1),(1,2),(2,3),(3,0))[edge]
     centre_weight=2*distances[edge];along=(sx,sy,1-sx,1-sy)[edge]
     last_weight=along-centre_weight*.5;first_weight=1-centre_weight-last_weight
-    return int(ids[np.argmin(values[:,first]*first_weight+values[:,last]*last_weight+values.mean(axis=1)*centre_weight)])
+    return int(ids[np.argmax(values[:,first]*first_weight+values[:,last]*last_weight+values.mean(axis=1)*centre_weight)])
 
 
 def administrative_coverage(front: AdministrativeFront):

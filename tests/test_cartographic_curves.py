@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 from shapely import LineString, Point, box
 
-from world_atlas.core.cartographic_curves import terrain_channel_paths
+from world_atlas.core.cartographic_curves import _rounded_channel, terrain_channel_paths
 from world_atlas.core.continuous_terrain import PhysicalTerrainField
 from world_atlas.core.cartographic_rivers import river_channel_surface
 
@@ -34,15 +34,66 @@ def valley_fixture():
 
 
 class CartographicCurveTests(unittest.TestCase):
-    def test_flat_ground_preserves_straight_and_cornered_geometry_without_waves(self):
+    def test_flat_ground_preserves_straight_geometry_without_waves(self):
         grid, field = fixture()
-        paths = (np.array(((4.5, 30.5), (28.5, 30.5))),
-                 np.array(((4.5, 30.5), (20.5, 30.5), (20.5, 48.5))))
-        for path in paths:
-            curve = _curve(grid, path, terrain_field=field)
-            self.assertGreater(len(curve), len(path))
-            self.assertTrue(LineString(curve).equals(LineString(path)))
-            np.testing.assert_array_equal(curve[[0, -1]], path[[0, -1]])
+        path = np.array(((4.5, 30.5), (28.5, 30.5)))
+        curve = _curve(grid, path, terrain_field=field)
+        self.assertGreater(len(curve), len(path))
+        self.assertTrue(LineString(curve).equals(LineString(path)))
+        np.testing.assert_array_equal(curve[[0, -1]], path[[0, -1]])
+
+    def test_supported_native_elbows_round_without_moving_endpoints_or_leaving_corridor(self):
+        grid, field = fixture()
+        for endpoint in ((20.5, 48.5), (12.5, 38.5)):
+            with self.subTest(endpoint=endpoint):
+                path = np.array(((4.5, 30.5), (20.5, 30.5), endpoint))
+                curve = _curve(grid, path, terrain_field=field)
+                self.assertFalse(LineString(curve).equals(LineString(path)))
+                self.assertLess(max(Point(point).distance(LineString(path)) for point in curve), .25)
+                self.assertTrue(LineString(curve).is_simple)
+                np.testing.assert_array_equal(curve[[0, -1]], path[[0, -1]])
+                vectors = np.diff(curve, axis=0)
+                turn = np.abs(np.arctan2(vectors[:-1, 0]*vectors[1:, 1]-vectors[:-1, 1]*vectors[1:, 0],
+                                        np.einsum('ij,ij->i', vectors[:-1], vectors[1:])))
+                self.assertLess(float(np.rad2deg(turn.max())), 40.)
+                reverse = _curve(grid, path[::-1], terrain_field=field)
+                np.testing.assert_allclose(curve, reverse[::-1], rtol=0., atol=1e-11)
+
+    def test_rounding_does_not_climb_an_actual_hill_or_add_an_uphill_step(self):
+        rows, columns = np.indices((64, 64), dtype=float)+.5
+        elbow = np.array(((29.5, 30.5), (30.5, 30.5), (30.5, 31.5)))
+        for direction in (1., -1.):
+            with self.subTest(direction=direction):
+                ground = 100 + direction*10*np.maximum(0., 30.5-columns)*np.maximum(0., rows-30.5)
+                grid, field = fixture(ground)
+                # A hill leaves the original river floor; a dip then rises
+                # again and would add an uphill leg to this level reach.
+                self.assertNotEqual(float(field.sample_points(30.4, 30.6)), 100.)
+                curve = _rounded_channel(grid, elbow, np.array((0., .25, 0.)), terrain_field=field)
+                np.testing.assert_array_equal(curve, elbow)
+
+    def test_rounding_preserves_confluence_embedding_and_fractional_mouth(self):
+        grid, field = fixture()
+        junction = np.array((18.5, 26.5))
+        paths = (np.array(((4.5, 30.5), (14.5, 30.5), (14.5, 26.5), junction)),
+                 np.array(((18.5, 14.5), junction)),
+                 np.array((junction, (28.5, 26.5), (28.5, 38.73))))
+        curves = terrain_channel_paths(grid, paths, terrain_field=field)
+        for source, curve in zip(paths, curves, strict=True):
+            np.testing.assert_array_equal(curve[[0, -1]], source[[0, -1]])
+        for first in range(len(curves)):
+            for second in range(first+1, len(curves)):
+                self.assertTrue(LineString(curves[first]).intersection(LineString(curves[second])).equals(Point(junction)))
+
+    def test_adjacent_elbows_remain_disjoint_in_the_shared_network(self):
+        grid, field = fixture()
+        paths = (np.array(((4.5, 30.5), (14.5, 30.5), (14.5, 40.5))),
+                 np.array(((4.5, 30.65), (14.35, 30.65), (14.35, 40.5))))
+        curves = terrain_channel_paths(grid, paths, terrain_field=field)
+        self.assertTrue(LineString(curves[0]).disjoint(LineString(curves[1])))
+        self.assertTrue(all(LineString(curve).is_simple for curve in curves))
+        for source, curve in zip(paths, curves, strict=True):
+            np.testing.assert_array_equal(curve[[0, -1]], source[[0, -1]])
 
     def test_convex_valley_follows_lower_accepted_ground_within_quarter_cell(self):
         grid, field = valley_fixture()

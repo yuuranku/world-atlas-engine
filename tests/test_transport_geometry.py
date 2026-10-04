@@ -110,6 +110,21 @@ class TransportGeometryTests(unittest.TestCase):
             self.assertTrue(shapely.LineString(path).covers(shapely.LineString(deck)))
         np.testing.assert_array_equal(path[[0,-1]],points[[0,-1]])
 
+    def test_bank_repair_retains_terrain_selected_dry_turns_before_and_after_bridge(self):
+        channel=shapely.box(4.9,0.,5.1,10.)
+        points=np.asarray(((1.,1.),(1.,4.),(5.,4.),(8.,4.),(8.,7.)))
+        source=shapely.LineString(points)
+        crossing=source.project(shapely.Point(5.,4.))
+        deck=((4.9,4.),(5.,4.),(5.1,4.))
+        path=_bank_route(points,channel,((crossing,deck),),shapely.box(0.,0.,10.,10.))
+        self.assertIn((1.,4.),tuple(map(tuple,path)))
+        self.assertIn((8.,4.),tuple(map(tuple,path)))
+        line=shapely.LineString(path)
+        self.assertTrue(line.covers(shapely.LineString(deck)))
+        water=line.intersection(channel).difference(channel.boundary)
+        self.assertAlmostEqual(water.length,.2)
+        np.testing.assert_array_equal(path[[0,-1]],points[[0,-1]])
+
     def test_navigability_is_a_single_physical_reach_attribute_with_all_routes_retained(self):
         water = np.zeros((8, 16), dtype=np.uint8)
         order = np.zeros_like(water)
@@ -226,6 +241,22 @@ class TransportGeometryTests(unittest.TestCase):
         self.assertGreater(len(curve),len(points))
         self.assertTrue(shapely.LineString(curve).disjoint(land))
         np.testing.assert_array_equal(curve[[0,-1]],points[[0,-1]])
+
+    def test_long_road_bend_rounds_within_its_accepted_corridor(self):
+        points=np.asarray(((2.,10.),(12.,10.),(22.,15.)))
+        land=shapely.box(0.,0.,32.,32.)
+        curve=_curved_transport_points(points,"road",land,shapely.GeometryCollection())
+        # Long shallow bends can use a broader tangent instead of a fixed
+        # sub-cell corner radius, while retaining the terrain-selected lane.
+        self.assertGreater(np.linalg.norm(curve[1]-points[1]),.45)
+        self.assertTrue(shapely.LineString(points).buffer(.35).covers(shapely.LineString(curve)))
+        np.testing.assert_array_equal(curve[[0,-1]],points[[0,-1]])
+
+    def test_road_rounding_still_requires_the_grade_profile_to_be_accepted(self):
+        points=np.asarray(((2.,10.),(12.,10.),(22.,15.)))
+        curve=_curved_transport_points(points,"road",shapely.box(0.,0.,32.,32.),
+            shapely.GeometryCollection(),grade_check=lambda original,proposed:False)
+        np.testing.assert_array_equal(curve,points)
 
     def test_road_cannot_straighten_across_a_valley_or_a_lake(self):
         land = shapely.box(0, 0, 64, 32).difference(shapely.box(9, 5, 13, 15))

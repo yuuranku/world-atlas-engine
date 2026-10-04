@@ -20,7 +20,7 @@ from .politics import _state_transition_penalties
 from .population import population_density, cell_areas_km2
 from .territorial_simulation import TerritorySeed, TerritorySimulation, bridge_transition_discounts
 from .transport import road_network_fields
-from .provinces import derive_provinces
+from .provinces import derive_provinces, _province_transition_penalties
 from .administrative_front import AdministrativeFront
 
 
@@ -68,8 +68,9 @@ def _travel_simulation(grid, thematic, society, *, domains=None, valid=None):
         - .08 * (grid.river_order > 0)
         - .22 * density / max(float(density.max(initial=0.)), 1e-15)
         - .68 * np.clip(society.transport.accessibility, 0., 1.)).astype(np.float32)
-    transitions = _state_transition_penalties(elevation, grid.river_order,
-        society.cultures.language_id, roads, land_mask=land)
+    transitions = (_state_transition_penalties(elevation, grid.river_order,
+        society.cultures.language_id, roads, land_mask=land) if domains is None
+        else _province_transition_penalties(grid, roads))
     return TerritorySimulation(valid, friction, transitions, roads, bridges, owner_constraint=domains)
 
 
@@ -103,15 +104,21 @@ def derive_administrations(grid, thematic, society):
     seeds = tuple(replace(seed,domain=int(states[seed.row,seed.column]))
         for seed in _core_seeds(provinces.provinces,society))
     province_front = administrative_front(_travel_simulation(grid,thematic,society,domains=states),seeds,maritime_links=_maritime_links(grid,society))
-    land = np.asarray(grid.water) == 0
-    provinces = np.where(land, np.maximum(province_front.owner, 0), -1).astype(np.int32)
-    if np.any((society.politics.state_id > 0) & (provinces <= 0)):
-        raise ValueError('governed component has no evidenced administrative source')
     parent = np.zeros(len(society.provinces.provinces)+1, dtype=np.int16)
     for record in society.provinces.provinces:
         parent[record.identifier] = record.state_identifier
-    states = np.where(land, parent[np.maximum(provinces, 0)], -1).astype(np.int16)
     front = AdministrativeHierarchy(countries,province_front,parent)
+    return _apply_administrative_ownership(grid, society, front), front
+
+
+def _apply_administrative_ownership(grid, society, front):
+    """Keep native truth and demographic records on the same source front."""
+    land = np.asarray(grid.water) == 0
+    provinces = np.where(land, np.maximum(front.provinces.owner, 0), -1).astype(np.int32)
+    if np.any((society.politics.state_id > 0) & (provinces <= 0)):
+        raise ValueError('governed component has no evidenced administrative source')
+    parent = front.province_to_state
+    states = np.where(land, parent[np.maximum(provinces, 0)], -1).astype(np.int16)
     weights = society.population.population_weight
     state_weight = np.bincount(np.maximum(states, 0).ravel(),
         weights=weights.ravel(), minlength=len(society.politics.states)+1)
@@ -136,7 +143,24 @@ def derive_administrations(grid, thematic, society):
             frontier=land & (states <= 0), states=tuple(state_records)),
         provinces=replace(society.provinces, province_id=provinces,
             provinces=tuple(province_records)))
-    return updated, front
+    return updated
+
+
+def refresh_saved_administrations(grid, thematic, society):
+    """Recompute provincial reach with existing seats and parent countries.
+
+    Terrain, population, transport, country and province identities, and all
+    institutional seats are reused. Native ownership and demographic records
+    are updated together if the shared geographic travel fields change.
+    """
+    front = administrative_source(grid, thematic, society)
+    updated = _apply_administrative_ownership(grid, society, front)
+    report = dict(method='existing-seats-provincial-terrain-and-transport-arrivals',
+        stateCellsChanged=int(np.count_nonzero(updated.politics.state_id != society.politics.state_id)),
+        provinceCellsChanged=int(np.count_nonzero(updated.provinces.province_id != society.provinces.province_id)),
+        countries=len(updated.politics.states), provinces=len(updated.provinces.provinces),
+        identitiesUnchanged=True, physicalFieldsUnchanged=True, populationWeightsUnchanged=True)
+    return updated, front, report
 
 
 def administrative_paint_coverage(front, land):

@@ -8,6 +8,36 @@ from tests.test_administrative_front import simulation
 
 
 class AdministrativeCoverageTests(unittest.TestCase):
+    def test_equal_arrivals_on_subdivision_edge_keep_a_complete_shared_border(self):
+        # These fractional margins exercise normalization around a binary64
+        # tie. A whole shared arc must survive when its zero lies on a sample.
+        owners=np.array([[[2,2],[1,1]],[[1,1],[2,2]]])
+        times=np.array([[[0.,0.],[0.,0.]],[[32.24516546,32.24516546],[32.24516546,32.24516546]]])
+        front=AdministrativeFront(owners,times,np.ones((8,2,2)),np.ones((2,2),bool),792.0550028899625,None,{1:0,2:0})
+        faces,labels=administrative_coverage(front)
+        first=shapely.union_all([face for face,label in zip(faces,labels) if label==1])
+        second=shapely.union_all([face for face,label in zip(faces,labels) if label==2])
+        shared=first.boundary.intersection(second.boundary)
+        self.assertEqual(shared.bounds,(0.,1.,2.,1.))
+        self.assertAlmostEqual(shared.length,2.)
+        self.assertTrue(shapely.coverage_is_valid(faces))
+
+    def test_bending_arrival_front_tracks_bilinear_zero_curve_without_grid_plateaux(self):
+        owners=np.array([[[1,2],[1,2]],[[2,1],[2,1]]])
+        times=np.array([[[0.,0.],[0.,0.]],[[1.,1.],[7.,1.]]])
+        front=AdministrativeFront(owners,times,np.ones((8,2,2)),np.ones((2,2),bool),20.,None,{1:0,2:0})
+        faces,labels=administrative_coverage(front)
+        first=shapely.union_all([face for face,label in zip(faces,labels) if label==1])
+        second=shapely.union_all([face for face,label in zip(faces,labels) if label==2])
+        shared=first.boundary.intersection(second.boundary)
+        # The measured left margin changes from 1 to 7; the right stays 1.
+        # Its continuous equal-time crossing is a curve, not two fan chords.
+        for y in np.linspace(.51,1.49,99):
+            crossing=shared.intersection(shapely.LineString(((.5,y),(1.5,y))))
+            exact=.5+(1+6*(y-.5))/(2+6*(y-.5))
+            self.assertLess(abs(crossing.x-exact),.01)
+        self.assertTrue(shapely.coverage_is_valid(faces))
+
     def test_real_arrival_difference_moves_shared_front_off_midpoint(self):
         owners=np.array([[[1,2],[1,2]],[[2,1],[2,1]]])
         times=np.array([[[2.,1.],[2.,1.]],[[4.,5.],[4.,5.]]])

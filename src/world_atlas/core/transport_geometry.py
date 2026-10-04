@@ -382,16 +382,21 @@ def _curved_transport_points(points, mode, land_geometry, river_geometry, *, gra
             # straight to the next one and cuts through the water obstacle.
             result.append(corner)
             continue
-        radius = min(1.5 if mode == "sea" else .45, before*.35, after*.35)
+        radius = min(before*.35, after*.35)
+        if mode == "sea":
+            radius = min(1.5, radius)
+        source_corner = (shapely.LineString(values[index-1:index+2]).buffer(.35)
+                         if mode != "sea" else None)
         for _attempt in range(8):
             entry, exit_point = corner+incoming/before*radius, corner+outgoing/after*radius
             triangle = shapely.Polygon((entry, corner, exit_point))
+            fraction = np.linspace(0., 1., 9)[1:, None]
+            curve = np.vstack((entry,(1-fraction)**2*entry + 2*(1-fraction)*fraction*corner + fraction**2*exit_point))
             safe = (not shapely.intersects(land_geometry, triangle) if mode == "sea"
                     else shapely.covers(land_geometry, triangle)
-                    and not shapely.intersects(river_geometry, triangle))
+                    and not shapely.intersects(river_geometry, triangle)
+                    and shapely.covers(source_corner, shapely.LineString(curve)))
             if safe:
-                fraction = np.linspace(0., 1., 9)[1:, None]
-                curve = np.vstack((entry,(1-fraction)**2*entry + 2*(1-fraction)*fraction*corner + fraction**2*exit_point))
                 if grade_check is None or grade_check(np.vstack((entry,corner,exit_point)),curve):
                     result.extend(curve)
                     break
@@ -520,10 +525,14 @@ def _bank_route(points, channel_geometry, passages, corridor):
         else:
             deck.insert(0,bank_port(deck[0],deck[-1]))
         actual_passages.append((station,deck))
+    stations=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(points,axis=0),axis=1))]
     result=[tuple(points[0])]
-    def navigate(last):
+    previous_station=0.
+    def navigate(last,station):
+        nonlocal previous_station
         first=result[-1]
         if first==tuple(last):
+            previous_station=station
             return
         candidates=[polygon for polygon in polygons if polygon.covers(shapely.MultiPoint((first,last)))]
         if not candidates:
@@ -532,11 +541,20 @@ def _bank_route(points, channel_geometry, passages, corridor):
         key = id(polygon)
         if key not in navigators:
             navigators[key] = PolygonNavigator(polygon)
-        result.extend(map(tuple,navigators[key].path(first,last)[1:]))
-    for _station,deck in sorted(actual_passages,key=lambda entry:entry[0]):
-        navigate(deck[0])
+        # Riverbank repair must not replace the terrain router's dry valley
+        # turns with one city-to-bridge shortest chord. Preserve accepted dry
+        # stations on this bank and navigate only the gaps around real water.
+        interior=points[(stations>previous_station)&(stations<station)]
+        dry=interior[shapely.covers(polygon,shapely.points(interior))]
+        for target in (*dry,last):
+            if tuple(target)==result[-1]:
+                continue
+            result.extend(map(tuple,navigators[key].path(result[-1],target)[1:]))
+        previous_station=station
+    for station,deck in sorted(actual_passages,key=lambda entry:entry[0]):
+        navigate(deck[0],station)
         result.extend(tuple(point)for point in deck[1:]if tuple(point)!=result[-1])
-    navigate(points[-1])
+    navigate(points[-1],source.length)
     return np.asarray(result)
 
 
