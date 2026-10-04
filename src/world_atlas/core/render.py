@@ -272,7 +272,7 @@ _MAX_HTML_BYTES = 16 * 1024 * 1024
 # single thematic overlay above 4 MiB. These remain bounded safeguards, but
 # fit the accepted high-detail 3-continent world without rasterizing it.
 _MAX_THEMATIC_SVG_BYTES = 10 * 1024 * 1024
-_MAX_THEMATIC_SVG_TOTAL_BYTES = 48 * 1024 * 1024
+_MAX_THEMATIC_SVG_TOTAL_BYTES = 64 * 1024 * 1024
 _MAX_EXPORT_SVG_BYTES = 64 * 1024 * 1024
 
 
@@ -1237,10 +1237,9 @@ def _administrative_boundary_paths(
     )
 
 
-def _administrative_overview_features(features, faces, province_ids, province_to_state,
-                                      *, frame_shape):
-    """Derive both administrative maps and all their ink from one summary."""
-    summary = overview_coverage(faces, frame_shape=frame_shape)
+def _administrative_overview_features(features, faces, province_ids, province_to_state):
+    """Use the same prepared administrative curves at every viewing scale."""
+    summary = shared_display_coverage(faces)
     province_ids = np.asarray(province_ids, dtype=np.int32)
     state_ids = np.asarray(province_to_state, dtype=np.int32)[province_ids]
     regions = {
@@ -1272,6 +1271,35 @@ def _administrative_overview_features(features, faces, province_ids, province_to
             seen.add(key)
             result.append(replace(feature, geometry=geometry))
     return result
+
+
+def _administrative_theme_features(political_paths, province_paths,
+                                   political_zones, province_zones):
+    """Package the common administrative fill for full and selective renders."""
+    features = []
+    for theme, paths, zones, opacity, attribute in (
+        ("political", political_paths, political_zones, .91, "state"),
+        ("provinces", province_paths, province_zones, .89, "province"),
+    ):
+        for identifier, ((label, color), regions) in enumerate(zip(zones, paths, strict=True)):
+            features.extend(filled_features(regions, "theme-fill", color, section="theme",
+                theme=theme, opacity=opacity, clip="land",
+                attributes={f"data-{attribute}": str(identifier), "aria-label": label}))
+    return features
+
+
+def _administrative_ink_features(state_paths, province_paths):
+    """Package both hierarchy levels once, with consistent screen styling."""
+    features = []
+    for layer, paths, color, width, opacity, dash in (
+        ("state-boundaries", state_paths, "#f4eee1", 2.80, .44, "7 3 1.3 3"),
+        ("state-boundaries", state_paths, "#46413b", 1.40, .88, "7 3 1.3 3"),
+        ("province-boundaries", province_paths, "#685f54", .95, .72, "4 2 1 2"),
+    ):
+        features.extend(line_features(paths, layer, color, width, opacity=opacity,
+            dash=dash, clip="land", attributes={"data-screen-stroke": str(width),
+                                                "data-screen-dash": dash}))
+    return features
 
 
 def _elevation_thresholds(grid: WorldGrid) -> list[float]:
@@ -4376,10 +4404,13 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
     political_zones = _political_zones(society)
     province_zones = _province_zones(society)
     from .society.administrations import administrative_source, administrative_paint_coverage
+    from .society.administrative_display import administrative_display_coverage
     with measure_stage(output_dir, "administrative-geometry"):
         administrative_front = administrative_source(grid, thematic, society)
         administrative_faces, province_face_ids = administrative_paint_coverage(
             administrative_front, land_mask)
+        administrative_faces = administrative_display_coverage(
+            administrative_faces, frame_shape=grid.shape)
         administrative_visible_faces, administrative_visible_ids = clip_partition_to_surface(
             administrative_faces, province_face_ids, land_surface)
     administrative_partition = CoastalPartition(administrative_faces, province_face_ids,
@@ -4822,13 +4853,13 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
         ("civilizations", civilization_zone_paths, civilization_zones, .68, "civilization"),
         ("languages", language_zone_paths, language_zones, .64, "language"),
         ("religions", religion_zone_paths, religion_zones, .66, "religion"),
-        ("political", political_zone_paths, political_zones, .91, "state"),
-        ("provinces", province_zone_paths, province_zones, .89, "province"),
     ):
         for identifier, ((label, color), faces) in enumerate(zip(zones, paths, strict=True)):
             tile_features.extend(filled_features(faces, "theme-fill", color, section="theme", theme=theme,
                                  opacity=opacity, clip="land", attributes={f"data-{attribute}": str(identifier),
                                                                           "aria-label": label}))
+    tile_features.extend(_administrative_theme_features(political_zone_paths,
+        province_zone_paths, political_zones, province_zones))
     landform_inventory = derive_landform_inventory(grid, thematic,
         raw_elevation_m=physical_source.relative_elevation_m)
     landform_tile_features = landform_features(grid, landform_inventory)
@@ -4855,13 +4886,12 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
         ("language-boundaries", language_boundary_paths, "#625f59", .95, .82, None),
         ("language-civilization-boundaries", civilization_boundary_paths, "#f8f3e8", .95, .92, None),
         ("religion-boundaries", religion_boundary_paths, "#6f5550", .95, .78, "3.2 2.3"),
-        ("state-boundaries", state_boundary_paths, "#f4eee1", 2.80, .44, "7 3 1.3 3"),
-        ("state-boundaries", state_boundary_paths, "#46413b", 1.40, .88, "7 3 1.3 3"),
-        ("province-boundaries", province_boundary_paths, "#685f54", .95, .72, "4 2 1 2"),
     ):
         tile_features.extend(line_features(paths, layer, color, stroke_width, opacity=opacity, dash=dash, clip="land",
                              attributes={"data-screen-stroke": str(stroke_width),
                                          **({"data-screen-dash": dash} if dash else {})}))
+    tile_features.extend(_administrative_ink_features(state_boundary_paths,
+                                                      province_boundary_paths))
     tile_features.extend(transport_tile_features)
     tile_features.extend(nominal_features)
     tile_levels = []
@@ -4882,8 +4912,7 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
         tile_levels.append(TileLevel(level_id, minimum_scale, level_land, features))
     overview_land = tile_levels[0].land_surface
     overview_features = _administrative_overview_features(
-        tile_features, administrative_faces, province_face_ids, province_to_state,
-        frame_shape=grid.shape)
+        tile_features, administrative_faces, province_face_ids, province_to_state)
     overview_surface = overview_markup(overview_features, overview_land, grid.shape[1], grid.shape[0], section="surface")
     overview_ink = overview_markup(overview_features, overview_land, grid.shape[1], grid.shape[0], section="ink")
     # Theme assets are paint records assembled under the physical overview's
@@ -4895,7 +4924,10 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
         document = _line_overlay_svg_document(grid, body, title=f"{theme} 全图轮廓")
         overview_bytes[theme] = len(document.encode("utf-8"))
         logger.info("Overview %s: %s bytes", theme, overview_bytes[theme])
-        if overview_bytes[theme] > _MAX_THEMATIC_SVG_BYTES:
+        # Administrative overviews now retain the full shared curves, just
+        # like their native vector exports. Other themes remain generalized.
+        byte_budget = _MAX_EXPORT_SVG_BYTES if theme in ("political", "provinces") else _MAX_THEMATIC_SVG_BYTES
+        if overview_bytes[theme] > byte_budget:
             oversized_overviews[theme] = overview_bytes[theme]
         (output_dir / f"overview-{theme}.svg").write_text(document, encoding="utf-8")
     if oversized_overviews:

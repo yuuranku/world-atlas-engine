@@ -50,8 +50,7 @@ class AdministrativeRenderingTests(unittest.TestCase):
         # A coast cutting through the shared border must clip both maps and
         # their ink at the same physical point.
         land = shapely.box(.2, .3, 3.8, 3.7)
-        summary = _administrative_overview_features(features, faces, labels, parents,
-            frame_shape=(4, 4))
+        summary = _administrative_overview_features(features, faces, labels, parents)
         states = {int(feature.attributes['data-state']): shapely.intersection(feature.geometry, land)
                   for feature in summary if feature.theme == 'political'}
         provinces = {int(feature.attributes['data-province']): shapely.intersection(feature.geometry, land)
@@ -66,6 +65,8 @@ class AdministrativeRenderingTests(unittest.TestCase):
             shapely.intersection(states[1].boundary, states[2].boundary)))
         self.assertTrue(shapely.equals(ink['province-boundaries'],
             shapely.intersection(provinces[1].boundary, provinces[2].boundary)))
+        self.assertTrue(shapely.equals(ink['state-boundaries'],
+            shapely.intersection(shapely.MultiLineString(state_paths), land)))
         self.assertEqual(shapely.intersection(ink['state-boundaries'], ink['province-boundaries']).length, 0)
         for row in range(4):
             for col in range(4):

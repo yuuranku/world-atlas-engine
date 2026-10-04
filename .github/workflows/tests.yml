@@ -17,3 +17,5 @@ jobs:
       - run: npm ci --ignore-scripts --no-audit --no-fund
         working-directory: runtime
       - run: python -m unittest discover -s tests -v
+        env:
+          WORLD_ATLAS_MAPSHAPER: ${{ github.workspace }}/runtime/node_modules/mapshaper/bin/mapshaper
