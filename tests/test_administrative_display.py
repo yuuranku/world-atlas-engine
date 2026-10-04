@@ -18,9 +18,12 @@ class AdministrativeDisplayTests(unittest.TestCase):
         self.assertEqual(len(source), len(result))
         self.assertTrue(np.all(shapely.is_valid(result)))
         self.assertTrue(shapely.coverage_is_valid(result))
-        self.assertTrue(shapely.coverage_union_all(source).equals(shapely.coverage_union_all(result)))
+        self.assertTrue(shapely.coverage_union_all(source[~shapely.is_empty(source)]).equals(
+            shapely.coverage_union_all(result[~shapely.is_empty(result)])))
         height, width = frame_shape
-        yy, xx = np.indices((height, width))
+        west, north, east, south = shapely.coverage_union_all(source[~shapely.is_empty(source)]).bounds
+        yy, xx = np.meshgrid(np.arange(max(0, int(np.floor(north))), min(height, int(np.ceil(south)))),
+                             np.arange(max(0, int(np.floor(west))), min(width, int(np.ceil(east)))), indexing='ij')
         centres = shapely.points(np.column_stack((xx.ravel()+.5, yy.ravel()+.5)))
         for before, after in zip(source, result, strict=True):
             np.testing.assert_array_equal(shapely.covers(before, centres), shapely.covers(after, centres))
@@ -97,6 +100,37 @@ class AdministrativeDisplayTests(unittest.TestCase):
         source = shared_display_coverage(source)
         result = administrative_display_coverage(source, frame_shape=front.valid.shape)
         self.assert_preserved(source, result, front.valid.shape)
+
+    def test_empty_face_records_keep_their_original_positions_and_types(self):
+        source = np.asarray((shapely.GeometryCollection(), shapely.box(0, 0, 3, 6),
+                             shapely.Polygon(), shapely.box(3, 0, 6, 6),
+                             shapely.GeometryCollection()), dtype=object)
+        result = administrative_display_coverage(source, frame_shape=(6, 6))
+        self.assert_preserved(source, result, (6, 6))
+        for index in (0, 2, 4):
+            self.assertEqual(result[index].geom_type, source[index].geom_type)
+            self.assertTrue(result[index].is_empty)
+
+    def test_microscopic_nonempty_enclaves_cannot_collapse(self):
+        for size in (1e-6, 1e-8):
+            with self.subTest(size=size):
+                enclave = shapely.box(2.08, 2.08, 2.08+size, 2.08+size)
+                source = np.asarray((shapely.box(0, 0, 6, 6).difference(enclave), enclave), dtype=object)
+                result = administrative_display_coverage(source, frame_shape=(6, 6))
+                self.assert_preserved(source, result, (6, 6))
+                self.assertGreater(result[1].area, 0)
+
+    def test_thin_long_and_world_coordinate_enclaves_survive(self):
+        examples = ((shapely.box(2.08, 2.08, 4.08, 2.08000001),
+                     shapely.box(0, 0, 6, 6), (6, 6)),
+                    (shapely.box(1120.08, 805.08, 1120.08000001, 805.08000001),
+                     shapely.box(1117, 803, 1123, 809), (1088, 2176)))
+        for enclave, frame, frame_shape in examples:
+            with self.subTest(enclave=enclave.bounds):
+                source = np.asarray((frame.difference(enclave), enclave), dtype=object)
+                result = administrative_display_coverage(source, frame_shape=frame_shape)
+                self.assert_preserved(source, result, frame_shape)
+                self.assertGreater(result[1].area, 0)
 
 
 if __name__ == '__main__':

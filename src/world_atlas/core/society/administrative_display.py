@@ -201,7 +201,12 @@ def _face_geometries(arcs, shapes):
             parts = [arcs[arc] if arc >= 0 else arcs[~arc][::-1] for arc in identifiers]
             ring = np.concatenate([points[:-1] for points in parts]+[parts[-1][-1:]])
             rings.append(shapely.LineString(ring))
-        result.append(shapely.build_area(shapely.MultiLineString(rings)))
+        geometry = shapely.build_area(shapely.MultiLineString(rings))
+        if geometry.is_empty:
+            geometry = shapely.Polygon()
+        elif geometry.geom_type not in {'Polygon', 'MultiPolygon'}:
+            raise ValueError('administrative arc rings must assemble polygonal faces')
+        result.append(geometry)
     return np.asarray(result, dtype=object)
 
 
@@ -216,11 +221,20 @@ def administrative_display_coverage(faces, *, frame_shape):
         return source
     if not bool(np.all(shapely.is_valid(source))) or not bool(shapely.coverage_is_valid(source)):
         raise ValueError('administrative display requires a valid shared source coverage')
-    original, smooth, shapes = _shared_arc_candidates(source)
+    active = ~shapely.is_empty(source)
+    if not np.any(active):
+        return source.copy()
+    painted = source[active]
+    if any(face.geom_type not in {'Polygon', 'MultiPolygon'} for face in painted):
+        raise ValueError('nonempty administrative source faces must be polygonal')
+    original, smooth, shapes = _shared_arc_candidates(painted)
     owners = _arc_owners(shapes, len(original))
     fields = []
     for before, after, neighbours in zip(original, smooth, owners, strict=True):
-        if len(neighbours) != 2 or len(before) <= 2:
+        closed = np.array_equal(before[0], before[-1])
+        unsupported_ring = closed and (shapely.LineString(before).length <= 2*_DISTANCE
+                                       or len(after) < 4 or shapely.Polygon(after).area == 0)
+        if len(neighbours) != 2 or len(before) <= 2 or unsupported_ring:
             fields.append(None)
             continue
         samples, positions, delta = _sampled_displacement(before, after)
@@ -232,7 +246,21 @@ def administrative_display_coverage(faces, *, frame_shape):
                 for before, field in zip(original, fields, strict=True)]
         blocked = _crossing_locations(arcs)
         if not blocked:
-            break
+            assembled = _face_geometries(arcs, shapes)
+            collapsed = np.flatnonzero(shapely.is_empty(assembled))
+            if not len(collapsed):
+                break
+            restored = False
+            for owner in collapsed:
+                for ring in shapes[owner] or ():
+                    for identifier in ring:
+                        index = identifier if identifier >= 0 else ~identifier
+                        if fields[index] is not None and np.array_equal(original[index][0], original[index][-1]):
+                            fields[index] = None
+                            restored = True
+            if restored:
+                continue
+            raise ValueError(f'nonempty administrative source faces must survive arc import: {collapsed.tolist()}')
         changed = False
         for index, points in blocked.items():
             field = fields[index]
@@ -248,11 +276,12 @@ def administrative_display_coverage(faces, *, frame_shape):
             fields[index] = (samples, positions, delta, reduced)
         if not changed:
             raise ValueError('administrative crossing constraint must reduce a changed local arc')
-    result = _face_geometries(arcs, shapes)
+    result = source.copy()
+    result[active] = assembled
     if not bool(np.all(shapely.is_valid(result))) or not bool(shapely.coverage_is_valid(result)):
         raise ValueError('rounded administrative arcs must retain shared face topology')
-    if not shapely.symmetric_difference(shapely.coverage_union_all(source),
-                                       shapely.coverage_union_all(result)).is_empty:
+    if not shapely.symmetric_difference(shapely.coverage_union_all(painted),
+                                       shapely.coverage_union_all(assembled)).is_empty:
         raise ValueError('rounded administrative arcs must retain the complete frame')
     for before, after in zip(source, result, strict=True):
         first, last = shapely.get_parts(before), shapely.get_parts(after)
