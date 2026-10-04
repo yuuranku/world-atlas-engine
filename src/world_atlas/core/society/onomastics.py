@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import re
 from functools import lru_cache
+from itertools import count
+from typing import Collection, Iterator
 
 from .naming_profiles import naming_profile
 
@@ -179,6 +181,132 @@ def _ordered_roots(lineage: str, *, seed: int) -> tuple[str, ...]:
     roots = lineage_roots(lineage, count=384)
     start = int(seed) % len(roots)
     return roots[start:] + roots[:start]
+
+
+@lru_cache(maxsize=128)
+def _compound_grammar(profile, endings, forbidden, tail):
+    """Keep only morpheme transitions that can end in an unexcluded name.
+
+    A state keeps the previous morpheme and the longest trailing prefix of an
+    excluded word. Those finite states suffice for every later substring
+    decision, even while the grammar itself produces arbitrarily long names.
+    Reverse reachability removes loops that can never accept the fixed suffix.
+    """
+    blocked = frozenset(name for name in forbidden if len(name) >= 2)
+    blocked_lengths = tuple(sorted({len(name) for name in blocked}))
+    prefixes = frozenset(name[:length] for name in blocked for length in range(1, len(name)))
+    prefix_lengths = tuple(sorted({len(name) for name in prefixes}, reverse=True))
+    stems = tuple(dict.fromkeys(stem for stem in profile.stems
+                                if not any(a == b for a, b in zip(stem, stem[1:]))))
+
+    @lru_cache(maxsize=None)
+    def advance(state, text):
+        for character in text:
+            extended = state + character
+            if any(extended[-length:] in blocked for length in blocked_lengths if length <= len(extended)):
+                return None
+            state = next((extended[-length:] for length in prefix_lengths
+                          if length <= len(extended) and extended[-length:] in prefixes), "")
+        return state
+
+    def compatible(previous, following):
+        return (previous != following and not following.startswith(previous)
+                and not previous.endswith(following) and previous[-1] != following[0])
+
+    openings = []
+    pending = []
+    queued = set()
+    for first, first_stem in enumerate(stems):
+        initial = advance("", first_stem)
+        if initial is None:
+            continue
+        for second, second_stem in enumerate(stems):
+            if not compatible(first_stem, second_stem):
+                continue
+            state = advance(initial, second_stem)
+            if state is None:
+                continue
+            node = (state, second)
+            openings.append((first, second, node))
+            if node not in queued:
+                queued.add(node)
+                pending.append(node)
+    edges, terminals, reverse = {}, {}, {}
+    while pending:
+        node = pending.pop()
+        state, previous = node
+        previous_stem = stems[previous]
+        terminals[node] = tuple(ending for ending in (*endings, "")
+            if (not ending or (compatible(previous_stem, ending)
+                               and not any(a == b for a, b in zip(ending, ending[1:]))))
+            and advance(state, ending + tail) is not None)
+        outgoing = []
+        for following, stem in enumerate(stems):
+            if not compatible(previous_stem, stem):
+                continue
+            state_after = advance(state, stem)
+            if state_after is None:
+                continue
+            target = (state_after, following)
+            outgoing.append((following, target))
+            reverse.setdefault(target, []).append(node)
+            if target not in queued:
+                queued.add(target)
+                pending.append(target)
+        edges[node] = tuple(outgoing)
+    live = {node for node, values in terminals.items() if values}
+    pending = list(live)
+    while pending:
+        for previous in reverse.get(pending.pop(), ()):
+            if previous not in live:
+                live.add(previous)
+                pending.append(previous)
+    return stems, tuple(item for item in openings if item[2] in live), {
+        node: tuple(item for item in edges[node] if item[1] in live) for node in live}, terminals
+
+
+def lineage_compound_candidates(
+    lineage: str,
+    *,
+    seed: int,
+    forbidden: Collection[str] = (),
+    suffix: str = "",
+    following: str = "",
+    environment: str | None = None,
+) -> Iterator[str]:
+    """Enumerate the usable local grammar lazily, shortest compounds first.
+
+    Complete cultural morphemes keep their original sound family. A finite
+    constraint graph proves that every retained prefix can reach an accepted
+    name, so an impossible exclusion/suffix combination ends without retries.
+    Already allocated names are handled by the caller and may still extend.
+    """
+    style = lineage_style_index(lineage)
+    profile = naming_profile(lineage, style=style)
+    endings = _FORMANTS[style][environment] if environment is not None else profile.endings
+    stems, openings, edges, terminals = _compound_grammar(
+        profile, tuple(dict.fromkeys(endings)), frozenset(forbidden), suffix + following)
+    ranks = {index: hashlib.sha256(f"compound-names-v1:{lineage}:{seed}:{stem}".encode("utf-8")).digest()
+             for index, stem in enumerate(stems)}
+    openings = sorted(openings, key=lambda item: (ranks[item[0]], ranks[item[1]]))
+    edges = {node: sorted(values, key=lambda item: ranks[item[0]]) for node, values in edges.items()}
+
+    def extend(root, node, remaining):
+        if remaining == 0:
+            yield root, node
+        else:
+            for index, target in edges[node]:
+                yield from extend(root + stems[index], target, remaining - 1)
+
+    for length in count(2):
+        viable = False
+        for first, second, node in openings:
+            for root, final_node in extend(stems[first] + stems[second], node, length - 2):
+                viable = True
+                for ending in terminals[final_node]:
+                    yield root + ending
+        if not viable:
+            return
 
 
 def lineage_entity_candidates(

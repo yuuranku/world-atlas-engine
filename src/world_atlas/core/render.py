@@ -63,6 +63,7 @@ from .continuous_terrain import PhysicalTerrainField
 from .terrain_refinement import terrain_from_source
 from .continuous_scalar import scalar_band_paths
 from .continuous_ecology import FreshwaterCorridors
+from .ecological_sources import PreparedWorldLayers, prepare_world_layers
 from .vegetation import VegetationCover, derive_vegetation_field, VEGETATION_THRESHOLDS
 from .cartographic_relief import physical_relief_paths
 from .cartographic_generalization import generalize_display_surface
@@ -4053,13 +4054,14 @@ def _render_transport_stage(output_dir, grid_payload, society, locations, terrai
 
 
 def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: ProceduralSurface,
-                  society: SocietyLayers | None = None, travel_capabilities: tuple[str,...] = ()) -> dict[str, Any]:
+                  society: SocietyLayers | None = None, travel_capabilities: tuple[str,...] = (),
+                  prepared_layers: PreparedWorldLayers | None = None) -> dict[str, Any]:
     """Render independent geometry stages on three bounded worker processes."""
     executor = ProcessPoolExecutor(max_workers=3, mp_context=multiprocessing.get_context("spawn"))
     try:
         return _render_review(grid, output_dir, physical_source=physical_source,
                               society=society, travel_capabilities=travel_capabilities,
-                              executor=executor)
+                              executor=executor, prepared_layers=prepared_layers)
     except BaseException:
         executor.terminate_workers()
         raise
@@ -4069,7 +4071,8 @@ def render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: P
 
 def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: ProceduralSurface,
                    society: SocietyLayers | None, travel_capabilities: tuple[str,...],
-                   executor: ProcessPoolExecutor) -> dict[str, Any]:
+                   executor: ProcessPoolExecutor,
+                   prepared_layers: PreparedWorldLayers | None = None) -> dict[str, Any]:
     """Write a raster export and an inline SVG review page from canonical arrays.
 
     The raster is retained as an export/debug artifact; the visible map base
@@ -4080,6 +4083,8 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
         raise TypeError("render_review requires a WorldGrid")
     if society is not None and society.population.population_weight.shape != grid.shape:
         raise ValueError("saved society must match the physical grid shape")
+    if prepared_layers is not None:
+        prepared_layers.validate(grid, physical_source)
     output_dir = Path(output_dir)
     _reject_reparse_paths(output_dir)
     if output_dir.exists():
@@ -4120,15 +4125,24 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
     display_width, display_height, _scale_x, _scale_y = _review_dimensions(grid)
 
     logger = logging.getLogger(__name__)
-    logger.info("Reconstructing the accepted physical ground")
-    with measure_stage(output_dir, "physical-ground"):
-        terrain_field = terrain_from_source(grid, physical_source)
-    logger.info("Extracting the shared physical shoreline")
-    with measure_stage(output_dir, "physical-shoreline"):
-        land_surface = continuous_land_surface(grid, terrain_field=terrain_field)
+    if prepared_layers is None:
+        prepared_layers = prepare_world_layers(grid, physical_source, timing_output=output_dir)
+    else:
+        logger.info("Reusing this run's physical ground, shoreline, ecological sources and thematic layers")
+        (output_dir/'preparation-reuse.json').write_text(json.dumps({
+            'schema':'world-atlas-same-run-preparation-v1',
+            'gridDigest':prepared_layers.grid_digest,
+            'physicalSourceDigest':prepared_layers.physical_source_digest,
+            'sourceTiming':str(prepared_layers.timing_output/'timing.json'),
+            'reusedStages':['physical-ground','physical-shoreline','ecological-sources','thematic-layers'],
+        },indent=2)+'\n',encoding='utf-8')
+    terrain_field = prepared_layers.terrain
+    land_surface = prepared_layers.land_surface
+    logger.info("Encoding the shared physical shoreline")
+    with measure_stage(output_dir, "physical-shoreline-markup"):
         land_surface_paths = _geometry_filled_paths(land_surface)
         coast_paths = _surface_outline_paths(land_surface_paths, grid.shape)
-        lake_fill_paths = _geometry_filled_paths(_lake_surface(grid, land_surface))
+        lake_fill_paths = _geometry_filled_paths(prepared_layers.ecological_sources.lake_geometry)
         lake_paths = _surface_outline_paths(lake_fill_paths, grid.shape)
     # Every water boundary is already a physical coast. Separate lake and
     # inland-sea outlines used to draw misaligned duplicates of that shore.
@@ -4179,9 +4193,8 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
         physical_source.bathymetry, maritime,
         np.arange(1, len(water_palette), dtype=float) / len(water_palette))
     inland_sea_fill_paths: list[tuple[np.ndarray, np.ndarray]] = []
-    ecological_sources = FreshwaterCorridors.from_surfaces(
-        grid.shape, river_paths, river_orders, _lake_surface(grid, land_surface))
-    thematic = derive_thematic_layers(grid, ecological_sources=ecological_sources)
+    ecological_sources = prepared_layers.ecological_sources
+    thematic = prepared_layers.thematic
     tectonics = derive_tectonic_review(grid, physical_source=physical_source)
     tectonic_svg = render_tectonic_svg(grid, tectonics)
     name_source, society_request = _society_generation_request(grid)

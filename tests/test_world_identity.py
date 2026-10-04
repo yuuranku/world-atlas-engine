@@ -1,6 +1,7 @@
 """Canonical naming uses lineage and place semantics, never old labels."""
 
 from dataclasses import replace
+import re
 import unittest
 
 import numpy as np
@@ -23,8 +24,9 @@ from world_atlas.core.society.model import (
     State,
     TransportLayers,
 )
-from world_atlas.core.society.world_identity import assign_world_identity, naming_audit
+from world_atlas.core.society.world_identity import NameRegistry, assign_world_identity, naming_audit
 from world_atlas.core.society.naming_profiles import naming_profile
+from world_atlas.core.society.onomastics import settlement_name_candidates
 
 
 def _society() -> SocietyLayers:
@@ -124,6 +126,63 @@ def _society() -> SocietyLayers:
 
 
 class WorldIdentityTests(unittest.TestCase):
+    def test_large_local_inventory_grows_without_serials_or_changing_culture(self):
+        lineage = "lineage-s05-17:profile-fantasy-astral-05"
+        profile = naming_profile(lineage, style=5)
+        first_candidates = settlement_name_candidates(lineage, "plain", None, seed=31)
+        # Keep old complete names and an embedded morpheme prohibited. The
+        # registry must grow the grammar, rather than prefixing these names.
+        forbidden = (*first_candidates[:80], profile.stems[0], "旧城")
+
+        def allocate():
+            registry = NameRegistry(9127, forbidden)
+            names = [registry.name(f"city:large-{index}", 5, candidates=("旧城",),
+                                  lineage=lineage, environment="plain") for index in range(1200)]
+            return names
+
+        names = allocate()
+        self.assertEqual(names, allocate())
+        self.assertEqual(len(set(names)), 1200)
+        grammar = "(?:" + "|".join(map(re.escape, profile.stems)) + "){2,}(?:萨赫勒)?"
+        self.assertTrue(all(re.fullmatch(grammar, name) for name in names))
+        self.assertTrue(all(not any(character.isdigit() for character in name) for name in names))
+        self.assertFalse(any(old in name for name in names for old in forbidden))
+        self.assertFalse(any(a == b for name in names for a, b in zip(name, name[1:])))
+
+    def test_allocated_compounds_can_still_form_distinct_longer_names(self):
+        lineage = "lineage-s00-17:profile-fantasy-sylvan-00"
+        profile = naming_profile(lineage, style=0)
+        registry = NameRegistry(73)
+        registry.used.update(first + second + ending for first in profile.stems
+                             for second in profile.stems for ending in (*profile.endings, ""))
+        name = registry.name("city:dense", 0, candidates=(), lineage=lineage)
+        self.assertGreaterEqual(len(name), 4)
+        self.assertTrue(registry.available(name + "新"))
+
+    def test_unusable_morphemes_or_fixed_suffix_fail_without_retrying(self):
+        lineage = "lineage-s05-17:profile-realistic-05"
+        profile = naming_profile(lineage, style=5)
+        with self.assertRaisesRegex(ValueError, "no unexcluded morpheme"):
+            NameRegistry(73, profile.stems).name("city:blocked", 5, candidates=(), lineage=lineage)
+        with self.assertRaisesRegex(ValueError, "excluded suffix"):
+            NameRegistry(73, ("旧名",)).name("province:blocked", 5, suffix="旧名州", lineage=lineage)
+        # The fixed suffix is safe in isolation, but every possible word
+        # boundary is blocked. An endlessly extensible prefix cannot help.
+        blocked_boundaries = tuple(morpheme[-1] + "城" for morpheme in (*profile.stems, *profile.endings))
+        with self.assertRaisesRegex(ValueError, "no unexcluded morpheme"):
+            NameRegistry(73, blocked_boundaries).name("province:blocked-boundary", 5,
+                candidates=(), suffix="城", lineage=lineage)
+
+    def test_indexed_exclusions_keep_exact_and_substring_semantics(self):
+        forbidden = ("安", "阿尔", "旧地名", "", " ")
+        registry = NameRegistry(73, forbidden)
+        registry.used.add("新城")
+        normalized = set(name.strip() for name in forbidden if name.strip())
+        for name in ("安", "安川", "阿尔", "新阿尔城", "旧地名州", "新城", "新泉"):
+            expected = (name not in registry.used and name not in normalized
+                        and not any(old in name for old in normalized if len(old) >= 2))
+            self.assertEqual(registry.available(name), expected)
+
     def test_names_are_lineage_derived_and_categorically_grounded(self):
         renamed = assign_world_identity(_society(), seed=934_221, forbidden=("旧东", "Old West"))
         cities = {item.identifier: item.name for item in renamed.settlements}

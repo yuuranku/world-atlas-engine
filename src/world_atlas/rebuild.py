@@ -17,8 +17,7 @@ from world_atlas.core.config import load_world_config
 from world_atlas.core.model import WorldGrid
 from world_atlas.core.procedural_planet import PlanetRecipe, load_surface_bundle
 from world_atlas.core.render import render_review, _society_generation_request
-from world_atlas.core.thematic import derive_thematic_layers
-from world_atlas.core.ecological_sources import derive_ecological_sources
+from world_atlas.core.ecological_sources import PreparedWorldLayers, prepare_world_layers
 from world_atlas.core.society.pipeline import derive_society_layers
 from world_atlas.core.society.storage import load_society, save_society
 from world_atlas.core.society.world_identity import collect_proper_names, naming_audit
@@ -230,17 +229,19 @@ def publish_accepted_world(output: Path, *, started: float | None = None) -> dic
         raise ValueError("human generation contract changed after the physical checkpoint")
     name_source, generation_request = _society_generation_request(grid)
     raw_source = load_surface_bundle(output / "source/physical-fields.npz")
+    with measure_stage(output, "ecological-preparation"):
+        prepared_layers = prepare_world_layers(grid, raw_source, timing_output=output)
     with measure_stage(output, "society"):
-        society = derive_society_layers(grid, derive_thematic_layers(grid,
-                                        ecological_sources=derive_ecological_sources(grid, raw_source)), name_source,
+        society = derive_society_layers(grid, prepared_layers.thematic, name_source,
                                         raw_elevation_m=raw_source.relative_elevation_m,
                                         **generation_request)
         save_society(society, output / "society", grid_digest=grid.content_digest())
     logging.info("Society checkpoint saved; rendering all map views")
-    return finish_accepted_world(output, started=started)
+    return finish_accepted_world(output, started=started, prepared_layers=prepared_layers)
 
 
-def finish_accepted_world(output: Path, *, started: float | None = None) -> dict:
+def finish_accepted_world(output: Path, *, started: float | None = None,
+                          prepared_layers: PreparedWorldLayers | None = None) -> dict:
     """Render the verified society checkpoint, without rerunning simulation."""
     started = time.monotonic() if started is None else started
     output = output.resolve()
@@ -259,7 +260,7 @@ def finish_accepted_world(output: Path, *, started: float | None = None) -> dict
     with measure_stage(output, "render"):
         settings = load_world_settings(output/'world-settings.json')
         render_review(grid, output / "review", society=society, physical_source=physical_source,
-                      travel_capabilities=settings.travel_capabilities)
+                      travel_capabilities=settings.travel_capabilities, prepared_layers=prepared_layers)
     society = load_society(output / "review", expected_grid_digest=grid.content_digest())
     audit = naming_audit(society, forbidden)
     write_json(output / "review/naming-audit.json", audit)

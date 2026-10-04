@@ -7,6 +7,7 @@ Only common translated geographic/legal terms are shared with older atlases.
 from collections import Counter
 from dataclasses import replace
 import hashlib
+from itertools import chain
 import json
 from typing import Collection, Mapping
 
@@ -16,6 +17,7 @@ from .names import _FEATURE_SUFFIX
 from .onomastics import (
     geographic_name_candidates,
     lineage_branch,
+    lineage_compound_candidates,
     lineage_entity_candidates,
     lineage_key,
     lineage_style_index,
@@ -61,25 +63,39 @@ class NameRegistry:
     def __init__(self, seed: int, forbidden: Collection[str] = ()):
         self.seed = int(seed)
         self.forbidden = frozenset(str(name).strip() for name in forbidden if str(name).strip())
+        self._forbidden_lengths = tuple(sorted({len(name) for name in self.forbidden if len(name) >= 2}))
         self.used: set[str] = set()
         self.names: dict[tuple, str] = {}
 
     def available(self, name: str) -> bool:
         return (name not in self.used and name not in self.forbidden
-                and not any(old in name for old in self.forbidden if len(old) >= 2))
+                and self.allowed_prefix(name))
+
+    def allowed_prefix(self, name: str) -> bool:
+        """A used root may grow, but an excluded substring can never grow away."""
+        return not any(name[start:start + length] in self.forbidden
+                       for length in self._forbidden_lengths if length <= len(name)
+                       for start in range(len(name) - length + 1))
 
     def name_seed(self, key: str) -> int:
         return int.from_bytes(hashlib.sha256(f"world-names-v3:{self.seed}:{key}".encode()).digest()[:8], "big")
 
     def name(self, key: str, style: int, *, suffix: str = "", preferred: str | None = None,
-             following: str = "", candidates: tuple[str, ...] | None = None) -> str:
-        cache_key = (key, style, suffix, preferred, following, candidates)
+             following: str = "", candidates: tuple[str, ...] | None = None,
+             lineage: str | None = None, environment: str | None = None) -> str:
+        cache_key = (key, style, suffix, preferred, following, candidates, lineage, environment)
         if cache_key in self.names:
             return self.names[cache_key]
-        if candidates is None:
+        if lineage is None:
             lineage = lineage_branch(lineage_key(1, style_index=style), self.seed)
+        if candidates is None:
             candidates = lineage_entity_candidates(lineage, key, seed=self.name_seed(key))
-        roots = (preferred, *candidates) if preferred else candidates
+        if not self.allowed_prefix(suffix + following):
+            raise ValueError(f"name grammar has an excluded suffix for {key}")
+        initial = (preferred, *candidates) if preferred else candidates
+        roots = chain(initial, lineage_compound_candidates(
+            lineage, seed=self.name_seed(key), forbidden=self.forbidden,
+            suffix=suffix, following=following, environment=environment))
         for root in roots:
             if any(a == b for a, b in zip(root, root[1:])):
                 continue
@@ -91,7 +107,7 @@ class NameRegistry:
                 self.used.add(candidate + following)
             self.names[cache_key] = candidate
             return candidate
-        raise ValueError(f"name inventory exhausted for {key}")
+        raise ValueError(f"name grammar has no unexcluded morpheme combinations for {key}")
 
 
 def assign_world_identity(society: SocietyLayers, *, seed: int, forbidden: Collection[str] = (),
@@ -117,8 +133,9 @@ def assign_world_identity(society: SocietyLayers, *, seed: int, forbidden: Colle
         return culture_lineages[identifier]
 
     def entity_name(key, lineage, **kwargs):
-        return registry.name(key, lineage_style_index(lineage), candidates=lineage_entity_candidates(
-            lineage_branch(lineage, key), key.split(":")[0], seed=registry.name_seed(key)), **kwargs)
+        branch = lineage_branch(lineage, key)
+        return registry.name(key, lineage_style_index(lineage), lineage=branch,
+            candidates=lineage_entity_candidates(branch, key.split(":")[0], seed=registry.name_seed(key)), **kwargs)
 
     cities = []
     for item in society.settlements:
@@ -126,7 +143,8 @@ def assign_world_identity(society: SocietyLayers, *, seed: int, forbidden: Colle
         key = f"city:{item.identifier}"
         candidates = settlement_name_candidates(lineage, _SITE_ENVIRONMENT[item.site_type], None,
                                                  seed=registry.name_seed(key))
-        cities.append(replace(item, name=registry.name(key, lineage_style_index(lineage), candidates=candidates)))
+        cities.append(replace(item, name=registry.name(key, lineage_style_index(lineage), candidates=candidates,
+            lineage=lineage, environment=_SITE_ENVIRONMENT[item.site_type])))
     cities = tuple(cities)
     city_names = {item.identifier: item.name for item in cities}
     civilizations = tuple(replace(item, name_family=culture_profiles[item.identifier],
@@ -166,7 +184,8 @@ def assign_world_identity(society: SocietyLayers, *, seed: int, forbidden: Colle
     groups = tuple(replace(item, name=entity_name(f"people:{item.identifier}", language_lineages[item.language_identifier],
         suffix=_GROUP_SUFFIX[item.organization])) for item in society.politics.frontier_groups)
     features = tuple(replace(item, name=registry.name(f"feature:{item.identifier}", families[item.language_identifier],
-        suffix=_FEATURE_SUFFIX[item.feature_type], candidates=geographic_name_candidates(
+        suffix=_FEATURE_SUFFIX[item.feature_type], lineage=language_lineages[item.language_identifier],
+        candidates=geographic_name_candidates(
             language_lineages[item.language_identifier], item.feature_type,
             seed=registry.name_seed(f"feature:{item.identifier}")))) for item in society.geographic_features)
     result = replace(society, settlements=cities,
