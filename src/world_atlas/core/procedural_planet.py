@@ -76,6 +76,7 @@ BOUNDARY_TRANSFORM = 3
 _REFERENCE_HEIGHT = 360
 _REFERENCE_WIDTH = 720
 _PLANET_RADIUS_KM = 6400.0
+_MAP_SEAM_FRACTION = 0.025
 _STAGE_SALTS = {
     "morphology": 0x13198A2E,
     "plates": 0x243F6A88,
@@ -1201,6 +1202,27 @@ def _grow_continental_crust(
     # with inherited fabric and spreading influence instead of adding a
     # uniform channel to the finished land mask.
     reserved = np.full(cell_count, -1, dtype=np.int16)
+    # The rectangular atlas needs a complete oceanic meridian. Preserve it
+    # during accretion, in the widest existing gap between non-polar roots,
+    # instead of cutting through finished continental crust at delivery.
+    root_mask = np.zeros(grid.shape, dtype=bool)
+    polar_root_rows = {root // width for root in root_cells if root // width in (0, height - 1)}
+    for root in root_cells:
+        if root // width not in polar_root_rows:
+            root_mask.reshape(-1)[root] = True
+    seam_column, _ = _ocean_map_seam(root_mask)
+    # One construction cell covers the rounding error when this interval is
+    # sampled on a larger grid with a non-integer resolution ratio.
+    seam_width = max(2, int(math.ceil(width * _MAP_SEAM_FRACTION))) + 1
+    seam_columns = (np.arange(seam_width) + seam_column - seam_width // 2) % width
+    seam_reserve = np.zeros(grid.shape, dtype=bool)
+    seam_reserve[:, seam_columns] = True
+    latitude_half_cell = 90.0 / height
+    if 0 in polar_root_rows:
+        seam_reserve[grid.latitude_degrees[:, 0] - latitude_half_cell >= 58.0] = False
+    if height - 1 in polar_root_rows:
+        seam_reserve[grid.latitude_degrees[:, 0] + latitude_half_cell <= -58.0] = False
+    reserved[seam_reserve.reshape(-1)] = -2
     separation_km = (
         420.0 + 240.0 * divergent_influence
         + 120.0 * np.clip(texture, -1.0, 1.0)
@@ -1231,26 +1253,25 @@ def _grow_continental_crust(
     for owner_index, root in enumerate(root_cells):
         if owner[root] >= 0:
             continue
-        owner[root] = owner_index
-        reserve(root, owner_index)
-        costs[owner_index, root] = 0.0
-        owner_area[owner_index] += cell_weight[root]
-        heapq.heappush(frontiers[owner_index], (0.0, root))
+        row, _ = divmod(root, width)
+        # A pole is one spherical point, represented by an entire longitude
+        # ring in this projection. Polar roots belong to the requested count.
+        nuclei = range(row * width, (row + 1) * width) if row in polar_root_rows else (root,)
+        for nucleus in nuclei:
+            owner[nucleus] = owner_index
+            reserve(nucleus, owner_index)
+            costs[owner_index, nucleus] = 0.0
+            owner_area[owner_index] += cell_weight[nucleus]
 
     def expand(owner_index: int, cell: int, current_cost: float) -> None:
         row, column = divmod(cell, width)
-        for delta_row, delta_column in (
-            (-1, -1),
-            (-1, 0),
-            (-1, 1),
-            (0, -1),
-            (0, 1),
-            (1, -1),
-            (1, 0),
-            (1, 1),
-        ):
+        # Every accepted cell has a cardinal path to its root. Diagonal-only
+        # arms split under the stricter mainland topology at the sea-level cut.
+        for delta_row, delta_column in ((-1, 0), (0, -1), (0, 1), (1, 0)):
             next_row = row + delta_row
             if not 0 <= next_row < height:
+                continue
+            if next_row in (0, height - 1) and next_row not in polar_root_rows:
                 continue
             next_column = (column + delta_column) % width
             neighbour = next_row * width + next_column
@@ -1292,7 +1313,11 @@ def _grow_continental_crust(
     # Continental roots are accreted belts of connected crustal nuclei, not
     # single points whose travel-time balls inevitably become oval continents.
     # Asymmetric arms bend with the crustal fabric and avoid spreading seams.
-    nucleus_cells: list[list[int]] = [[root] for root in root_cells]
+    nucleus_cells: list[list[int]] = [
+        list(range((root // width) * width, (root // width + 1) * width))
+        if root // width in polar_root_rows else [root]
+        for root in root_cells
+    ]
     for owner_index, root in enumerate(root_cells):
         core_radius_km = row_step * math.sqrt(float(quotas[owner_index]))
         arm_length = float(np.clip(0.32 * core_radius_km, 600.0, 2200.0))
@@ -1309,7 +1334,7 @@ def _grow_continental_crust(
                 row, column = divmod(cell, width)
                 direction = heading + curvature * travelled / max(length, 1.0)
                 options = []
-                for dr, dc in ((-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)):
+                for dr, dc in ((-1,0),(0,-1),(0,1),(1,0)):
                     nr, nc = row + dr, (column + dc) % width
                     if not 1 <= nr < height - 1:
                         continue
@@ -1742,46 +1767,134 @@ def _continental_crust(
     recipe: PlanetRecipe,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray, float, Mapping[str, object]]:
-    """Condition the kinematic history on the requested present-day continents.
+    """Compute one history, then solve its present-day physical constraints."""
+    return _continental_crust_candidate(
+        grid, plate_fields, boundary_class, morphology, recipe, seed,
+        32.0 + 28.0 * morphology.crust_fragmentation,
+    )
 
-    A continent count is a constraint on the resulting crust, not a number of
-    arbitrary labels. Reconstruct shorter histories when the motion tears a
-    nucleus into an extra continent or accretes two into one. Every candidate
-    rebuilds ancestral plates and crust before applying its Euler motion.
+
+def _continental_topology(
+    land: np.ndarray,
+    latitude_weight: np.ndarray,
+    recipe: PlanetRecipe,
+) -> tuple[bool, Mapping[str, object]]:
+    """Certify the actual land, including a margin around major-component area."""
+    area = np.broadcast_to(latitude_weight, land.shape)
+    results = {}
+    valid = True
+    for connectivity in (4, 8):
+        labels, _ = periodic_component_labels(land, connectivity)
+        sizes = np.bincount(labels.ravel(), weights=area.ravel())[1:]
+        shares = np.sort(sizes / max(float(sizes.sum()), np.finfo(float).tiny))[::-1]
+        count = int(np.count_nonzero(shares >= 0.05))
+        smallest = float(shares[recipe.continent_count - 1]) if len(shares) >= recipe.continent_count else 0.0
+        next_share = float(shares[recipe.continent_count]) if len(shares) > recipe.continent_count else 0.0
+        valid &= count == recipe.continent_count and smallest >= 0.06 and next_share < 0.04
+        results[str(connectivity)] = {
+            "majorCount": count, "smallestRequestedShare": smallest,
+            "largestMinorShare": next_share,
+        }
+    polar_valid = (bool(np.all(land[0])) if recipe.north_polar_continent else not bool(np.any(land[0])))
+    polar_valid &= (bool(np.all(land[-1])) if recipe.south_polar_continent else not bool(np.any(land[-1])))
+    valid &= polar_valid
+    try:
+        _, seam_width = _ocean_map_seam(_non_polar_seam_land(land, recipe))
+        # Certify the actual target-grid sampling too. Mapping only occupied
+        # meridians needs no target-sized land allocation and handles cap rows
+        # at the 58-degree projection cutoff without assuming integer ratios.
+        native_latitude = 90.0 - (np.arange(recipe.height) + 0.5) * 180.0 / recipe.height
+        active_rows = np.ones(recipe.height, dtype=bool)
+        if recipe.north_polar_continent:
+            active_rows &= native_latitude < 58.0
+        if recipe.south_polar_continent:
+            active_rows &= native_latitude > -58.0
+        source_rows = ((np.flatnonzero(active_rows) + 0.5) * land.shape[0] / recipe.height).astype(np.int64)
+        occupied = np.any(land[np.unique(source_rows)], axis=0)
+        native_columns = ((np.arange(recipe.width) + 0.5) * land.shape[1] / recipe.width).astype(np.int64)
+        _, projected_seam_width = _ocean_map_seam(occupied[native_columns][None, :])
+        seam_valid = True
+    except ValueError:
+        seam_width, projected_seam_width, seam_valid = 0, 0, False
+    valid &= seam_valid
+    return bool(valid), {
+        "connectivity": results, "polarDomainsValid": bool(polar_valid),
+        "mapSeamValid": seam_valid, "oceanCorridorWidthColumns": seam_width,
+        "projectedOceanCorridorWidthColumns": projected_seam_width,
+        "landFraction": float(np.sum(land * area) / np.sum(area)),
+    }
+
+
+def _condition_continental_field(
+    relative: np.ndarray,
+    feasible_land: np.ndarray,
+    feasible_relative: np.ndarray,
+    latitude_weight: np.ndarray,
+    recipe: PlanetRecipe,
+) -> tuple[np.ndarray, Mapping[str, object]]:
+    """Retain a certified amount of a continuous tectonic/relief field.
+
+    The accretion endpoint is a physical domain with connected, separated
+    roots and area quotas. A positive, smooth relief amplitude multiplies its
+    signed field: the feasible shoreline stays continuous, and compatible
+    interior relief is retained to the field's local sampling resolution.
+    A valid full-amplitude candidate needs no projection. Otherwise a bracket
+    of certified feasible and infeasible amplitudes converges at raster
+    precision. Feasibility need not be monotone: only tested feasible endpoints
+    are retained, and this is not a claim of a global maximum amplitude.
     """
-    requested_duration = 32.0 + 28.0 * morphology.crust_fragmentation
-    area = np.cos(np.radians(grid.latitude_degrees))
-    attempts = []
-    for fraction in (1.0, 0.5, 0.25, 0.125):
-        result = _continental_crust_candidate(
-            grid, plate_fields, boundary_class, morphology, recipe, seed,
-            requested_duration * fraction,
-        )
-        land, field, level, metrics = result
-        counts = []
-        stable = True
-        for connectivity in (4, 8):
-            labels, _ = periodic_component_labels(land, connectivity)
-            component_area = np.bincount(labels.ravel(), weights=area.ravel())[1:]
-            shares = np.sort(component_area / component_area.sum())[::-1]
-            counts.append(int(np.count_nonzero(shares >= 0.05)))
-            # Leave a real area margin around the major-landmass criterion:
-            # a 4.99% detached block can become a fourth continent after the
-            # native shoreline/erosion pass. Condition the crust itself.
-            stable &= bool(len(shares) >= recipe.continent_count
-                           and shares[recipe.continent_count - 1] >= 0.06
-                           and (len(shares) == recipe.continent_count
-                                or shares[recipe.continent_count] < 0.04))
-        attempts.append({"durationMyr": requested_duration * fraction,
-                         "fourConnectedMajorCount": counts[0], "eightConnectedMajorCount": counts[1],
-                         "stableAreaMargin": stable})
-        if stable and counts == [recipe.continent_count, recipe.continent_count]:
-            return land, field, level, {
-                **metrics,
-                "continentConstruction": {"model": "area-spaced-separated-crust-with-conditioned-euler-history",
-                                           "requestedCount": recipe.continent_count, "attempts": attempts},
-            }
-    raise ValueError(f"continental construction did not meet {recipe.continent_count} physical continents: {attempts}")
+    desired = np.asarray(relative, dtype=np.float32)
+    valid, desired_metrics = _continental_topology(desired > 0.0, latitude_weight, recipe)
+    if valid:
+        return desired, {
+            "model": "certified-continuous-field-amplitude", "retainedAmplitude": 1.0,
+            "refinements": 0, "changedSignAreaFraction": 0.0,
+            "result": desired_metrics,
+        }
+    feasible = np.asarray(feasible_land, dtype=bool)
+    base_valid, base_metrics = _continental_topology(feasible, latitude_weight, recipe)
+    if not base_valid:
+        raise ValueError(f"continental accretion endpoint is infeasible: {base_metrics}")
+    area = np.broadcast_to(latitude_weight, feasible.shape)
+    basal = np.asarray(feasible_relative, dtype=np.float32)
+    if not np.array_equal(basal > 0.0, feasible):
+        raise ValueError("continental feasible field does not represent its physical domain")
+    # The local gradient is the observed field's sampling resolution. Unlike
+    # stitching two fields at a binary sign mask, this positive amplitude
+    # tends continuously to the accretion shoreline and creates no jump.
+    vertical = np.gradient(basal.astype(np.float64), axis=0)
+    horizontal = (np.roll(basal, -1, axis=1) - np.roll(basal, 1, axis=1)) * 0.5
+    resolution = np.maximum(np.hypot(vertical, horizontal),
+                            np.spacing(max(float(np.max(np.abs(basal))), 1.0)))
+    directed = np.where(feasible, desired, -desired).astype(np.float64)
+    magnitude = resolution * np.logaddexp(0.0, directed / resolution)
+    base = (basal * (magnitude + resolution) / (np.abs(basal) + resolution)).astype(np.float32)
+    retained = base
+    retained_metrics = base_metrics
+    lower, upper = 0.0, 1.0
+    refinements = 0
+    # Sub-raster amplitude resolution scales with the actual grid rather than
+    # a seed-specific number of historical-duration guesses.
+    amplitude_resolution = 1.0 / max(desired.shape)
+    while upper - lower > amplitude_resolution:
+        amplitude = 0.5 * (lower + upper)
+        trial = base + amplitude * (desired - base)
+        level = _weighted_level(trial, latitude_weight, recipe.land_fraction)
+        trial = (trial - level).astype(np.float32)
+        trial_valid, trial_metrics = _continental_topology(trial > 0.0, latitude_weight, recipe)
+        refinements += 1
+        if trial_valid:
+            lower, retained, retained_metrics = amplitude, trial, trial_metrics
+        else:
+            upper = amplitude
+    changed = (retained > 0.0) != (desired > 0.0)
+    return retained, {
+        "model": "certified-continuous-field-amplitude", "retainedAmplitude": lower,
+        "refinements": refinements, "terminalBracketWidth": upper - lower,
+        "changedSignAreaFraction": float(np.sum(changed * area) / np.sum(area)),
+        "candidate": desired_metrics, "accretionEndpoint": base_metrics,
+        "result": retained_metrics,
+    }
 
 
 def _continental_crust_candidate(
@@ -1809,18 +1922,34 @@ def _continental_crust_candidate(
     # Accreted crust must be allowed across the future rift. Pre-clearing a
     # wide ocean around every divergent boundary leaves little shared crust
     # to tear apart when the finite motion below actually starts.
-    roots = _select_crust_roots(grid, recipe.continent_count, morphology, seed, recipe.land_fraction)
+    polar_count = int(recipe.north_polar_continent) + int(recipe.south_polar_continent)
+    roots = _select_crust_roots(
+        grid, recipe.continent_count - polar_count, morphology, seed, recipe.land_fraction,
+    )
+    if recipe.north_polar_continent:
+        roots += (0,)
+    if recipe.south_polar_continent:
+        roots += ((grid.shape[0] - 1) * grid.shape[1],)
     rng = np.random.Generator(np.random.PCG64(seed ^ 0xA24BAED4963EE407))
-    crust_fraction = min(recipe.land_fraction + 0.075, 0.62)
     continental_mask = _grow_continental_crust(
         grid,
         roots,
         ancestral_plates.plate_grid,
         ancestral_boundaries,
         morphology,
-        crust_fraction,
+        recipe.land_fraction,
         seed,
     )
+    accreted_mask = continental_mask.copy()
+    latitude_weight = np.cos(np.radians(grid.latitude_degrees[:, 0]))[:, None]
+    accreted_valid, accreted_metrics = _continental_topology(accreted_mask, latitude_weight, recipe)
+    area_tolerance = float(np.max(latitude_weight) / (np.sum(latitude_weight) * grid.shape[1]))
+    if not accreted_valid or abs(float(accreted_metrics["landFraction"]) - recipe.land_fraction) > 2.0 * area_tolerance:
+        raise ValueError(f"continental accretion did not reach its physical area quotas: {accreted_metrics}")
+    accreted_potential = (
+        _distance_from_sources(~accreted_mask, grid)
+        - _distance_from_sources(accreted_mask, grid)
+    ) / 680.0
 
     # Detached continental fragments now come from the same transported
     # crust, not extra radial islands stamped around its perimeter. Oceanic
@@ -1966,9 +2095,9 @@ def _continental_crust_candidate(
             )
 
     # Reserve one genuine oceanic longitude corridor for the rectangular map
-    # seam.  Pick the weakest existing meridian, so this widens a basin rather
-    # than slicing an established continental core.
-    basin_column = int(np.argmin(np.max(potential_grid, axis=0)))
+    # seam. Widen the basin already preserved by accretion instead of cutting
+    # a different meridian through established continental cores.
+    basin_column, _ = _ocean_map_seam(_non_polar_seam_land(accreted_mask, recipe))
     columns = np.arange(grid.shape[1], dtype=np.float64)
     basin_distance = np.minimum(
         np.mod(columns - basin_column, grid.shape[1]),
@@ -1990,10 +2119,15 @@ def _continental_crust_candidate(
     latitude_weight = np.cos(np.radians(grid.latitude_degrees[:, 0]))[:, None]
     field = potential_grid.astype(np.float32)
     level = _weighted_level(field, latitude_weight, recipe.land_fraction)
+    field, construction = _condition_continental_field(
+        field - level, accreted_mask, accreted_potential,
+        latitude_weight, recipe,
+    )
     # Sea-level crust, thermal ocean age and relief must share the same
     # geometry. The uncut accretion mask predates rifting and subsidence;
     # using it here leaves newly opened seas classified as dry continent.
-    return field > level, field, float(level), {
+    return field > 0.0, field, 0.0, {
+        "continentConstruction": {"requestedCount": recipe.continent_count, **construction},
         "macroMarginFeatureCount": macro_margin_feature_count,
         "coastalRiftCount": coastal_rift_count,
         "coastalShelfField": {
@@ -3324,6 +3458,17 @@ def _resize_nearest(values: np.ndarray, height: int, width: int) -> np.ndarray:
     return source[np.ix_(rows, columns)]
 
 
+def _non_polar_seam_land(land: np.ndarray, recipe: PlanetRecipe) -> np.ndarray:
+    """Exclude requested caps that necessarily span every map longitude."""
+    seam_land = np.asarray(land, dtype=bool).copy()
+    latitude = 90.0 - (np.arange(land.shape[0]) + 0.5) * 180.0 / land.shape[0]
+    if recipe.north_polar_continent:
+        seam_land[latitude >= 58.0] = False
+    if recipe.south_polar_continent:
+        seam_land[latitude <= -58.0] = False
+    return seam_land
+
+
 def _ocean_map_seam(land: np.ndarray) -> tuple[int, int]:
     """Return the centre and width of the widest all-ocean meridian corridor."""
 
@@ -3344,7 +3489,7 @@ def _ocean_map_seam(land: np.ndarray) -> tuple[int, int]:
                 best_start = run_start
                 best_length = run_length
             run_start = -1
-    minimum_width = max(2, int(math.ceil(width * 0.025)))
+    minimum_width = max(2, int(math.ceil(width * _MAP_SEAM_FRACTION)))
     if best_start < 0 or best_length < minimum_width:
         raise ValueError(
             "generated planet has no sufficiently wide complete ocean corridor for the map seam"
@@ -4176,13 +4321,28 @@ def generate_planet_surface(recipe: PlanetRecipe) -> ProceduralSurface:
 
     land = relative_m > 0.0
     signed_m = relative_m + sea_level_m
+    # Native relief and shoreline evolution are another constrained layer of
+    # this same construction, not a second random planet. Upsampling the
+    # certified domain preserves cardinal connectivity and ocean separation.
+    # Its area can differ by reference-cell resampling error; quota completion
+    # was certified on the spherical construction grid above.
+    native_feasible_land = _resize_nearest(continental_mask, recipe.height, recipe.width).astype(bool)
+    native_crust_potential = _resize_periodic_float(
+        crust_potential - crust_level, recipe.height, recipe.width,
+    )
+    magnitude = np.maximum(np.abs(native_crust_potential), np.finfo(np.float32).eps)
+    native_feasible_relative = _crust_base_relief(
+        np.where(native_feasible_land, magnitude, -magnitude),
+    ).astype(np.float32)
+    relative_m, native_continent_construction = _condition_continental_field(
+        relative_m, native_feasible_land, native_feasible_relative,
+        latitude_weight, recipe,
+    )
+    land = relative_m > 0.0
+    signed_m = relative_m + sea_level_m
     # Pole-spanning land necessarily touches every longitude in Plate Carree;
     # choose the rectangular seam using the inhabited/non-polar continents.
-    seam_land = land.copy()
-    polar_rows = np.abs(np.degrees(latitude[:, 0])) >= 58.0
-    selected_polar_rows = polar_rows & np.where(latitude[:, 0] >= 0,
-        recipe.north_polar_continent, recipe.south_polar_continent)
-    seam_land[selected_polar_rows] = False
+    seam_land = _non_polar_seam_land(land, recipe)
     seam_column, seam_width = _ocean_map_seam(seam_land)
     longitude_roll = -seam_column
     signed_m = np.roll(signed_m, longitude_roll, axis=1)
@@ -4358,6 +4518,7 @@ def generate_planet_surface(recipe: PlanetRecipe) -> ProceduralSurface:
         "authoredBoundaryCorridorCount": len(boundary_corridors),
         "crustPotentialRange": [float(np.min(crust_potential)), float(np.max(crust_potential))],
         "crustStructureMetrics": dict(crust_structure_metrics),
+        "nativeContinentConstruction": dict(native_continent_construction),
         "reliefDiagnostics": dict(relief_diagnostics),
         "largeLakePolicy": dict(large_lake_diagnostics),
         "fullResolutionRelief": dict(detail_diagnostics),

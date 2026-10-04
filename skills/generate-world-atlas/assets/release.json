@@ -1,11 +1,11 @@
 {
   "repository": "yuuranku/world-atlas-engine",
-  "engineVersion": "1.4.0.dev21",
+  "engineVersion": "1.4.0.dev22",
   "assets": {
     "engine": {
-      "name": "world_atlas_engine-1.4.0.dev21-py3-none-any.whl",
-      "bytes": 1049986,
-      "sha256": "f830e96a5bd82a278f6c18c2c6c602708d77059099ca6accad3f0c52ea0f9c6c"
+      "name": "world_atlas_engine-1.4.0.dev22-py3-none-any.whl",
+      "bytes": 1052713,
+      "sha256": "8c3f0823d26be6b91a7d691e7a585212288e48d172315479e48726215321dda1"
     }
   }
 }
