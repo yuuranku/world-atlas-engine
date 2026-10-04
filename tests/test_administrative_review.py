@@ -37,8 +37,7 @@ class AdministrativeReviewTests(unittest.TestCase):
             politics=SimpleNamespace(state_id=states, states=[SimpleNamespace(identifier=i) for i in (1, 2)]),
             provinces=SimpleNamespace(province_id=provinces, provinces=[
                 SimpleNamespace(identifier=i, state_identifier=1 if i < 3 else 2) for i in (1, 2, 3)]))
-        self.front = SimpleNamespace(countries=SimpleNamespace(owner=states),
-                                    provinces=SimpleNamespace(owner=provinces))
+        self.front = SimpleNamespace(province_id=provinces)
         self.land = shapely.box(0, 0, 64, 32)
         self.labels = np.asarray((1, 2, 3), dtype=np.int32)
         self.parents = np.asarray((0, 1, 1, 2), dtype=np.int32)
@@ -124,8 +123,7 @@ class AdministrativeReviewTests(unittest.TestCase):
     def run_refresh(self, source, target):
         with ExitStack() as stack:
             for name, value in (("society_content_digest", "human"), ("terrain_from_source", object()),
-                ("continuous_land_surface", self.land), ("derive_ecological_sources", object()),
-                ("derive_thematic_layers", object()), ("administrative_source", self.front),
+                ("continuous_land_surface", self.land), ("administrative_source", self.front),
                 ("administrative_paint_coverage", (self.original_faces, self.labels)),
                 ("administrative_display_coverage", self.changed_faces)):
                 stack.enter_context(patch.object(refresh, name, return_value=value))
@@ -202,14 +200,14 @@ class AdministrativeReviewTests(unittest.TestCase):
             self.assertEqual(qa["artifacts"]["political.svg"], (target / "political.svg").stat().st_size)
             self.assertEqual(result["phases"]["schema"], "world-atlas-timing-v2")
 
-    def test_refresh_stops_if_arrival_source_would_change_saved_native_ownership(self):
+    def test_refresh_rejects_a_source_that_differs_from_saved_native_ownership(self):
         owners = self.society.provinces.province_id.copy()
         owners[0, 0] = 2
-        self.front = SimpleNamespace(countries=self.front.countries, provinces=SimpleNamespace(owner=owners))
+        self.front = SimpleNamespace(province_id=owners)
         with tempfile.TemporaryDirectory() as directory:
             source, target = Path(directory) / "source", Path(directory) / "target"
             self.create_source(source)
-            with self.assertRaisesRegex(ValueError, "no longer reproduces"):
+            with self.assertRaisesRegex(ValueError, "must use the saved native ownership"):
                 self.run_refresh(source, target)
             record = json.loads((target / "administrative-refresh.json").read_text(encoding="utf-8"))
             self.assertEqual(record["status"], "failed")

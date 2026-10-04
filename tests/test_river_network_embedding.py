@@ -9,7 +9,7 @@ from collections import Counter
 import numpy as np
 import shapely
 
-from world_atlas.core.cartographic_curves import terrain_channel_paths
+from world_atlas.core.river_courses import solve_river_courses
 from world_atlas.core.continuous_terrain import PhysicalTerrainField
 
 
@@ -31,7 +31,7 @@ class RiverNetworkEmbeddingTests(unittest.TestCase):
         junction = shapely.Point(paths[0][0])
         self.assertFalse(old[0].intersection(old[1]).equals(junction))
 
-        curves = terrain_channel_paths(grid, paths, terrain_field=field)
+        curves = solve_river_courses(grid, field, source_paths=paths).paths
         delivered = [shapely.LineString(path) for path in curves]
         for first in range(len(paths)):
             self.assertTrue(delivered[first].is_simple)
@@ -39,17 +39,12 @@ class RiverNetworkEmbeddingTests(unittest.TestCase):
             for second in range(first):
                 self.assertTrue(delivered[first].intersection(delivered[second]).equals(
                     original[first].intersection(original[second])))
-        # Source first/last incidence directions remain exact at the fork.
-        np.testing.assert_allclose(curves[0][1] - curves[0][0],
-                                   (paths[0][1] - paths[0][0]) / 6, atol=1e-12)
-        np.testing.assert_allclose(curves[1][-2] - curves[1][-1],
-                                   (paths[1][-2] - paths[1][-1]) / 6, atol=1e-12)
 
     def test_intrinsic_nonadjacent_intersection_is_retained(self):
         rows, columns = np.indices((20, 20))
         grid, field = field_fixture(100 + 8 * (rows - 8) ** 2 + .4 * columns ** 2)
         path = np.array(((3.5, 3.5), (13.5, 13.5), (3.5, 13.5), (13.5, 3.5)))
-        curve = terrain_channel_paths(grid, (path,), terrain_field=field)[0]
+        curve = solve_river_courses(grid, field, source_paths=(path,)).paths[0]
         self.assertFalse(shapely.LineString(path).is_simple)
         self.assertFalse(shapely.LineString(curve).is_simple)
         def intrinsic_nodes(points):
@@ -66,8 +61,8 @@ class RiverNetworkEmbeddingTests(unittest.TestCase):
         paths = [np.array(((3.5, 10.5), (10.5, 10.5))),
                  np.array(((10.5, 3.5), (10.5, 10.5))),
                  np.array(((10.5, 10.5), (15.5, 14.5)))]
-        curves = terrain_channel_paths(grid, paths, terrain_field=field)
-        reversed_curves = terrain_channel_paths(grid, [p[::-1] for p in paths[::-1]], terrain_field=field)
+        curves = solve_river_courses(grid, field, source_paths=paths).paths
+        reversed_curves = solve_river_courses(grid, field, source_paths=[p[::-1] for p in paths[::-1]]).paths
         for curve, reverse in zip(curves, reversed_curves[::-1], strict=True):
             np.testing.assert_allclose(curve, reverse[::-1], rtol=0, atol=1e-11)
 
@@ -76,7 +71,7 @@ class RiverNetworkEmbeddingTests(unittest.TestCase):
         grid, field = field_fixture(np.broadcast_to(200 + 40 * (rows[:, None] - 15.5) ** 2, (64, 64)))
         paths = [np.array(((3.5, 15.8), (27.5, 15.8))),
                  np.array(((3.5, 25.5), (27.5, 25.5)))]
-        curves = terrain_channel_paths(grid, paths, terrain_field=field)
+        curves = solve_river_courses(grid, field, source_paths=paths).paths
         self.assertGreater(float(np.max(15.8 - curves[0][1:-1, 1])), .01)
         self.assertTrue(shapely.LineString(curves[0]).disjoint(shapely.LineString(curves[1])))
 

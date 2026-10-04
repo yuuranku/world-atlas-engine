@@ -408,14 +408,17 @@ def _curved_transport_points(points, mode, land_geometry, river_geometry, *, gra
     return result[np.r_[True, np.any(np.diff(result, axis=0)!=0.,axis=1)]]
 
 
-def _road_native_corridor(grid, points, land_surface, *, endpoint_access):
+def _road_native_corridor(grid, points, land_surface, *, endpoint_access, bank_allowance=.25):
     """Reconstruct the cells admitted by the original wrapped D8 road walk.
 
     Source path compression removes intermediate centre stations. An ink
     buffer around that compressed chord is not the native navigable domain.
     Diagonal steps require both orthogonal land cells in the source router;
     retain that same corner access before clipping by actual physical ground.
-    These cells constrain path finding only and are never painted as boxes.
+    The baseline quarter-cell bank allowance admits subcell shoreline placement.
+    The consumer adds the measured movement and width of nearby real channels.
+    Actual dry polygons and recorded bridge portals constrain every passage.
+    This domain is never painted as boxes.
     """
     from .society.transport import _path_cells
     def walk_cells(walk):
@@ -442,26 +445,19 @@ def _road_native_corridor(grid, points, land_surface, *, endpoint_access):
         raise ValueError("an accepted road has no native land corridor")
     rows,columns=np.asarray(cells).T
     boxes=shapely.box(columns,rows,columns+1,rows+1)
-    return shapely.intersection(shapely.coverage_union_all(boxes),land_surface)
+    support=shapely.coverage_union_all(boxes).buffer(bank_allowance,join_style='mitre')
+    return shapely.intersection(support,land_surface)
 
 
 def _dry_bank_navigation_surface(corridor, channel_geometry):
-    """Reserve only numerical clearance on the dry side of the real channel.
+    """Keep real bank coordinates in the accepted native dry surface.
 
-    Overlay noding can place a bank vertex a few ulps inside water. Bridge
-    decks and the final crossing audit keep the original physical channel.
+    An ulp-scale buffer of a continental channel can trigger GEOS's internal
+    precision reduction and move otherwise exact banks into physical water.
+    Use the actual difference; bridge approach and final bank certificates
+    classify representable boundary limits without changing the channel.
     """
-    free = corridor.difference(channel_geometry)
-    coordinates = shapely.get_coordinates(free)
-    if not len(coordinates):
-        return free
-    points = shapely.points(coordinates)
-    inside = shapely.contains(channel_geometry, points)
-    drift = float(np.max(shapely.distance(points[inside], channel_geometry.boundary), initial=0.))
-    scale = max(1., float(np.max(np.abs(shapely.get_coordinates(channel_geometry)))))
-    clearance = max(32 * float(np.spacing(scale)), 2 * drift)
-    obstacle = channel_geometry.buffer(clearance, join_style="mitre")
-    return corridor.difference(obstacle)
+    return corridor.difference(channel_geometry)
 
 
 def _bank_route(points, channel_geometry, passages, corridor):
@@ -605,6 +601,42 @@ def _facility_decks(point, river, channel):
         end=max(span,key=lambda coordinates:np.dot(np.asarray(coordinates)-np.asarray(point.coords[0]),direction))
         decks.append(shapely.LineString((point.coords[0],end)))
     return tuple(decks)
+
+
+def _grounded_facility_station(native, reach, river, channel, land_surface, *, native_support, licensed_roads):
+    """Keep a licensed crossing on its reach and attach both banks to land.
+
+    Nearest projection can put a crossing just inside a river outlet, where
+    one transverse bank is actually the lake or sea shore. Select the nearest
+    crossing of that same course and its licensed roads with land beyond each
+    bank, within the recorded native facility's physical support. Isolated
+    bank spits cannot replace the original road's crossing. No channel or
+    crossing is added.
+    """
+    projected=reach.interpolate(reach.project(native))
+    intersections=shapely.get_parts(reach.intersection(licensed_roads))
+    candidates=[projected,*[point for point in intersections if point.geom_type=='Point']]
+    for point in sorted(candidates,key=native.distance):
+        if not native_support.covers(point) or not channel.covers(point):
+            continue
+        decks=_facility_decks(point,river,channel)
+        supported=True
+        for deck in decks:
+            centre,bank=np.asarray(deck.coords)
+            direction=bank-centre
+            length=np.linalg.norm(direction)
+            if length==0.:
+                supported=False
+                break
+            direction/=length
+            clearance=64*float(np.spacing(max(1.,float(np.max(np.abs(bank))))))
+            approach=shapely.LineString((bank,bank+direction*clearance))
+            if not land_surface.covers(approach):
+                supported=False
+                break
+        if supported:
+            return point,decks
+    raise ValueError("a licensed crossing has no physical station with dry land beyond its banks")
 
 
 def _bank_deck(direction, native, point, source_parts, display_parts, decks):
@@ -784,6 +816,16 @@ def prepare_transport_geometry(grid, routes, bridges, *, locations, land_surface
     if len(source_parts) != len(display_parts):
         raise ValueError("source and displayed river reaches must have shared identities")
     source_index, display_index = shapely.STRtree(source_parts), shapely.STRtree(display_parts)
+    # Matching reach identities bound how far a raster bank can move when its
+    # continuous valley course is solved. Include the real channel half-width;
+    # widening this navigation domain never opens water or authorizes a bridge.
+    reach_displacements=shapely.hausdorff_distance(source_parts,display_parts)
+    channel_points=shapely.points(shapely.get_coordinates(river_channel_geometry))
+    if len(channel_points):
+        _matches,channel_distances=display_index.query_nearest(channel_points,return_distance=True)
+        channel_radius=float(np.max(channel_distances,initial=0.))
+    else:
+        channel_radius=0.
     channel_parts=shapely.get_parts(river_channel_geometry)
     channel_index=shapely.STRtree(channel_parts)
     def crossing_channel(point):
@@ -832,9 +874,15 @@ def prepare_transport_geometry(grid, routes, bridges, *, locations, land_surface
         # select a neighbouring bend, and therefore the wrong bank portal.
         reach=min(_parts(physical),key=native.distance)
         point=reach.interpolate(reach.project(native))
-        position = (float(point.x),float(point.y))
         local_channel=crossing_channel(point)
-        bridge_decks=_facility_decks(point,physical,local_channel)
+        movement=float(np.max(reach_displacements[reaches],initial=0.))
+        native_support=shapely.box(cell[1],cell[0],cell[1]+1,cell[0]+1).buffer(movement+channel_radius)
+        licensed_roads=shapely.union_all([min((shapely.LineString(part)for part in
+            _split_seam(member.path,grid.shape[1])),key=member_point.distance)
+            for member,member_point,_cell,_order in entries])
+        point,bridge_decks=_grounded_facility_station(native,reach,physical,local_channel,land_surface,
+            native_support=native_support,licensed_roads=licensed_roads)
+        position = (float(point.x),float(point.y))
         facilities.append(record)
         positions[record.identifier] = position
         decks[record.identifier]=[]
@@ -881,6 +929,7 @@ def prepare_transport_geometry(grid, routes, bridges, *, locations, land_surface
     opening_parts=[deck.buffer(1e-8,cap_style="square")
                    for group in (*decks.values(),*access_spans.values())for deck in group]
     openings=shapely.union_all(opening_parts)
+    engineering.bind_bridge_decks(decks,terrain_field=terrain_field)
     road_surface=land_surface.difference(river_channel_geometry).union(openings)
     native_routes={route.identifier:route for route in routes}
     prepared_routes = []
@@ -909,6 +958,10 @@ def prepare_transport_geometry(grid, routes, bridges, *, locations, land_surface
                     passages.append((distance,passage))
             try:
                 corridor=_road_native_corridor(grid,points,land_surface,endpoint_access=endpoint_access)
+                nearby=np.union1d(source_index.query(corridor),display_index.query(corridor))
+                movement=float(np.max(reach_displacements[nearby],initial=0.))
+                corridor=_road_native_corridor(grid,points,land_surface,
+                    endpoint_access=endpoint_access,bank_allowance=.25+movement+channel_radius)
                 local_channel=shapely.union_all(channel_parts[channel_index.query(corridor,predicate="intersects")])
                 banked = _bank_route(points,local_channel,passages,corridor)
             except ValueError as error:
@@ -930,7 +983,11 @@ def prepare_transport_geometry(grid, routes, bridges, *, locations, land_surface
                       grade_check=grade_check,engineer_path=engineer_path))
     lines = [shapely.LineString(points) for mode,_importance,points in paths if mode in {"road","rail"}]
     network = shapely.union_all(lines)
-    water_roads=network.intersection(river_channel_geometry).difference(river_channel_geometry.boundary)
+    # Audit the actual rendered chains before network overlay. Noding a whole
+    # near-bank network against a continental channel can create long overlay
+    # fragments several ulps outside the channel even though each chain is dry.
+    water_roads=shapely.union_all([line.intersection(river_channel_geometry).difference(
+        river_channel_geometry.boundary) for line in lines])
     unlicensed_water=water_roads.difference(openings)
     bank_roundoff=_bank_boundary_roundoff(unlicensed_water,river_channel_geometry)
     # A second GEOS difference of floating-point collinear sublines can

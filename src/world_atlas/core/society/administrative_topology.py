@@ -52,6 +52,7 @@ def reconcile_partition_components(
     maritime_routes=(),
     settlements=(),
     prefer_local_seats: bool = False,
+    institutional_seats: Mapping[tuple[int, int], int] | None = None,
 ) -> np.ndarray:
     """Join inland fragments to a rooted neighbour, or retain them as frontier.
 
@@ -90,6 +91,10 @@ def reconcile_partition_components(
         local_seat_land = component_land[core_component[core_component >= 0]]
         remote &= ~np.isin(component_land, local_seat_land)
     rooted = (np.arange(count) == owner_core) | remote
+    for cell, owner in (institutional_seats or {}).items():
+        if int(result[cell]) != owner:
+            raise ValueError("local institutional seat must remain owned by its state")
+        rooted[component_grid[cell]] = True
     supported, _evidence = maritime_component_support(
         component_grid, component_owner, core_component, settlements, maritime_routes,
     )

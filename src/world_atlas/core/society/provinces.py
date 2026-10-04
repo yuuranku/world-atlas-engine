@@ -1053,252 +1053,38 @@ def _province_name(
     raise ValueError("unable to resolve province-name collision")
 
 
-def derive_provinces(
-    grid: WorldGrid,
-    thematic: ThematicLayers,
-    population: PopulationLayers,
-    settlements: Sequence[Settlement],
-    transport: TransportLayers,
-    cultures: CultureLayers,
-    politics: PoliticalLayers,
-) -> ProvinceLayers:
-    """Partition each country around city cores without crossing its border."""
+def _province_growth_scale(local_density_ratio, function, rank):
+    """Use population workload and the recorded institutional role for reach."""
+    density_growth = float(
+        np.clip(max(local_density_ratio, 1.0e-6) ** -0.28, 0.62, 1.62)
+    )
+    function_growth = {
+        "capital": 0.86,
+        "civil": 0.90,
+        "civic": 0.88,
+        "maritime": 0.98,
+        "vassal": {
+            "duchy": 1.16,
+            "county": 1.06,
+            "viscounty": 0.96,
+            "barony": 0.88,
+        }.get(rank, 1.0),
+        "crown": 0.94,
+        "military": 1.12,
+        "frontier": 1.28,
+        "pastoral": 1.32,
+    }[function]
+    return float(np.clip(density_growth * function_growth, 0.48, 2.15))
 
-    if politics.state_id.shape != grid.shape:
-        raise ValueError("political layers must match the WorldGrid shape")
-    if population.population_weight.shape != grid.shape:
-        raise ValueError("population layers must match the WorldGrid shape")
-    if transport.accessibility.shape != grid.shape:
-        raise ValueError("transport layers must match the WorldGrid shape")
-    state_id = np.asarray(politics.state_id, dtype=np.int16)
+
+def _allocate_province_territories(grid, thematic, population, settlements, transport,
+                                   state_id, province_specs):
+    """Partition the shared physical control graph using fixed province seats."""
+    state_id = np.asarray(state_id, dtype=np.int16)
     controlled = state_id > 0
-    result = np.where(grid.water == 0, 0, -1).astype(np.int32)
-    if not np.any(controlled) or not politics.states:
-        return ProvinceLayers(province_id=result, provinces=())
-
-    controlled_area = int(np.count_nonzero(controlled))
-    population_weight = np.asarray(population.population_weight, dtype=np.float64)
-    density_field = population_density(grid, population)
-    cell_areas = cell_areas_km2(grid)
-    midpoint_population = (population.population_min + population.population_max) / 2.0
     accessibility = np.asarray(transport.accessibility, dtype=np.float64)
+    density_field = population_density(grid, population)
     road_corridor, road_junction = road_network_fields(grid.shape, transport.routes)
-    controlled_population = float(np.sum(population_weight[controlled]))
-    world_controlled_density = controlled_population * midpoint_population / float(np.sum(cell_areas[controlled]))
-    province_specs: list[_ProvinceSeed] = []
-    settlement_by_identifier = {item.identifier: item for item in settlements}
-    civilization_by_identifier = {
-        item.identifier: item for item in cultures.civilizations
-    }
-    government_by_identifier = {
-        item.identifier: item for item in politics.government_forms
-    }
-    entity_by_state = {
-        item.country_identifier: item for item in politics.political_entities
-    }
-    state_areas: dict[int, float] = {}
-    density_ratios: dict[int, float] = {}
-    administrative_systems: dict[int, str] = {}
-    candidates_by_state: dict[int, list[Settlement]] = {}
-    candidate_counts: dict[int, int] = {}
-    for state in politics.states:
-        state_region = state_id == state.identifier
-        area = int(np.count_nonzero(state_region))
-        if area <= 0:
-            continue
-        entity = entity_by_state.get(state.identifier)
-        if entity is None:
-            raise ValueError("province parent country requires a political entity")
-        government = government_by_identifier.get(entity.government_form_identifier)
-        if government is None:
-            raise ValueError("province parent country requires a government form")
-        candidates = _province_core_candidates(
-            state.identifier, state.core_settlement_id, settlements, state_id,
-        )
-        if not candidates:
-            core = settlement_by_identifier.get(state.core_settlement_id)
-            if core is None:
-                raise ValueError("province parent country requires a real capital")
-            candidates = [core]
-        state_areas[state.identifier] = float(np.sum(cell_areas[state_region]))
-        density_ratios[state.identifier] = (
-            float(np.sum(population_weight[state_region])) * midpoint_population / state_areas[state.identifier]
-            / max(world_controlled_density, 1.0e-12)
-        )
-        administrative_systems[state.identifier] = _administrative_system(government.key)
-        candidates_by_state[state.identifier] = candidates
-        candidate_counts[state.identifier] = max(1, sum(item.tier != "site" for item in candidates))
-    core_targets = _province_core_targets(
-        state_areas, density_ratios, administrative_systems, candidate_counts,
-    )
-    target_area = max(48.0, controlled_area / max(1, sum(core_targets.values())))
-    route_group_by_identifier = _major_route_groups(
-        settlements,
-        transport,
-        state_id,
-    )
-    used_names = {item.name for item in settlements}
-    used_names.update(item.name for item in politics.states)
-    used_names.update(item.formal_name for item in politics.political_entities)
-    next_identifier = 1
-    for state in politics.states:
-        state_region = state_id == state.identifier
-        state_area = int(np.count_nonzero(state_region))
-        if state_area <= 0:
-            continue
-        entity = entity_by_state.get(state.identifier)
-        if entity is None:
-            raise ValueError("province parent country requires a political entity")
-        government = government_by_identifier.get(entity.government_form_identifier)
-        if government is None:
-            raise ValueError("province parent country requires a government form")
-        administrative_system = administrative_systems[state.identifier]
-        candidates = candidates_by_state[state.identifier]
-        density_ratio = density_ratios[state.identifier]
-        desired = core_targets[state.identifier]
-
-        component_id, component_sizes = connected_components(state_region)
-        capital = settlement_by_identifier.get(state.core_settlement_id)
-        capital_component = (
-            int(component_id[capital.row, capital.column])
-            if capital is not None
-            else 0
-        )
-        capital_route_group = route_group_by_identifier.get(
-            state.core_settlement_id
-        )
-        minimum_independent_component = min(
-            128,
-            max(16, int(round(state_area * 0.004))),
-        )
-        required_identifiers: set[str] = set()
-        for component_identifier, component_size in enumerate(
-            component_sizes,
-            start=1,
-        ):
-            if (
-                component_identifier == capital_component
-                or component_size < minimum_independent_component
-            ):
-                continue
-            component_candidates = [
-                item
-                for item in candidates
-                if int(component_id[item.row, item.column]) == component_identifier
-            ]
-            if not component_candidates:
-                continue
-            route_connected = capital_route_group is not None and any(
-                route_group_by_identifier.get(item.identifier)
-                == capital_route_group
-                for item in component_candidates
-            )
-            if not route_connected:
-                required_identifiers.add(component_candidates[0].identifier)
-        desired = max(desired, 1 + len(required_identifiers))
-        state_access = float(np.mean(accessibility[state_region]))
-        service_radius = (
-            math.sqrt(target_area / math.pi)
-            * 1.38
-            * float(np.clip(0.88 + 0.72 * state_access, 0.88, 1.42))
-            / math.sqrt(
-                _province_density_multiplier(density_ratio)
-                * _institutional_division_multiplier(administrative_system)
-            )
-        )
-        cores = _select_province_cores(
-            candidates,
-            capital_identifier=state.core_settlement_id,
-            count=desired,
-            width=grid.shape[1],
-            route_group_by_identifier=route_group_by_identifier,
-            required_identifiers=frozenset(required_identifiers),
-            service_radius=max(14.0, service_radius),
-        )
-        civilization = civilization_by_identifier.get(state.civilization_identifier)
-        if civilization is None:
-            raise ValueError("province parent country must reference a civilization")
-        local_metrics = {
-            core.identifier: _local_state_metrics(
-                core,
-                state.identifier,
-                state_id,
-                density_field,
-                cell_areas,
-                accessibility,
-            )
-            for core in cores
-        }
-        non_capital = sorted(
-            (core for core in cores if core.identifier != state.core_settlement_id),
-            key=lambda item: (-item.score, item.identifier),
-        )
-        feudal_ordinal = {
-            core.identifier: ordinal
-            for ordinal, core in enumerate(non_capital, start=1)
-        }
-        for core in cores:
-            region_type = _province_region_type(core, grid, thematic)
-            local_density, local_access, border_exposure = local_metrics[core.identifier]
-            function, rank = _province_role(
-                administrative_system=administrative_system,
-                government_key=government.key,
-                core=core,
-                capital_identifier=state.core_settlement_id,
-                region_type=region_type,
-                ordinal=feudal_ordinal.get(core.identifier, 0),
-                non_capital_count=len(non_capital),
-                border_exposure=border_exposure,
-                access=local_access,
-                elevation=float(grid.elevation[core.row, core.column]),
-            )
-            name = _province_name(
-                core,
-                state_identifier=state.identifier,
-                name_family=civilization.name_family,
-                administrative_system=administrative_system,
-                administrative_function=function,
-                administrative_rank=rank,
-                used=used_names,
-            )
-            local_density_ratio = local_density / max(world_controlled_density, 1.0e-12)
-            density_growth = float(
-                np.clip(max(local_density_ratio, 1.0e-6) ** -0.28, 0.62, 1.62)
-            )
-            function_growth = {
-                "capital": 0.86,
-                "civil": 0.90,
-                "civic": 0.88,
-                "maritime": 0.98,
-                "vassal": {
-                    "duchy": 1.16,
-                    "county": 1.06,
-                    "viscounty": 0.96,
-                    "barony": 0.88,
-                }.get(rank, 1.0),
-                "crown": 0.94,
-                "military": 1.12,
-                "frontier": 1.28,
-                "pastoral": 1.32,
-            }[function]
-            province_specs.append(
-                _ProvinceSeed(
-                    identifier=next_identifier,
-                    state_identifier=state.identifier,
-                    core=core,
-                    name=name,
-                    region_type=region_type,
-                    administrative_system=administrative_system,
-                    administrative_function=function,
-                    administrative_rank=rank,
-                    growth_scale=float(np.clip(density_growth * function_growth, 0.48, 2.15)),
-                )
-            )
-            next_identifier += 1
-
-    if not province_specs:
-        return ProvinceLayers(province_id=result, provinces=())
-
     elevation = np.asarray(grid.elevation, dtype=np.float64)
     slope = relative_land_slope(elevation, grid.water == 0)
     neighbor_sum = np.zeros(grid.shape, dtype=np.float64)
@@ -1488,24 +1274,19 @@ def derive_provinces(
         state_id,
         province_specs,
     )
-    result, kept_provinces = _consolidate_tiny_provinces(
-        result,
-        province_state,
-        protected_identifiers=frozenset(
-            spec.identifier
-            for spec in province_specs
-            if spec.administrative_function == "capital"
-        ),
-    )
-    province_specs = tuple(
-        replace(spec, identifier=new_identifier)
-        for new_identifier, old_identifier in enumerate(kept_provinces, start=1)
-        for spec in (province_specs[old_identifier - 1],)
-    )
-
-    result = _repair_inland_province_fragments(result, state_id, province_specs)
     if np.any(controlled & (result <= 0)):
         raise ValueError("every country cell must belong to a province")
+    return result
+
+
+def _province_layers_from_specs(grid, population, state_id, result, province_specs):
+    """Bind fixed identities to their actual parent, area and population workload."""
+    population_weight = np.asarray(population.population_weight, dtype=np.float64)
+    cell_areas = cell_areas_km2(grid)
+    midpoint_population = (population.population_min + population.population_max) / 2.0
+    controlled = np.asarray(state_id) > 0
+    controlled_population = float(np.sum(population_weight[controlled]))
+    world_controlled_density = controlled_population * midpoint_population / float(np.sum(cell_areas[controlled]))
     province_records: list[Province] = []
     for spec in province_specs:
         region = result == spec.identifier
@@ -1538,3 +1319,258 @@ def derive_provinces(
 
 
 __all__ = ["derive_provinces"]
+
+
+def derive_provinces(
+    grid: WorldGrid,
+    thematic: ThematicLayers,
+    population: PopulationLayers,
+    settlements: Sequence[Settlement],
+    transport: TransportLayers,
+    cultures: CultureLayers,
+    politics: PoliticalLayers,
+) -> ProvinceLayers:
+    """Partition each country around city cores without crossing its border."""
+
+    if politics.state_id.shape != grid.shape:
+        raise ValueError("political layers must match the WorldGrid shape")
+    if population.population_weight.shape != grid.shape:
+        raise ValueError("population layers must match the WorldGrid shape")
+    if transport.accessibility.shape != grid.shape:
+        raise ValueError("transport layers must match the WorldGrid shape")
+    state_id = np.asarray(politics.state_id, dtype=np.int16)
+    controlled = state_id > 0
+    result = np.where(grid.water == 0, 0, -1).astype(np.int32)
+    if not np.any(controlled) or not politics.states:
+        return ProvinceLayers(province_id=result, provinces=())
+
+    controlled_area = int(np.count_nonzero(controlled))
+    population_weight = np.asarray(population.population_weight, dtype=np.float64)
+    density_field = population_density(grid, population)
+    cell_areas = cell_areas_km2(grid)
+    midpoint_population = (population.population_min + population.population_max) / 2.0
+    accessibility = np.asarray(transport.accessibility, dtype=np.float64)
+    controlled_population = float(np.sum(population_weight[controlled]))
+    world_controlled_density = controlled_population * midpoint_population / float(np.sum(cell_areas[controlled]))
+    province_specs: list[_ProvinceSeed] = []
+    settlement_by_identifier = {item.identifier: item for item in settlements}
+    civilization_by_identifier = {
+        item.identifier: item for item in cultures.civilizations
+    }
+    government_by_identifier = {
+        item.identifier: item for item in politics.government_forms
+    }
+    entity_by_state = {
+        item.country_identifier: item for item in politics.political_entities
+    }
+    state_areas: dict[int, float] = {}
+    density_ratios: dict[int, float] = {}
+    administrative_systems: dict[int, str] = {}
+    candidates_by_state: dict[int, list[Settlement]] = {}
+    candidate_counts: dict[int, int] = {}
+    for state in politics.states:
+        state_region = state_id == state.identifier
+        area = int(np.count_nonzero(state_region))
+        if area <= 0:
+            continue
+        entity = entity_by_state.get(state.identifier)
+        if entity is None:
+            raise ValueError("province parent country requires a political entity")
+        government = government_by_identifier.get(entity.government_form_identifier)
+        if government is None:
+            raise ValueError("province parent country requires a government form")
+        candidates = _province_core_candidates(
+            state.identifier, state.core_settlement_id, settlements, state_id,
+        )
+        if not candidates:
+            core = settlement_by_identifier.get(state.core_settlement_id)
+            if core is None:
+                raise ValueError("province parent country requires a real capital")
+            candidates = [core]
+        state_areas[state.identifier] = float(np.sum(cell_areas[state_region]))
+        density_ratios[state.identifier] = (
+            float(np.sum(population_weight[state_region])) * midpoint_population / state_areas[state.identifier]
+            / max(world_controlled_density, 1.0e-12)
+        )
+        administrative_systems[state.identifier] = _administrative_system(government.key)
+        candidates_by_state[state.identifier] = candidates
+        candidate_counts[state.identifier] = max(1, sum(item.tier != "site" for item in candidates))
+    core_targets = _province_core_targets(
+        state_areas, density_ratios, administrative_systems, candidate_counts,
+    )
+    target_area = max(48.0, controlled_area / max(1, sum(core_targets.values())))
+    route_group_by_identifier = _major_route_groups(
+        settlements,
+        transport,
+        state_id,
+    )
+    used_names = {item.name for item in settlements}
+    used_names.update(item.name for item in politics.states)
+    used_names.update(item.formal_name for item in politics.political_entities)
+    next_identifier = 1
+    for state in politics.states:
+        state_region = state_id == state.identifier
+        state_area = int(np.count_nonzero(state_region))
+        if state_area <= 0:
+            continue
+        entity = entity_by_state.get(state.identifier)
+        if entity is None:
+            raise ValueError("province parent country requires a political entity")
+        government = government_by_identifier.get(entity.government_form_identifier)
+        if government is None:
+            raise ValueError("province parent country requires a government form")
+        administrative_system = administrative_systems[state.identifier]
+        candidates = candidates_by_state[state.identifier]
+        density_ratio = density_ratios[state.identifier]
+        desired = core_targets[state.identifier]
+
+        component_id, component_sizes = connected_components(state_region)
+        capital = settlement_by_identifier.get(state.core_settlement_id)
+        capital_component = (
+            int(component_id[capital.row, capital.column])
+            if capital is not None
+            else 0
+        )
+        capital_route_group = route_group_by_identifier.get(
+            state.core_settlement_id
+        )
+        minimum_independent_component = min(
+            128,
+            max(16, int(round(state_area * 0.004))),
+        )
+        required_identifiers: set[str] = set()
+        for component_identifier, component_size in enumerate(
+            component_sizes,
+            start=1,
+        ):
+            if (
+                component_identifier == capital_component
+                or component_size < minimum_independent_component
+            ):
+                continue
+            component_candidates = [
+                item
+                for item in candidates
+                if int(component_id[item.row, item.column]) == component_identifier
+            ]
+            if not component_candidates:
+                continue
+            route_connected = capital_route_group is not None and any(
+                route_group_by_identifier.get(item.identifier)
+                == capital_route_group
+                for item in component_candidates
+            )
+            if not route_connected:
+                required_identifiers.add(component_candidates[0].identifier)
+        desired = max(desired, 1 + len(required_identifiers))
+        state_access = float(np.mean(accessibility[state_region]))
+        service_radius = (
+            math.sqrt(target_area / math.pi)
+            * 1.38
+            * float(np.clip(0.88 + 0.72 * state_access, 0.88, 1.42))
+            / math.sqrt(
+                _province_density_multiplier(density_ratio)
+                * _institutional_division_multiplier(administrative_system)
+            )
+        )
+        cores = _select_province_cores(
+            candidates,
+            capital_identifier=state.core_settlement_id,
+            count=desired,
+            width=grid.shape[1],
+            route_group_by_identifier=route_group_by_identifier,
+            required_identifiers=frozenset(required_identifiers),
+            service_radius=max(14.0, service_radius),
+        )
+        civilization = civilization_by_identifier.get(state.civilization_identifier)
+        if civilization is None:
+            raise ValueError("province parent country must reference a civilization")
+        local_metrics = {
+            core.identifier: _local_state_metrics(
+                core,
+                state.identifier,
+                state_id,
+                density_field,
+                cell_areas,
+                accessibility,
+            )
+            for core in cores
+        }
+        non_capital = sorted(
+            (core for core in cores if core.identifier != state.core_settlement_id),
+            key=lambda item: (-item.score, item.identifier),
+        )
+        feudal_ordinal = {
+            core.identifier: ordinal
+            for ordinal, core in enumerate(non_capital, start=1)
+        }
+        for core in cores:
+            region_type = _province_region_type(core, grid, thematic)
+            local_density, local_access, border_exposure = local_metrics[core.identifier]
+            function, rank = _province_role(
+                administrative_system=administrative_system,
+                government_key=government.key,
+                core=core,
+                capital_identifier=state.core_settlement_id,
+                region_type=region_type,
+                ordinal=feudal_ordinal.get(core.identifier, 0),
+                non_capital_count=len(non_capital),
+                border_exposure=border_exposure,
+                access=local_access,
+                elevation=float(grid.elevation[core.row, core.column]),
+            )
+            name = _province_name(
+                core,
+                state_identifier=state.identifier,
+                name_family=civilization.name_family,
+                administrative_system=administrative_system,
+                administrative_function=function,
+                administrative_rank=rank,
+                used=used_names,
+            )
+            growth_scale = _province_growth_scale(
+                local_density / max(world_controlled_density, 1.0e-12), function, rank,
+            )
+            province_specs.append(
+                _ProvinceSeed(
+                    identifier=next_identifier,
+                    state_identifier=state.identifier,
+                    core=core,
+                    name=name,
+                    region_type=region_type,
+                    administrative_system=administrative_system,
+                    administrative_function=function,
+                    administrative_rank=rank,
+                    growth_scale=growth_scale,
+                )
+            )
+            next_identifier += 1
+
+    if not province_specs:
+        return ProvinceLayers(province_id=result, provinces=())
+
+    result = _allocate_province_territories(
+        grid, thematic, population, settlements, transport, state_id, province_specs,
+    )
+    province_state = np.zeros(len(province_specs) + 1, dtype=np.int16)
+    for spec in province_specs:
+        province_state[spec.identifier] = spec.state_identifier
+    result, kept_provinces = _consolidate_tiny_provinces(
+        result,
+        province_state,
+        protected_identifiers=frozenset(
+            spec.identifier
+            for spec in province_specs
+            if spec.administrative_function == "capital"
+        ),
+    )
+    province_specs = tuple(
+        replace(spec, identifier=new_identifier)
+        for new_identifier, old_identifier in enumerate(kept_provinces, start=1)
+        for spec in (province_specs[old_identifier - 1],)
+    )
+
+    result = _repair_inland_province_fragments(result, state_id, province_specs)
+    if np.any(controlled & (result <= 0)):
+        raise ValueError("every country cell must belong to a province")
+    return _province_layers_from_specs(grid, population, state_id, result, province_specs)

@@ -18,6 +18,41 @@ _HEADINGS = tuple((dy, dx) for dy in range(-4, 5) for dx in range(-4, 5)
                   if (dy or dx) and math.gcd(abs(dy), abs(dx)) == 1)
 
 
+def _anchor_connectors(point, xs, ys, allowed, domain, engineering, terrain_field, resolution):
+    """Connect a bank anchor through actual corners omitted by the lattice."""
+    vertices = shapely.get_coordinates(domain.boundary)
+    vertices = np.unique(vertices[np.linalg.norm(vertices-point, axis=1) <= 4/resolution], axis=0)
+    result = {}
+    for vertex in vertices:
+        first_leg = np.asarray((point, vertex))
+        if not domain.covers(shapely.LineString(first_leg)):
+            continue
+        _, _, first_lengths, first_grade = engineering.profile(first_leg, terrain_field=terrain_field)
+        if np.max(np.abs(first_grade), initial=0.) > engineering.maximum_grade:
+            continue
+        first_cost = float(np.sum(first_lengths*(1+4*(first_grade/engineering.preferred_grade)**2)))
+        row, col = int(np.searchsorted(ys, vertex[1])), int(np.searchsorted(xs, vertex[0]))
+        rows, cols = np.meshgrid(np.arange(max(0,row-4), min(len(ys),row+5)),
+                                np.arange(max(0,col-4), min(len(xs),col+5)), indexing='ij')
+        nodes = np.column_stack((rows.ravel(), cols.ravel()))
+        nodes = nodes[allowed[nodes[:,0], nodes[:,1]]]
+        targets = np.column_stack((xs[nodes[:,1]], ys[nodes[:,0]]))
+        legs = shapely.linestrings(np.stack((np.repeat(vertex[None,:], len(targets), axis=0), targets), axis=1))
+        matches = np.flatnonzero(shapely.covers(domain, legs))
+        for index in matches:
+            target = targets[index]
+            _, _, lengths, grade = engineering.profile((vertex,target), terrain_field=terrain_field)
+            if np.max(np.abs(grade), initial=0.) > engineering.maximum_grade:
+                continue
+            cost = first_cost+float(np.sum(lengths*(1+4*(grade/engineering.preferred_grade)**2)))
+            node = tuple(nodes[index])
+            if cost < result.get(node, (math.inf,None))[0]:
+                chain = np.asarray((point,vertex,target))
+                chain = chain[np.r_[True, np.any(np.diff(chain,axis=0)!=0.,axis=1)]]
+                result[node] = (cost,chain)
+    return result
+
+
 def _route(first, last, domain, engineering, terrain_field, *, margin, resolution):
     shape = engineering.elevation_m.shape
     west, north = np.minimum(first, last)-margin
@@ -27,7 +62,8 @@ def _route(first, last, domain, engineering, terrain_field, *, margin, resolutio
     xs = np.unique(np.r_[np.arange(west, east, 1/resolution), east, first[0], last[0]])
     ys = np.unique(np.r_[np.arange(north, south, 1/resolution), south, first[1], last[1]])
     xx, yy = np.meshgrid(xs, ys)
-    z = terrain_field.sample_points(xx.ravel(), yy.ravel()).reshape(xx.shape)
+    z = engineering.surface_heights(np.column_stack((xx.ravel(), yy.ravel())),
+                                   terrain_field=terrain_field).reshape(xx.shape)
     allowed = shapely.intersects_xy(domain, xx, yy) & (z > 0)
     start = (int(np.searchsorted(ys, first[1])), int(np.searchsorted(xs, first[0])))
     goal = (int(np.searchsorted(ys, last[1])), int(np.searchsorted(xs, last[0])))
@@ -60,37 +96,98 @@ def _route(first, last, domain, engineering, terrain_field, *, margin, resolutio
         # A small margin leaves room for continuous-field verification.
         valid &= peak <= engineering.maximum_grade*.97
         costs[..., k] = np.where(valid, distance*(1+4*integral), np.inf)
-    distances = {start: 0.}
-    previous = {}
-    queue = [(0., 0., start)]
-    closed = set()
     def heuristic(node):
         return float(segment_lengths_km([(xs[node[1]], ys[node[0]]), last], shape, engineering.radius_km)[0])
-    while queue:
-        _, cost, node = heapq.heappop(queue)
-        if node in closed:
-            continue
-        if node == goal:
-            chain = [node]
-            while chain[-1] != start:
-                chain.append(previous[chain[-1]])
-            return np.asarray([(xs[c], ys[r]) for r, c in reversed(chain)])
-        closed.add(node)
-        for k, (dy, dx) in enumerate(_HEADINGS):
-            edge = float(costs[node[0], node[1], k])
-            if not math.isfinite(edge):
+    heading_indices = {heading: index for index, heading in enumerate(_HEADINGS)}
+    verified_edges = set()
+    extra_edges = {}
+    augmented = False
+    # The raster heights estimate search cost, but a narrow bank or ridge can
+    # have a steeper continuous profile than their bilinear interpolation.
+    # Reject those actual edges and search the same graph again, rather than
+    # discarding every alternative after the first infeasible candidate.
+    while True:
+        extra_neighbours = {}
+        for (source,target), (edge,edge_points) in extra_edges.items():
+            extra_neighbours.setdefault(source,[]).append((target,edge,edge_points))
+        distances = {start: 0.}
+        previous = {}
+        queue = [(0., 0., start)]
+        closed = set()
+        while queue:
+            _, cost, node = heapq.heappop(queue)
+            if node in closed:
                 continue
-            target = (node[0]+dy, node[1]+dx)
-            proposed = cost+edge
-            if proposed >= distances.get(target, math.inf):
-                continue
-            line = shapely.LineString(((xs[node[1]], ys[node[0]]), (xs[target[1]], ys[target[0]])))
-            if not domain.covers(line):
-                continue
-            distances[target] = proposed
-            previous[target] = node
-            heapq.heappush(queue, (proposed+heuristic(target), proposed, target))
-    return None
+            if node == goal:
+                chain = []
+                while node != start:
+                    before, edge_points = previous[node]
+                    chain.append((before,node,edge_points))
+                    node = before
+                chain.reverse()
+                pieces = [edge_points if edge_points is not None else np.asarray(
+                    ((xs[a[1]],ys[a[0]]),(xs[b[1]],ys[b[0]]))) for a,b,edge_points in chain]
+                proposal = np.vstack([*(piece[:-1] for piece in pieces), last])
+                _, _, _, grade = engineering.profile(proposal, terrain_field=terrain_field)
+                if np.max(np.abs(grade), initial=0.) <= engineering.maximum_grade:
+                    return proposal
+                blocked = False
+                for (first_node,last_node,edge_points), piece in zip(chain,pieces,strict=True):
+                    key = (tuple(sorted((first_node,last_node))), edge_points is not None)
+                    if key in verified_edges:
+                        continue
+                    _, _, _, grade = engineering.profile(piece, terrain_field=terrain_field)
+                    if np.max(np.abs(grade), initial=0.) <= engineering.maximum_grade:
+                        verified_edges.add(key)
+                        continue
+                    if edge_points is not None:
+                        del extra_edges[first_node,last_node]
+                    else:
+                        direction = (last_node[0]-first_node[0], last_node[1]-first_node[1])
+                        reverse = (-direction[0], -direction[1])
+                        costs[first_node[0], first_node[1], heading_indices[direction]] = np.inf
+                        costs[last_node[0], last_node[1], heading_indices[reverse]] = np.inf
+                    blocked = True
+                if not blocked:
+                    return proposal
+                break
+            closed.add(node)
+            for k, (dy, dx) in enumerate(_HEADINGS):
+                edge = float(costs[node[0], node[1], k])
+                if not math.isfinite(edge):
+                    continue
+                target = (node[0]+dy, node[1]+dx)
+                proposed = cost+edge
+                if proposed >= distances.get(target, math.inf):
+                    continue
+                line = shapely.LineString(((xs[node[1]], ys[node[0]]), (xs[target[1]], ys[target[0]])))
+                if not domain.covers(line):
+                    continue
+                distances[target] = proposed
+                previous[target] = (node,None)
+                heapq.heappush(queue, (proposed+heuristic(target), proposed, target))
+            for target,edge,edge_points in extra_neighbours.get(node,()):
+                proposed = cost+edge
+                if proposed >= distances.get(target, math.inf):
+                    continue
+                distances[target] = proposed
+                previous[target] = (node,edge_points)
+                heapq.heappush(queue, (proposed+heuristic(target), proposed, target))
+        else:
+            if augmented:
+                return None
+            # Only an exhausted lattice needs corner connectors. This keeps
+            # ordinary hillside searches unchanged while retaining narrow
+            # constructible bank approaches at their exact physical anchors.
+            augmented = True
+            for node, edge in _anchor_connectors(first,xs,ys,allowed,domain,engineering,terrain_field,resolution).items():
+                if node != start:
+                    extra_edges[start,node] = edge
+            for node, (cost,points) in _anchor_connectors(last,xs,ys,allowed,domain,engineering,terrain_field,resolution).items():
+                if node != goal:
+                    extra_edges[node,goal] = (cost,points[::-1])
+            if not extra_edges:
+                return None
 
 
 def engineer_mountain_path(points, engineering, *, terrain_field, road_surface):

@@ -45,7 +45,6 @@ from ..timing import measure_stage
 from .governance_render import write_governance_overlay
 from .presentation import society_content_digest
 from .cartographic_symbols import LANDFORM_STYLES, SITE_MARKS, symbol_definitions
-from .cartographic_curves import terrain_channel_paths
 from .cartographic_surface import continuous_land_surface
 from .cartographic_tiles import (
     TileFeature, TileLevel, geometry_path_data, write_atlas_tiles, write_city_relief_tiles,
@@ -71,7 +70,6 @@ from .procedural_planet import ProceduralSurface
 from .cartographic_rivers import RIVER_WIDTH_MODEL, river_width_field, river_width_profile, river_channel_surface
 from .coastal_partition import CoastalPartition, extend_coastal_partition, clip_partition_to_surface, enforce_homogeneous_components
 from .transport_geometry import prepare_transport_geometry, river_navigation_attributes, river_navigation_segments
-from .river_network import hydrologic_outlet_targets
 from .thematic import (
     BIOME_BOREAL_FOREST,
     BIOME_COUNT,
@@ -570,7 +568,12 @@ def _terrain_pixels(grid: WorldGrid, *, terrain_field, bathymetry) -> np.ndarray
     land = grid.water == 0
     maritime_water = np.isin(grid.water, (1, 3))
     lake = grid.water == 2
-    physical_elevation = terrain_field.palette_elevation(terrain_field.native_m)
+    ground = np.empty(grid.shape, dtype=float)
+    x = np.arange(grid.shape[1], dtype=float) + .5
+    for north in range(0, grid.shape[0], 32):
+        south = min(north + 32, grid.shape[0])
+        ground[north:south] = terrain_field.sample_rect(x, np.arange(north, south, dtype=float) + .5)
+    physical_elevation = terrain_field.palette_elevation(ground)
     pixels[land] = elevation_palette[elevation_display_indices(physical_elevation[land])]
     if np.any(maritime_water):
         source_depth = np.asarray(bathymetry, dtype=float)
@@ -3045,90 +3048,6 @@ def _svg_group(
     )
 
 
-def _river_paths(grid: WorldGrid, shoreline_paths: Sequence[np.ndarray], *, raw_elevation_m) -> list[np.ndarray]:
-    """Turn flow_to links into edge/reach chains, not cell polygons.
-
-    A reach stops at every indegree junction so each tributary owns the
-    shared confluence point and the downstream reach starts at that point.
-    """
-
-    active = grid.river_order.reshape(-1) > 0
-    if not np.any(active):
-        return []
-    downstream = grid.flow_to.reshape(-1)
-    outlet_targets = hydrologic_outlet_targets(grid, raw_elevation_m)
-    cell_count = active.size
-    indegree = np.zeros(cell_count, dtype=np.int32)
-    for source in np.flatnonzero(active):
-        target = int(downstream[source])
-        if 0 <= target < cell_count and active[target]:
-            indegree[target] += 1
-
-    starts = [int(cell) for cell in np.flatnonzero(active) if indegree[cell] != 1]
-    paths: list[np.ndarray] = []
-    visited_edges: set[tuple[int, int]] = set()
-    shore = shapely.STRtree([shapely.LineString(path) for path in shoreline_paths])
-
-    def water_boundary_point(
-        current: int,
-        target: int,
-    ) -> tuple[float, float] | None:
-        row, column = divmod(current, grid.shape[1])
-        if target < 0 or target >= cell_count:
-            return None
-        water_row, water_column = divmod(target, grid.shape[1])
-        if (grid.water[water_row, water_column] == 0
-                or max(abs(water_row - row), abs(water_column - column)) != 1):
-            return None
-        origin = shapely.Point(column + .5, row + .5)
-        outflow = shapely.LineString((origin.coords[0], (water_column + .5, water_row + .5)))
-        candidates = shore.query(outflow, predicate="intersects")
-        if not len(candidates):
-            raise WorldGridRenderError("native dry-to-wet river outflow must cross the visible shoreline")
-        crossings = shapely.intersection(outflow, shapely.union_all(shore.geometries[candidates]))
-        # The first encountered shore belongs to this river's landward bank.
-        # A nearest projection of the grid midpoint can instead move sideways
-        # onto another cove or the far shore of a narrow inlet.
-        mouth = shapely.shortest_line(origin, crossings)
-        return tuple(mouth.coords[-1])
-
-    def follow(start: int) -> None:
-        points: list[tuple[float, float]] = []
-        current = start
-        while 0 <= current < cell_count and active[current]:
-            row, column = divmod(current, grid.shape[1])
-            points.append((column + 0.5, row + 0.5))
-            target = outlet_targets.get(current, int(downstream[current]))
-            if target < 0 or target >= cell_count or not active[target]:
-                boundary = water_boundary_point(
-                    current,
-                    target,
-                )
-                if boundary is not None:
-                    points.append(boundary)
-                break
-            edge = (current, target)
-            if edge in visited_edges:
-                break
-            visited_edges.add(edge)
-            if indegree[target] != 1:
-                row, column = divmod(target, grid.shape[1])
-                points.append((column + 0.5, row + 0.5))
-                break
-            current = target
-        if len(points) >= 2:
-            paths.append(np.asarray(points, dtype=np.float64))
-
-    for start in starts:
-        follow(start)
-    for remaining in np.flatnonzero(active):
-        source = int(remaining)
-        target = int(downstream[source])
-        if 0 <= target < cell_count and active[target] and (source, target) not in visited_edges:
-            follow(source)
-    return paths
-
-
 def _map_theme_palettes(society: SocietyLayers) -> dict:
     return {
         "climate": _CLIMATE_ZONES, "biome": _BIOME_ZONES, "watershed": _WATERSHED_ZONES,
@@ -4095,10 +4014,26 @@ def _render_transport_stage(output_dir, grid_payload, society, locations, terrai
                             land_surface, river_source_paths, river_paths,
                             river_channel_geometry, raw_elevation_m):
     from .city_harbors import derive_harbors, connect_harbor_routes
+    from .city_ground_locations import refine_city_ground_locations
     from .transport_artifacts import write_transport_sources
 
     grid = WorldGrid(**grid_payload)
     with measure_stage(output_dir, "transport-geometry"):
+        refine_city_ground_locations(grid,society,locations,terrain_field,
+            land_surface=land_surface,
+            river_source_geometry=shapely.MultiLineString(river_source_paths),
+            river_geometry=shapely.MultiLineString(river_paths),
+            river_channel_geometry=river_channel_geometry)
+        (output_dir/'settlement-ground-locations.json').write_text(json.dumps({
+            'schema':'canonical-settlement-ground-locations-v1',
+            'settlementCount':len(society.settlements),
+            'relocations':[{'identifier':city.identifier,
+                'sourceCell':{'row':city.row,'column':city.column},
+                'location':{'row':locations[city.identifier][0],
+                            'column':locations[city.identifier][1]}}
+                for city in society.settlements
+                if locations[city.identifier]!=(city.row+.5,city.column+.5)],
+        },ensure_ascii=False,separators=(',',':'))+'\n',encoding='utf-8')
         harbors = derive_harbors(grid, society, locations, terrain_field,
             road_surface=land_surface.difference(river_channel_geometry), land_surface=land_surface)
         society = replace(society, transport=replace(society.transport,
@@ -4213,9 +4148,10 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
     sea_ice_paths = _surface_outline_paths(sea_ice_fill_paths, grid.shape)
     # A channel's banks use native ground widths. Minimum overview ink is a
     # separate centreline, never a replacement for the river's actual surface.
-    logger.info("Extracting the physical river network")
+    logger.info("Reading the shared continuous river courses and beds")
     with measure_stage(output_dir, "river-network"):
-        river_source_paths = _river_paths(grid, coast_paths, raw_elevation_m=physical_source.relative_elevation_m)
+        river_source_paths = terrain_field.river_source_paths
+        river_paths = terrain_field.river_paths
     river_seasonal_strengths = _river_seasonal_strengths(grid, river_source_paths)
     river_orders = []
     for path in river_source_paths:
@@ -4229,8 +4165,6 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
         }
         for index, strengths in enumerate(river_seasonal_strengths)
     ]
-    with measure_stage(output_dir, "river-centrelines"):
-        river_paths = terrain_channel_paths(grid, river_source_paths, terrain_field=terrain_field)
     wind_overlay, wind_arrow_counts = _wind_arrow_groups(grid)
     graticule_paths, graticule_major_flags, graticule_labels = _graticule_paths(grid)
     elevation_palette, _ = _elevation_palette_for(grid)
@@ -4406,11 +4340,14 @@ def _render_review(grid: WorldGrid, output_dir: str | Path, *, physical_source: 
     from .society.administrations import administrative_source, administrative_paint_coverage
     from .society.administrative_display import administrative_display_coverage
     with measure_stage(output_dir, "administrative-geometry"):
-        administrative_front = administrative_source(grid, thematic, society)
+        administrative_front = administrative_source(grid, society)
         administrative_faces, province_face_ids = administrative_paint_coverage(
             administrative_front, land_mask)
         administrative_faces = administrative_display_coverage(
             administrative_faces, frame_shape=grid.shape)
+        administrative_faces, province_face_ids = enforce_homogeneous_components(
+            administrative_faces, province_face_ids, society.provinces.province_id,
+            land_mask, land_surface)
         administrative_visible_faces, administrative_visible_ids = clip_partition_to_surface(
             administrative_faces, province_face_ids, land_surface)
     administrative_partition = CoastalPartition(administrative_faces, province_face_ids,

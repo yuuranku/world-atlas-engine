@@ -179,6 +179,23 @@ class TerrainRefinementTests(unittest.TestCase):
         self.assertLess(abs(float(field.sample_points(anchor[0],anchor[1]))), 1e-7)
         np.testing.assert_array_equal(grid.flow_to, np.full(raw.shape, -1))
 
+    def test_city_height_range_includes_the_shared_incised_river_bed(self):
+        from world_atlas.core.river_courses import RiverCourses, RiverBedRelief
+        from world_atlas.core.implicit_terrain import terrain_height_range, terrain_level_curves
+        from world_atlas.core.implicit_terrain_bounds import field_range_gradient_bounds
+        _, field = fixture(np.full((24, 48), 1000.))
+        path = np.array(((10.5, 10.5), (12.5, 10.5)))
+        courses = RiverCourses((path,), (path,), (np.array((50., 40.)),), {})
+        grid = SimpleNamespace(shape=(24, 48), discharge=np.full((24, 48), 10.))
+        field._river_bed = RiverBedRelief(courses, grid, radius_km=60.)
+        minimum, maximum = terrain_height_range(field, [[10., 10., 13., 11.]])
+        self.assertLessEqual(minimum, float(field.sample_points(12.5, 10.5)))
+        self.assertGreaterEqual(maximum, 1000.)
+        with self.assertRaisesRegex(ValueError, "do not support the continuous river-bed"):
+            terrain_level_curves(field, [100.])
+        with self.assertRaisesRegex(ValueError, "do not support the continuous river-bed"):
+            field_range_gradient_bounds(field, [[10., 10.]], [[11., 11.]])
+
 
 if __name__ == "__main__":
     unittest.main()

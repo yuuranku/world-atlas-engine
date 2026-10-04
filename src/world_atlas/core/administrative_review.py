@@ -18,8 +18,7 @@ from .cartographic_features import overview_markup
 from .cartographic_generalization import generalize_display_surface
 from .cartographic_surface import continuous_land_surface
 from .cartographic_tiles import refresh_atlas_tile_themes
-from .coastal_partition import clip_partition_to_surface
-from .ecological_sources import derive_ecological_sources
+from .coastal_partition import clip_partition_to_surface, enforce_homogeneous_components
 from .globe_assets import THEME_EXPORT_FILENAMES, globe_theme_documents
 from .governance_render import write_governance_overlay
 from .presentation import society_content_digest
@@ -28,7 +27,6 @@ from .society.administrations import administrative_paint_coverage, administrati
 from .society.administrative_display import administrative_display_coverage
 from .svg_groups import extract_group, replace_group
 from .terrain_refinement import terrain_from_source
-from .thematic import derive_thematic_layers
 
 
 _INK_LAYERS = ("state-boundaries", "province-boundaries", "nominal-realms")
@@ -109,17 +107,16 @@ def refresh_review_administrations(grid, source_dir, target_dir, *, administrati
             with measure_stage(target_dir, "administrative-inputs"):
                 terrain = terrain_from_source(grid, physical_source)
                 land_surface = continuous_land_surface(grid, terrain_field=terrain)
-                thematic = derive_thematic_layers(grid,
-                    ecological_sources=derive_ecological_sources(grid, physical_source))
             with measure_stage(target_dir, "administrative-geometry"):
-                front = administrative_source(grid, thematic, administrative_society)
+                front = administrative_source(grid, administrative_society)
                 land = grid.water == 0
-                for values, owners in ((administrative_society.politics.state_id, front.countries.owner),
-                                       (administrative_society.provinces.province_id, front.provinces.owner)):
-                    if not np.array_equal(values, np.where(land, np.maximum(owners, 0), -1)):
-                        raise ValueError("administrative source no longer reproduces the saved native ownership")
+                if not np.array_equal(administrative_society.provinces.province_id, front.province_id):
+                    raise ValueError("administrative drawing must use the saved native ownership")
                 raw_faces, province_ids = administrative_paint_coverage(front, land)
+                source_province_ids = province_ids.copy()
                 faces = administrative_display_coverage(raw_faces, frame_shape=grid.shape)
+                faces, province_ids = enforce_homogeneous_components(faces, province_ids,
+                    administrative_society.provinces.province_id, land, land_surface)
                 visible_faces, visible_ids = clip_partition_to_surface(faces, province_ids, land_surface)
                 political_zones = render._political_zones(rendered_society)
                 province_zones = render._province_zones(rendered_society)
@@ -151,7 +148,11 @@ def refresh_review_administrations(grid, source_dir, target_dir, *, administrati
                     "provinceFaces": len(faces), "visibleProvinceFaces": len(visible_faces),
                     "sourceCoverageSha256": hashlib.sha256(b"".join(shapely.to_wkb(raw_faces))).hexdigest(),
                     "coverageSha256": hashlib.sha256(geometry_bytes).hexdigest(),
-                    "paintedGeometryChangedCount": int(np.count_nonzero(~shapely.equals(raw_faces, faces))),
+                    "paintedGeometryChangedCount": sum(
+                        not shapely.equals(
+                            shapely.union_all(np.asarray(raw_faces, dtype=object)[source_province_ids == identifier]),
+                            shapely.union_all(np.asarray(faces, dtype=object)[province_ids == identifier]))
+                        for identifier in np.unique(source_province_ids)),
                     "stateBoundaryPaths": len(state_paths), "provinceBoundaryPaths": len(province_paths),
                     "governanceCheck": governance_check,
                 }

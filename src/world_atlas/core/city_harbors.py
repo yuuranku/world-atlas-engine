@@ -5,6 +5,7 @@ import math
 import numpy as np
 import shapely
 from dataclasses import replace
+from .polygon_navigation import PolygonNavigator
 
 
 def derive_harbors(grid, society, locations, terrain_field, *, road_surface, land_surface):
@@ -48,13 +49,58 @@ def derive_harbors(grid, society, locations, terrain_field, *, road_surface, lan
             low_many=np.where(dry,middle,low_many);high_many=np.where(dry,high_many,middle)
         origin=np.array([column,row])
         landings=origin+direction_many*np.maximum(0.,low_many-.07)[:,None]
-        approaches=shapely.linestrings(np.stack((np.broadcast_to(origin,landings.shape),landings),axis=1))
-        reachable=shapely.covers(road_surface,approaches)
+        # The source cell is a coarse site address, not a fixed town centre.
+        # Choose a usable coastal terrace and its dock on the same actual
+        # bank before fixing the canonical display city location.
+        local=road_surface.intersection(shapely.box(
+            column-distances[-1]/column_km,row-distances[-1]/row_km,
+            column+distances[-1]/column_km,row+distances[-1]/row_km))
+        parts=shapely.get_parts(local)
+        parts=np.asarray([part for part in parts if part.geom_type=='Polygon'],dtype=object)
+        banks=shapely.covers(parts[:,None],shapely.points(landings)[None,:])
+        bank_indices=np.argmax(banks,axis=0)
+        reachable=banks.any(axis=0)
         seaward=origin+direction_many*(high_many+.12)[:,None]
         reachable &= ~shapely.covers(sailing_obstacle,shapely.points(seaward))
+        setback=min(2., max(.10, .65*math.sqrt(population/15000)))
+        terraces=np.full_like(landings,np.nan)
+        owner=society.politics.state_id[city.row,city.column]
+        for index in np.flatnonzero(reachable):
+            bank=parts[int(bank_indices[index])]
+            for retreat in (setback,setback*1.25,setback*1.65):
+                candidate=landings[index]-direction_many[index]*retreat
+                cy,cx=int(candidate[1]),int(candidate[0])%grid.shape[1]
+                if not 0<=cy<grid.shape[0]:
+                    continue
+                candidate_owner=society.politics.state_id[cy,cx]
+                coastal_remnant=(candidate_owner<=0 and grid.water[cy,cx]>0 and
+                    abs(cy-city.row)<=1 and abs(cx-city.column)<=1)
+                if candidate_owner!=owner and not coastal_remnant:
+                    continue
+                probe=.05
+                elevations=terrain_field.sample_points(
+                    candidate[0]+np.array([0,probe,-probe,0,0])/column_km,
+                    candidate[1]+np.array([0,0,0,probe,-probe])/row_km)
+                grade=np.hypot(elevations[1]-elevations[2],elevations[3]-elevations[4])/(probe*2000)
+                if np.all(elevations>0) and grade<.10 and bank.covers(
+                        shapely.LineString((candidate,landings[index]))):
+                    terraces[index]=candidate
+                    break
+            # A genuine cliff port can retain its upper town. Its approach
+            # must still fit the local dry bank, including any necessary turn.
+            if not np.isfinite(terraces[index]).all() and bank.covers(shapely.Point(origin)):
+                terraces[index]=origin
+        reachable &= np.isfinite(terraces).all(axis=1)
+        original_banks=shapely.covers(parts,shapely.Point(origin))
+        on_original_bank=original_banks[bank_indices]
+        if np.any(reachable & on_original_bank):
+            # Preserve the bank served by the source city's licensed roads
+            # whenever that bank offers a real coastal terrace of its own.
+            reachable &= on_original_bank
         if not np.any(reachable):
-            raise ValueError(f'{city.identifier}: port has no shore connected to its dry road approach')
+            raise ValueError(f'{city.identifier}: port has no coastal terrace connected to a real shore')
         nearby=reachable & (high_many<=high_many[reachable].min()+harbor_scale*2)
+        terraces,bank_indices=terraces[nearby],bank_indices[nearby]
         options,low_many,high_many,direction_many=(a[nearby] for a in (options,low_many,high_many,direction_many))
         coast_many=origin+direction_many*((low_many+high_many)/2)[:,None]
         probe_angles=angles[options,None]+np.linspace(-np.pi/2,np.pi/2,17)
@@ -79,31 +125,13 @@ def derive_harbors(grid, society, locations, terrain_field, *, road_surface, lan
         coast = origin+direction*(low+high)/2
         shore = origin+direction*max(0., low-.07)
         sea = origin+direction*(high+.12)
-        # Native cells are many kilometres wide. Their edge must not keep an
-        # ordinary port inland: refine its anchor within the same polity, on a
-        # usable coastal terrace. A real cliff can still require an upper town.
-        setback=min(2., max(.10, .65*math.sqrt(population/15000)))
-        centre=origin
-        for retreat in (setback,setback*1.25,setback*1.65):
-            candidate=origin+direction*max(0., low-retreat)
-            cy,cx=int(candidate[1]),int(candidate[0])%grid.shape[1]
-            if not 0<=cy<grid.shape[0]:
-                continue
-            owner=society.politics.state_id[cy,cx]
-            coastal_remnant=owner<=0 and grid.water[cy,cx]>0
-            if owner!=society.politics.state_id[city.row,city.column] and not coastal_remnant:
-                continue
-            probe=.05
-            elevations=terrain_field.sample_points(
-                candidate[0]+np.array([0,probe,-probe,0,0])/column_km,
-                candidate[1]+np.array([0,0,0,probe,-probe])/row_km)
-            grade=np.hypot(elevations[1]-elevations[2],elevations[3]-elevations[4])/(probe*2000)
-            if np.all(elevations>0) and grade<.10:
-                centre=candidate
-                break
+        centre=terraces[choice]
+        bank=parts[int(bank_indices[choice])]
+        access=PolygonNavigator(bank).path(centre,shore)
+        metric=np.array([column_km,row_km])
+        metric_access=shapely.LineString(access*metric)
         locations[city.identifier]=(float(centre[1]),float(centre[0]))
         prefix = city.name[:3]
-        access = [centre, shore]
         result[city.identifier] = {
             'kind': 'lake' if city.site_type == 'lake-port' else 'sea',
             'name': prefix+('湖港' if city.site_type == 'lake-port' else '港'),
@@ -111,7 +139,7 @@ def derive_harbors(grid, society, locations, terrain_field, *, road_surface, lan
             'landPoint': {'column': float(shore[0]), 'row': float(shore[1])},
             'seaPoint': {'column': float(sea[0]), 'row': float(sea[1])},
             'outward': {'x': float(np.cos(angles[index])), 'y': float(np.sin(angles[index]))},
-            'distanceKm': float(np.hypot((shore[0]-centre[0])*column_km, (shore[1]-centre[1])*row_km)),
+            'distanceKm': float(metric_access.length),
             'access': [{'column': float(p[0]), 'row': float(p[1])} for p in access],
             'shorelineElevationMetres': float(terrain_field.sample_points(coast[0], coast[1])),
             'shelter':float(shelter[choice]),

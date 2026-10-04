@@ -18,7 +18,7 @@ from .cartographic_contours import CARTOGRAPHIC_CONTOUR_CONTRACT, cartographic_c
 
 _SCHEMA = "physical-cartographic-height-graphs-v2"
 _CURVE_MODULES = (
-    "continuous_terrain", "continuous_scalar", "continuous_pchip", "hypsometry", "terrain_refinement", "river_network",
+    "continuous_terrain", "continuous_scalar", "continuous_pchip", "hypsometry", "terrain_refinement", "river_network", "river_courses", "cartographic_curves",
     "implicit_terrain", "implicit_terrain_bounds", "implicit_curves",
     "implicit_pchip", "implicit_warp_events", "implicit_river_events",
     "implicit_terrain_parallel", "physical_contour_stage",
@@ -81,6 +81,12 @@ def _refinement_binding(field):
         "riverCoordinates": _array_binding(shapely.get_coordinates(field._rivers.geometries)
                                            if field._rivers is not None else None),
         "riverSupportDistance": _array_binding(field._river_support_distance),
+        "riverBed": None if field._river_bed is None else {
+            "segments": _array_binding(field._river_bed.segments),
+            "owners": _array_binding(field._river_bed.owners),
+            "beds": _array_binding(field._river_bed.beds),
+            "radii": _array_binding(field._river_bed.radii),
+        },
         "anchors": _array_binding(field._anchors.data if field._anchors is not None else None),
     }
 

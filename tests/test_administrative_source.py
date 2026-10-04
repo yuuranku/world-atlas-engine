@@ -6,9 +6,8 @@ import numpy as np
 
 from tests.test_world_identity import _society
 from world_atlas.core.society.administrations import (
-    AdministrativeHierarchy, _apply_administrative_ownership, _travel_simulation,
+    administrative_source, synchronize_administrative_statistics,
 )
-from world_atlas.core.society.administrative_front import AdministrativeFront
 
 
 class AdministrativeSourceTests(unittest.TestCase):
@@ -24,16 +23,16 @@ class AdministrativeSourceTests(unittest.TestCase):
                                    habitability=np.full(grid.shape,.7))
         return grid,thematic,society
 
-    def test_provincial_reach_respects_mapped_minor_river_without_national_language_seam(self):
-        grid,thematic,society = self.fixture()
+    def test_source_uses_formed_observations_without_a_second_territorial_race(self):
+        grid,_,society = self.fixture()
+        first = administrative_source(grid,society)
         grid.river_order[:,2] = 1
-        # Within a single language, a minor river constrains local reach even
-        # when it is not a national frontier. Along-bank travel stays cheap.
-        countries = _travel_simulation(grid,thematic,society)
-        provinces = _travel_simulation(grid,thematic,society,domains=society.politics.state_id)
-        self.assertEqual(float(countries.transition_penalty[4,2,1]),0.)
-        self.assertGreater(float(provinces.transition_penalty[4,2,1]),5.)
-        self.assertEqual(float(provinces.transition_penalty[6,2,2]),0.)
+        grid.elevation[:,2] = .9
+        second = administrative_source(grid,society)
+        np.testing.assert_array_equal(first.province_id,society.provinces.province_id)
+        np.testing.assert_array_equal(first.province_id,second.province_id)
+        self.assertFalse(first.province_id.flags.writeable)
+        self.assertFalse(first.province_to_state.flags.writeable)
 
     def test_native_refresh_updates_provincial_counts_with_same_seats_and_population_source(self):
         grid,_,society = self.fixture()
@@ -46,11 +45,8 @@ class AdministrativeSourceTests(unittest.TestCase):
         society = replace(society,provinces=replace(society.provinces,
                           province_id=old,provinces=records))
         new = old.copy();new[3,:4] = 1
-        front = AdministrativeFront(np.stack((new,np.zeros_like(new))),
-            np.zeros((2,*grid.shape)),np.ones((8,*grid.shape)),
-            np.ones(grid.shape,bool),100.,None,{1:1,2:2,3:1})
-        hierarchy = AdministrativeHierarchy(front,front,np.array((0,1,2,1)))
-        updated = _apply_administrative_ownership(grid,society,hierarchy)
+        updated = synchronize_administrative_statistics(grid,society,
+            state_id=society.politics.state_id,province_id=new)
         np.testing.assert_array_equal(updated.politics.state_id,society.politics.state_id)
         np.testing.assert_array_equal(updated.provinces.province_id,new)
         self.assertEqual([item.area_cells for item in updated.provinces.provinces],[16,24,8])

@@ -79,5 +79,61 @@ class CityHarborTests(unittest.TestCase):
         harbor=derive_harbors(grid,society,locations,terrain,road_surface=dry,
             land_surface=shapely.box(0,0,1.8,grid.shape[0]))['port-city']
         row,column=locations['port-city']
-        self.assertTrue(dry.covers(shapely.LineString(((1.5,3.5),(column,row)))))
+        from world_atlas.core.polygon_navigation import PolygonNavigator
+        relocation=PolygonNavigator(dry).path((1.5,3.5),(column,row))
+        self.assertTrue(dry.covers(shapely.LineString(relocation)))
         self.assertTrue(dry.covers(shapely.LineString([(p['column'],p['row']) for p in harbor['access']])))
+
+    def test_harbor_access_turns_around_river_on_the_same_dry_bank(self):
+        grid,society=_fixture()
+        society=replace(society,settlements=(replace(society.settlements[0],row=3,column=1,
+            site_type='port',population_min=1000,population_max=2000),))
+        terrain=SimpleNamespace(sample_points=lambda x,y:(1.8-np.asarray(x))*100)
+        land=shapely.box(0,0,1.8,grid.shape[0])
+        river=shapely.box(1.6,2.5,1.7,4.5)
+        dry=land.difference(river)
+        harbor=derive_harbors(grid,society,{'port-city':(3.5,1.5)},terrain,
+            road_surface=dry,land_surface=land)['port-city']
+        landing=(harbor['landPoint']['column'],harbor['landPoint']['row'])
+        self.assertFalse(dry.covers(shapely.LineString(((1.5,3.5),landing))))
+        from world_atlas.core.polygon_navigation import PolygonNavigator
+        original_access=PolygonNavigator(dry).path((1.5,3.5),landing)
+        self.assertGreater(len(original_access),2)
+        access=shapely.LineString([(p['column'],p['row']) for p in harbor['access']])
+        self.assertTrue(dry.covers(access))
+
+    def test_coarse_city_cell_refines_to_a_real_coastal_bank(self):
+        grid,society=_fixture()
+        city=replace(society.settlements[0],row=3,column=1,
+            site_type='port',population_min=1000,population_max=2000)
+        society=replace(society,settlements=(city,))
+        terrain=SimpleNamespace(sample_points=lambda x,y:(1.8-np.asarray(x))*100)
+        land=shapely.box(0,0,1.8,grid.shape[0])
+        dry=land.difference(shapely.box(1.6,0,1.7,grid.shape[0]))
+        locations={'port-city':(3.5,1.5)}
+        harbor=derive_harbors(grid,society,locations,terrain,
+            road_surface=dry,land_surface=land)['port-city']
+        row,column=locations['port-city']
+        self.assertTrue(1.7<column<1.8)
+        self.assertEqual((city.row,city.column),(3,1))
+        self.assertTrue(dry.covers(shapely.LineString(
+            [(p['column'],p['row']) for p in harbor['access']])))
+        self.assertEqual((harbor['access'][0]['row'],harbor['access'][0]['column']),(row,column))
+
+    def test_port_keeps_a_coastal_bank_already_served_by_source_roads(self):
+        grid,society=_fixture()
+        city=replace(society.settlements[0],row=3,column=1,
+            site_type='port',population_min=1000,population_max=2000)
+        society=replace(society,settlements=(city,))
+        terrain=SimpleNamespace(sample_points=lambda x,y:np.minimum(
+            1.8-np.asarray(x),4.0-np.asarray(y))*100)
+        land=shapely.box(0,0,1.8,4.)
+        dry=land.difference(shapely.box(1.6,0,1.7,4.))
+        source_bank=next(p for p in shapely.get_parts(dry) if p.covers(shapely.Point(1.5,3.5)))
+        locations={'port-city':(3.5,1.5)}
+        harbor=derive_harbors(grid,society,locations,terrain,
+            road_surface=dry,land_surface=land)['port-city']
+        row,column=locations['port-city']
+        self.assertTrue(source_bank.covers(shapely.Point(column,row)))
+        self.assertTrue(source_bank.covers(shapely.Point(
+            harbor['landPoint']['column'],harbor['landPoint']['row'])))

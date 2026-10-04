@@ -107,14 +107,6 @@ class FrontierSiteIntegrationTests(unittest.TestCase):
             calls.append(("provinces", ()))
             return SimpleNamespace(province_id=politics.state_id)
 
-        def administration(_grid, _thematic, society):
-            # This integration fixture isolates routing and institution order.
-            # The final front consumes the administered port, after provinces.
-            self.assertEqual(int(society.provinces.province_id[town.row, town.column]), 1)
-            self.assertTrue(any(route.mode == 'sea' for route in society.transport.routes))
-            calls.append(('arrival-front', ()))
-            return society, SimpleNamespace()
-
         stubs = {
             "derive_population": lambda *a, **k: population,
             "load_name_lexicon": lambda *a: SimpleNamespace(),
@@ -130,7 +122,6 @@ class FrontierSiteIntegrationTests(unittest.TestCase):
             "promote_border_settlements": lambda *a: a[-1],
             "derive_strategic_sites": strategic,
             "derive_provinces": provinces,
-            "derive_administrations": administration,
             "extract_geographic_features": lambda *a, **k: (),
             "SocietyLayers": lambda **kwargs: SimpleNamespace(**kwargs),
         }
@@ -141,11 +132,12 @@ class FrontierSiteIntegrationTests(unittest.TestCase):
             result = pipeline.derive_society_layers(
                 grid, thematic, "fixture", raw_elevation_m=np.where(grid.water==0, 100., -100.), state_count=1,
             )
-        self.assertEqual([call[0] for call in calls], ["countries", "countries", "final-borders", "provinces", "arrival-front"])
+        self.assertEqual([call[0] for call in calls], ["countries", "countries", "final-borders", "provinces"])
         self.assertEqual(result.settlements, (home, town))
         self.assertTrue(any(route.mode == "sea" and town.identifier in
             (route.source_settlement_id, route.target_settlement_id) for route in result.transport.routes))
         self.assertEqual(int(result.politics.state_id[town.row, town.column]), 1)
+        self.assertIs(result.provinces.province_id, result.politics.state_id)
 
 
 if __name__ == "__main__":

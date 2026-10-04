@@ -9,7 +9,7 @@ import numpy as np
 import shapely
 
 from world_atlas.core.transport_geometry import (
-    _anchor_parts, _bank_boundary_roundoff, _bank_route, _curved_transport_points, _road_native_corridor, river_navigation_attributes, river_navigation_segments, shared_transport_paths,
+    _anchor_parts, _bank_boundary_roundoff, _bank_route, _curved_transport_points, _grounded_facility_station, _road_native_corridor, river_navigation_attributes, river_navigation_segments, shared_transport_paths,
 )
 
 
@@ -20,6 +20,33 @@ def route(identifier, mode, points, importance="regional"):
 class TransportGeometryTests(unittest.TestCase):
     def setUp(self):
         self.grid = SimpleNamespace(shape=(32, 64))
+
+    def test_outlet_crossing_uses_same_reach_station_with_two_real_dry_banks(self):
+        land=shapely.box(0.,0.,10.,5.)
+        river=shapely.LineString(((4.,4.),(5.75,4.75),(6.,5.)))
+        channel=river.buffer(.15).intersection(land)
+        native=shapely.Point(5.99,4.99)
+        original=shapely.LineString(((5.,4.7),(6.,4.7)))
+        point,decks=_grounded_facility_station(native,river,river,channel,land,
+            native_support=shapely.box(5.,4.,6.,5.),licensed_roads=original)
+        self.assertTrue(original.covers(point))
+        self.assertEqual(len(decks),2)
+        self.assertTrue(river.covers(point))
+        for deck in decks:
+            centre,bank=np.asarray(deck.coords)
+            direction=(bank-centre)/np.linalg.norm(bank-centre)
+            self.assertTrue(land.contains(shapely.Point(bank+direction*.001)))
+        with self.assertRaisesRegex(ValueError,'no physical station'):
+            _grounded_facility_station(native,river,river,channel,land,
+                native_support=shapely.box(5.9,4.9,6.,5.),licensed_roads=original)
+
+    def test_grounded_crossing_retains_exact_nearest_physical_station(self):
+        river=shapely.LineString(((2.,4.),(8.,4.)))
+        land=shapely.box(0.,0.,10.,10.)
+        native=shapely.Point(5.,4.1)
+        point,_decks=_grounded_facility_station(native,river,river,river.buffer(.2),land,
+            native_support=shapely.box(4.,3.,6.,5.),licensed_roads=shapely.LineString(((5.,3.),(5.,5.))))
+        self.assertEqual(point.coords[0],(5.,4.))
 
     def test_bridge_connects_to_overlay_bank_without_adding_a_water_crossing(self):
         record=json.loads((Path(__file__).parent/'fixtures/bridge-overlay-bank-dev12.json').read_text())
@@ -72,6 +99,20 @@ class TransportGeometryTests(unittest.TestCase):
             endpoint_access=(((1.5,.5),(3.3,2.3)),))
         self.assertEqual(corridor.geom_type,'Polygon')
         self.assertTrue(corridor.covers(shapely.LineString(points)))
+
+    def test_continuous_bank_can_turn_outside_a_native_cell_edge_without_a_bridge(self):
+        grid=SimpleNamespace(shape=(3,6),water=np.zeros((3,6),dtype=np.uint8))
+        land=shapely.box(0,0,6,3)
+        channel=shapely.box(1.2,.9,1.3,2.1)
+        points=np.array(((.5,1.5),(2.5,1.5)))
+        with self.assertRaisesRegex(ValueError,'disconnected banks'):
+            _bank_route(points,channel,(),shapely.box(0,1,3,2))
+        corridor=_road_native_corridor(grid,points,land,endpoint_access=())
+        path=_bank_route(points,channel,(),corridor)
+        line=shapely.LineString(path)
+        self.assertTrue(land.covers(line))
+        self.assertTrue(line.intersection(channel).difference(channel.boundary).is_empty)
+        np.testing.assert_array_equal(path[[0,-1]],points[[0,-1]])
 
     def test_bank_roundoff_certifies_only_same_edge_binary64_limits(self):
         channel=shapely.box(0.,0.,1.,1.)

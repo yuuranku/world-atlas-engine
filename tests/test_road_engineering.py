@@ -1,5 +1,6 @@
 import unittest
 import numpy as np
+import shapely
 
 from world_atlas.core.road_engineering import RoadEngineering
 from world_atlas.core.society.transport import _least_cost_path
@@ -7,6 +8,30 @@ from world_atlas.core.continuous_terrain import PhysicalTerrainField
 
 
 class RoadEngineeringTests(unittest.TestCase):
+    def test_recorded_bridge_profile_uses_deck_and_keeps_bed_and_adjacent_ground(self):
+        class RiverBed:
+            def sample_points(self,x,y):
+                return 100.-90.*np.exp(-((np.asarray(x)-5.)/.4)**8)
+        field=RiverBed()
+        engine=RoadEngineering(np.ones((16,32)),4,'ancient')
+        deck=(shapely.LineString(((5.,5.),(4.,5.))),shapely.LineString(((5.,5.),(6.,5.))))
+        self.assertGreater(np.max(np.abs(engine.profile(((4.,5.),(6.,5.)),terrain_field=field)[-1])),engine.maximum_grade)
+        engine.bind_bridge_decks({'bridge-one':deck},terrain_field=field)
+        sampled,heights,_distances,grades=engine.profile(((4.,5.),(6.,5.)),terrain_field=field)
+        np.testing.assert_allclose(heights,100.)
+        self.assertLess(np.max(np.abs(grades)),1e-8)
+        self.assertEqual(field.sample_points(np.asarray([5.]),np.asarray([5.]))[0],10.)
+        adjacent=engine.surface_heights(np.asarray(((5.,5.01),)),terrain_field=field)
+        self.assertEqual(adjacent[0],10.)
+
+    def test_bridge_surface_cannot_hide_an_impossible_difference_between_banks(self):
+        class Cliff:
+            def sample_points(self,x,y):return (np.asarray(x)>5.).astype(float)*100.
+        engine=RoadEngineering(np.ones((16,32)),.1,'ancient')
+        decks={'bridge-one':(shapely.LineString(((5.,5.),(4.,5.))),shapely.LineString(((5.,5.),(6.,5.))))}
+        with self.assertRaisesRegex(ValueError,'no grade-constrained shared bridge surface'):
+            engine.bind_bridge_decks(decks,terrain_field=Cliff())
+
     def test_cart_road_uses_low_pass_instead_of_climbing_a_cliff(self):
         z=np.ones((24,48));z[:,24:]=401
         z[4:7]=1+np.clip((np.arange(48)-10)/25,0,1)*400

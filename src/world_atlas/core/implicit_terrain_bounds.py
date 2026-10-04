@@ -509,6 +509,9 @@ def _drainage(drainage,x,y):
 
 
 def _evaluate(field,lower,upper,*,directions=None):
+    if (isinstance(field, RefinedTerrainField) and field._river_bed is not None
+            and len(field._river_bed.segments)):
+        raise ValueError("interval terrain certificates do not support the continuous river-bed model")
     count = len(lower)
     if directions is None:
         dx,dy = np.tile([1.,0.],(count,1)),np.tile([0.,1.],(count,1))

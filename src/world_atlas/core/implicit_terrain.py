@@ -144,7 +144,15 @@ def _selected_ranges(field,cells):
         zero=_zero_detail_boxes(field,rows[ids],columns[ids],lower[ids],upper[ids])
         gain[ids[zero]]=0.
     products=np.stack((low*(1-gain),low*(1+gain),high*(1-gain),high*(1+gain)))
-    return products.min(axis=0),products.max(axis=0)
+    low, high = products.min(axis=0), products.max(axis=0)
+    if field._river_bed is not None and len(field._river_bed.segments):
+        bed = field._river_bed
+        radius = bed.maximum_radius
+        boxes = shapely.box(lower[:,0]-radius, lower[:,1]-radius,
+                            upper[:,0]+radius, upper[:,1]+radius)
+        owner, segment = bed._tree.query(boxes)
+        np.minimum.at(low, owner, bed.beds[segment].min(axis=1))
+    return low, high
 
 
 def terrain_height_range(field,query_bounds):
@@ -909,6 +917,9 @@ def terrain_level_curves(field,metre_levels,*,query_bounds=None):
         raise ValueError("physical contours require increasing finite metre levels")
     if not isinstance(field,(PhysicalTerrainField,RefinedTerrainField)):
         raise ValueError("physical contours require the accepted physical ground model")
+    if (isinstance(field, RefinedTerrainField) and field._river_bed is not None
+            and len(field._river_bed.segments)):
+        raise ValueError("certified terrain contours do not support the continuous river-bed model")
     cells=_query_cells(field,query_bounds) if query_bounds is not None else None
     if isinstance(field,PhysicalTerrainField):
         return _base_level_curves(field,levels,cells)

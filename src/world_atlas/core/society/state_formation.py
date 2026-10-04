@@ -332,6 +332,7 @@ def settle_state_boundaries(
     *,
     core_region_by_state: np.ndarray,
     maximum_passes: int = 8,
+    institutional_regions: dict[int, int] | None = None,
 ) -> np.ndarray:
     """Move fringe control regions so open seams become internal borders.
 
@@ -357,6 +358,12 @@ def settle_state_boundaries(
         core_state_by_region[region] = state
         if int(owners[region]) != state:
             raise ValueError("state-boundary core must remain owned by its state")
+    for region, state in (institutional_regions or {}).items():
+        if not 0 < region <= graph.region_count or not 0 < state < cores.size:
+            raise ValueError("institutional regions must reference available regions and states")
+        if int(owners[region]) != state:
+            raise ValueError("institutional regions must remain owned by their state")
+        core_state_by_region[region] = state
     neighbors: list[list[tuple[int, ControlRegionEdge]]] = [
         [] for _ in range(graph.region_count + 1)
     ]
@@ -476,6 +483,7 @@ def repair_same_land_state_fragments(
     *,
     state_domain: np.ndarray,
     maritime_routes: Sequence[TransportRoute] = (),
+    institutional_seats: dict[tuple[int, int], int] | None = None,
     settlements: Sequence[Settlement] = (),
 ) -> np.ndarray:
     """Repair whole fragments without inventing corridors or cultural claims."""
@@ -489,7 +497,8 @@ def repair_same_land_state_fragments(
     if 0 in seats or -1 in seats:
         raise ValueError("political cores require positive ownership")
     return reconcile_partition_components(labels, seats, state_domain, land_component_id,
-                                          maritime_routes=maritime_routes, settlements=settlements)
+                                          maritime_routes=maritime_routes, settlements=settlements,
+                                          institutional_seats=institutional_seats)
 
 
 def distribute_state_cores(
@@ -660,6 +669,7 @@ def simulate_state_formation(
     travel_days_by_edge: tuple[float, ...],
     maximum_response_days_by_state: np.ndarray,
     maximum_rounds: int | None = None,
+    institutional_regions: dict[int, int] | None = None,
 ) -> StateFormationResult:
     """Form contiguous states through simultaneous adjacent-region expansion."""
 
@@ -712,6 +722,23 @@ def simulate_state_formation(
         state_areas[state] = max(1.0, float(graph.area_by_region[region]))
         state_domains[state] = int(graph.domain_by_region[region])
         core_state_by_region[region] = state
+    for region, state in (institutional_regions or {}).items():
+        if not 0 < region <= graph.region_count or not 0 < state <= state_count:
+            raise ValueError("institutional regions must reference available regions and states")
+        if int(graph.domain_by_region[region]) != int(state_domains[state]):
+            raise ValueError("institutional regions cannot cross a physical or cultural owner domain")
+        if int(owners[region]) not in (0, state):
+            raise ValueError("institutional region conflicts with a rival political core")
+        if int(owners[region]) == state:
+            continue
+        owners[region] = state
+        costs[region] = 0.0
+        rounds[region] = 0
+        response_days[region] = 0.0
+        core_state_by_region[region] = state
+        state_regions[state].add(region)
+        state_resources[state] += max(0.05, float(graph.resource_by_region[region]))
+        state_areas[state] += max(1.0, float(graph.area_by_region[region]))
     capacity_targets = _state_capacity_targets(graph, cores, strengths)
     mean_region_area = max(1.0, float(np.mean(graph.area_by_region[1:])))
     limit = maximum_rounds or max(8, graph.region_count * 3)
@@ -795,6 +822,7 @@ def simulate_state_formation(
         graph,
         owners,
         core_region_by_state=cores,
+        institutional_regions=institutional_regions,
     )
     state_regions = [set() for _ in range(state_count + 1)]
     state_resources[:] = 0.0
@@ -861,8 +889,10 @@ def simulate_state_formation(
     supported = np.zeros(graph.region_count + 1, dtype=bool)
     for state in range(1, state_count + 1):
         seat = int(cores[state])
-        travel = {seat: 0.0}
-        queue = [(0.0, seat)]
+        roots = {seat} | {region for region, owner in (institutional_regions or {}).items()
+                          if owner == state}
+        travel = dict.fromkeys(roots, 0.0)
+        queue = [(0.0, region) for region in sorted(roots)]
         while queue:
             days, region = heapq.heappop(queue)
             if days != travel[region]:

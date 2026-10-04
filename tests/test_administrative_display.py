@@ -88,18 +88,15 @@ class AdministrativeDisplayTests(unittest.TestCase):
         unconstrained = shapely.box(5, 3, 9, 7)
         self.assertFalse(border.intersection(unconstrained).equals(shared.intersection(unconstrained)))
 
-    def test_continuous_competitive_front_retains_all_measured_owners(self):
-        from world_atlas.core.society.administrative_front import administrative_front
-        from world_atlas.core.society.administrative_coverage import administrative_coverage
-        from world_atlas.core.society.territorial_simulation import TerritorySeed
-        from tests.test_administrative_front import simulation
-        front = administrative_front(simulation((19, 37)),
-            (TerritorySeed(3, 4, 1), TerritorySeed(12, 16, 2), TerritorySeed(7, 29, 3)))
-        source, _ = administrative_coverage(front)
+    def test_continuous_formed_coverage_retains_all_measured_owners(self):
+        from world_atlas.core.raster_topology import categorical_coverage
+        yy,xx=np.indices((19,37))
+        labels=np.where(xx < 10+4*np.sin(yy*.4),1,np.where(xx < 24+3*np.cos(yy*.7),2,3))
+        source, _ = categorical_coverage(labels,np.ones(labels.shape,bool),category_count=4)
         from world_atlas.core.cartographic_features import shared_display_coverage
         source = shared_display_coverage(source)
-        result = administrative_display_coverage(source, frame_shape=front.valid.shape)
-        self.assert_preserved(source, result, front.valid.shape)
+        result = administrative_display_coverage(source, frame_shape=labels.shape)
+        self.assert_preserved(source, result, labels.shape)
 
     def test_empty_face_records_keep_their_original_positions_and_types(self):
         source = np.asarray((shapely.GeometryCollection(), shapely.box(0, 0, 3, 6),

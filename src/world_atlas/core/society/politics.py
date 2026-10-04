@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter, deque
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -1184,6 +1185,404 @@ def _automatic_state_count(urban_count: int) -> int:
     return int(np.clip(round(max(0, int(urban_count)) * 0.30), 88, 144))
 
 
+@dataclass(frozen=True, slots=True)
+class _StateFormationFields:
+    land: np.ndarray
+    route_affinity: np.ndarray
+    transitions: np.ndarray
+    friction: np.ndarray
+    density: np.ndarray
+    bridge_discounts: np.ndarray
+
+
+def _state_formation_fields(grid, thematic, population, cultures, transport):
+    """Measure physical and transport evidence once before choosing institutions."""
+    land = society_domain_mask(grid)
+    native_route_affinity = _coarse_route_affinity(
+        transport,
+        grid.shape,
+        step=1,
+    ).astype(np.float32)
+    native_transitions = _state_transition_penalties(
+        grid.elevation,
+        grid.river_order,
+        cultures.language_id,
+        native_route_affinity,
+        land_mask=grid.water == 0,
+    )
+    elevation = np.asarray(grid.elevation)
+    potential = np.asarray(thematic.land_potential)
+    habitability = np.asarray(thematic.habitability)
+    river = grid.river_order > 0
+    density_field = population_density(grid, population)
+    population_support = density_field
+    accessibility = np.asarray(transport.accessibility)
+    population_scale = population_support / max(
+        float(population_support.max(initial=0.0)),
+        1.0e-15,
+    )
+    friction = (
+        1.0
+        + 7.2 * np.square(np.clip(elevation, 0.0, 1.0))
+        + 18.0 * relative_land_slope(elevation, land)
+        + 1.9 * (1.0 - np.clip(potential, 0.0, 1.0))
+        + 2.6 * (1.0 - np.clip(habitability, 0.0, 1.0))
+        - 0.08 * river
+        - 0.22 * population_scale
+        - 0.68 * np.clip(accessibility, 0.0, 1.0)
+    )
+    bridge_discounts = bridge_transition_discounts(
+        grid.river_order,
+        transport.routes,
+        transport.bridges,
+    )
+    return _StateFormationFields(land, native_route_affinity, native_transitions,
+                                 friction, density_field, bridge_discounts)
+
+
+def _state_core_strengths(core_by_identifier, civilization_by_identifier, cultures, transport):
+    """Measure the same institutional power for newly selected or existing seats."""
+    civilization_cores = {item.identifier: item.core_settlement_id for item in cultures.civilizations}
+    result = {}
+    for civilization in sorted(set(civilization_by_identifier.values())):
+        identifiers = sorted(identifier for identifier in core_by_identifier
+                             if civilization_by_identifier[identifier] == civilization)
+        values = np.asarray([core_by_identifier[identifier].score for identifier in identifiers],
+                            dtype=np.float64)
+        low = float(values.min())
+        span = max(float(values.max()) - low, 1.0e-12)
+        major_slots = max(1, int(round(len(identifiers) * 0.18)))
+        for index, identifier in enumerate(identifiers):
+            core = core_by_identifier[identifier]
+            result[identifier] = float(np.clip(
+                0.72 + 0.60 * ((core.score - low) / span)
+                + 0.24 * float(transport.accessibility[core.row, core.column])
+                + (0.35 if index < major_slots else 0.0)
+                + (0.40 if core.identifier == civilization_cores[civilization] else 0.0),
+                0.68, 1.75,
+            ))
+    return result
+
+
+def _state_control_regions(thematic, cultures, transport, fields, *,
+                           governed_land, control_settlements):
+    """Build shared city hinterlands split at actual physical compartments."""
+    coarse_civilization = np.asarray(cultures.civilization_id, dtype=np.int16)
+    native_route_affinity = fields.route_affinity
+    native_transitions = fields.transitions
+    friction = fields.friction
+    density_field = fields.density
+    bridge_discounts = fields.bridge_discounts
+    territory_simulation = TerritorySimulation(
+        valid=governed_land,
+        friction=friction.astype(np.float32),
+        transition_penalty=native_transitions,
+        road_access=native_route_affinity,
+        bridge_edges=bridge_discounts,
+        owner_constraint=coarse_civilization.astype(np.int32),
+    )
+
+    # Countries are not a direct Voronoi allocation from a handful of
+    # capitals.  First give every real urban settlement a connected daily
+    # hinterland.  States then form by absorbing these local control regions
+    # over several political rounds on their physical adjacency graph.
+    control_seeds: list[TerritorySeed] = []
+    for control_identifier, settlement in enumerate(control_settlements, start=1):
+        civilization_identifier = int(
+            cultures.civilization_id[settlement.row, settlement.column]
+        )
+        control_seeds.append(
+            TerritorySeed(
+                row=settlement.row,
+                column=settlement.column,
+                owner=control_identifier,
+                strength=float(
+                    np.clip(
+                        0.92
+                        + 0.18 * settlement.score
+                        + 0.12
+                        * float(transport.accessibility[settlement.row, settlement.column]),
+                        0.82,
+                        1.35,
+                    )
+                ),
+                domain=civilization_identifier,
+            )
+        )
+    control_result = simulate_territories(
+        territory_simulation,
+        tuple(control_seeds),
+    )
+    control_labels = control_result.owner.astype(np.int32)
+    control_anchors = {
+        (seed.row, seed.column): identifier
+        for identifier, seed in enumerate(control_seeds, start=1)
+    }
+    control_domain = np.zeros(len(control_seeds) + 1, dtype=np.int32)
+    for identifier, seed in enumerate(control_seeds, start=1):
+        control_domain[identifier] = seed.domain
+
+    # A city hinterland is first snapped to the physical compartments cut by
+    # major river banks, drainage divides and ridges.  Only the narrow seam
+    # between neighbouring hinterlands is then regrown.  This makes the graph
+    # consumed by state formation geographic by construction: later politics
+    # can transfer whole local regions, but cannot redraw a capital-distance
+    # bisector across an available natural frontier.
+    control_labels = snap_partition_to_natural_regions(
+        control_labels,
+        governed_land,
+        native_transitions,
+        control_anchors,
+        owner_field=coarse_civilization.astype(np.int32),
+        label_owner=control_domain,
+        barrier_threshold=14.0,
+        anchored_support=0.42,
+        unanchored_majority=0.62,
+    )
+    control_labels = refine_partition_boundaries(
+        control_labels,
+        governed_land,
+        native_transitions,
+        control_anchors,
+        owner_field=coarse_civilization.astype(np.int32),
+        label_owner=control_domain,
+        friction=friction.astype(np.float32),
+        band_radius=12,
+    ).astype(np.int32)
+    effective_civilization = coarse_civilization.astype(np.int32, copy=True)
+    neutral_control = (effective_civilization <= 0) & (control_labels > 0)
+    effective_civilization[neutral_control] = control_domain[
+        control_labels[neutral_control]
+    ]
+    # A settlement hinterland may legitimately extend across a bridge or an
+    # unopposed river.  It must not, however, hide that natural seam from the
+    # later political graph.  Intersect each hinterland with the compartments
+    # cut by strong river banks, drainage divides and ridges.  The resulting
+    # micro-regions retain the same economic origin but may change political
+    # owner independently during state formation.
+    control_labels = natural_compartment_ids(
+        governed_land & (control_labels > 0),
+        native_transitions,
+        domain=control_labels,
+        barrier_threshold=14.0,
+    ).astype(np.int32)
+    population_normalized = density_field.astype(np.float64)
+    population_normalized /= max(
+        float(population_normalized.max(initial=0.0)),
+        1.0e-12,
+    )
+    local_resources = (
+        0.52 * population_normalized
+        + 0.28 * np.clip(thematic.land_potential, 0.0, 1.0)
+        + 0.20 * np.clip(transport.accessibility, 0.0, 1.0)
+    ).astype(np.float32)
+    control_graph = build_control_region_graph(
+        control_labels,
+        native_transitions,
+        native_route_affinity,
+        bridge_discounts,
+        effective_civilization,
+        local_resources,
+    )
+    return control_graph, control_labels
+
+
+def _resolve_institutional_seats(grid, graph, control_labels, core_regions,
+                                 seats, settlements, routes, edge_days):
+    """Retain recorded local institutions within their real cultural control domain."""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import dijkstra
+
+    domains = graph.domain_by_region[core_regions]
+    result = {}
+    unresolved = {}
+    for cell, owner in seats.items():
+        region = int(control_labels[cell])
+        if region <= 0:
+            raise ValueError("local institutional seat requires a physical control region")
+        if int(graph.domain_by_region[region]) == int(domains[owner]):
+            result[cell] = owner
+        else:
+            unresolved[cell] = region
+    if not unresolved:
+        return result
+
+    # A formerly misassigned seat changes parent through actual regional or
+    # maritime links. Capital distance cannot claim disconnected land.
+    links = {}
+    for edge, days in zip(graph.edges, edge_days, strict=True):
+        if graph.domain_by_region[edge.first] != graph.domain_by_region[edge.second]:
+            continue
+        pair = (min(edge.first, edge.second), max(edge.first, edge.second))
+        links[pair] = min(links.get(pair, math.inf), float(days))
+    by_identifier = {item.identifier: item for item in settlements}
+    maritime_days = maritime_response_days(grid, routes)
+    for route in routes:
+        if route.mode != "sea" or route.target_settlement_id is None:
+            continue
+        first = by_identifier[route.source_settlement_id]
+        second = by_identifier[route.target_settlement_id]
+        a = int(control_labels[first.row, first.column])
+        b = int(control_labels[second.row, second.column])
+        if a <= 0 or b <= 0 or a == b or graph.domain_by_region[a] != graph.domain_by_region[b]:
+            continue
+        pair = (min(a, b), max(a, b))
+        links[pair] = min(links.get(pair, math.inf), maritime_days[route.identifier])
+    row, column, costs = [], [], []
+    for (a, b), days in links.items():
+        row.extend((a, b)); column.extend((b, a)); costs.extend((days, days))
+    adjacency = csr_matrix((costs, (row, column)), shape=(graph.region_count + 1,) * 2)
+    travel = dijkstra(adjacency, directed=False, indices=core_regions[1:])
+    for cell, region in unresolved.items():
+        domain = int(graph.domain_by_region[region])
+        candidates = [owner for owner in range(1, len(core_regions))
+                      if int(domains[owner]) == domain and np.isfinite(travel[owner - 1, region])]
+        if not candidates:
+            raise ValueError(f"institutional seat {cell} has no evidenced state in its cultural domain")
+        result[cell] = min(candidates, key=lambda owner: (travel[owner - 1, region], owner))
+    return result
+
+
+def _allocate_state_territories(grid, cultures, transport, settlements, fields,
+                                control_graph, control_labels, *, core_by_identifier,
+                                civilization_by_identifier, strength_by_identifier,
+                                institutional_seats=None):
+    """Allocate physical control regions using fixed state identities and seats."""
+    state_count = len(core_by_identifier)
+    land = fields.land
+    physical_land = grid.water == 0
+    physical_land_components = connected_components(physical_land)[0]
+    native_transitions = fields.transitions
+    friction = fields.friction
+    bridge_discounts = fields.bridge_discounts
+    settlement_anchor_protection = _settlement_protection_mask(settlements, grid.shape, radius=1)
+    core_region_by_state = np.zeros(state_count + 1, dtype=np.int32)
+    state_strength = np.zeros(state_count + 1, dtype=np.float32)
+    for identifier in range(1, state_count + 1):
+        core = core_by_identifier[identifier]
+        core_region_by_state[identifier] = int(control_labels[core.row, core.column])
+        state_strength[identifier] = strength_by_identifier[identifier]
+    control_graph, edge_days, response_budgets = control_region_reach(
+        grid, control_graph, control_labels, core_region_by_state, state_strength,
+        provinces=False, routes=transport.routes,
+    )
+    institutional_seats = _resolve_institutional_seats(
+        grid, control_graph, control_labels, core_region_by_state,
+        institutional_seats or {}, settlements, transport.routes, edge_days,
+    )
+    institutional_regions = {}
+    for cell, owner in institutional_seats.items():
+        region = int(control_labels[cell])
+        if institutional_regions.get(region, owner) != owner:
+            raise ValueError("rival institutions cannot occupy one control region")
+        institutional_regions[region] = owner
+    formation = simulate_state_formation(
+        control_graph,
+        core_region_by_state=core_region_by_state,
+        state_strength=state_strength,
+        travel_days_by_edge=edge_days,
+        maximum_response_days_by_state=response_budgets,
+        institutional_regions=institutional_regions,
+    )
+    region_owners = attach_maritime_control_regions(
+        control_graph, formation.region_owner, control_labels,
+        core_region_by_state, settlements, transport.routes,
+        travel_days_by_edge=edge_days,
+        maximum_response_days_by_state=response_budgets,
+        maritime_days_by_route=maritime_response_days(grid, transport.routes),
+    )
+    expanded = np.zeros(grid.shape, dtype=np.int16)
+    controlled = control_labels > 0
+    expanded[controlled] = region_owners[control_labels[controlled]].astype(
+        np.int16
+    )
+    expanded[~physical_land] = -1
+    expanded[physical_land & ~land] = 0
+    state_civilization = np.zeros(state_count + 1, dtype=np.int16)
+    for identifier, civilization_identifier in civilization_by_identifier.items():
+        state_civilization[identifier] = civilization_identifier
+    assigned = expanded > 0
+    cultural_mismatch = assigned & (
+        (cultures.civilization_id > 0)
+        & (
+            state_civilization[np.clip(expanded, 0, state_count)]
+            != cultures.civilization_id
+        )
+    )
+    if np.any(cultural_mismatch):
+        raise ValueError("territorial simulation crossed a civilization domain")
+    # The pastoral and tribal domain was reserved before the political graph
+    # was built.  States therefore stop at its physical edge instead of being
+    # generated across the whole continent and punctured afterwards.
+    frontier = land & (expanded <= 0)
+    expanded = expanded.astype(np.int16)
+    # A political core is always the minimum protected control space.
+    for identifier, core in core_by_identifier.items():
+        expanded[core.row, core.column] = identifier
+        frontier[core.row, core.column] = False
+
+    # The graph simulation already guarantees that every acquisition touches
+    # existing state territory.  Pixel smoothing here would cut across the
+    # physical control-region seams we just paid to compute, so it is
+    # deliberately absent from the new path.
+    assigned = expanded > 0
+    expanded[
+        assigned
+        & (
+            state_civilization[np.clip(expanded, 0, state_count)]
+            != cultures.civilization_id
+        )
+    ] = 0
+    expanded = _attach_adjacent_frontier_settlements(
+        expanded,
+        cultures.civilization_id,
+        state_civilization,
+        settlements,
+    )
+    political_core_cells = np.zeros(grid.shape, dtype=bool)
+    for core in core_by_identifier.values():
+        political_core_cells[core.row, core.column] = True
+    expanded = repair_same_land_state_fragments(
+        expanded,
+        political_core_cells,
+        physical_land_components,
+        state_domain=state_civilization,
+        maritime_routes=transport.routes,
+        settlements=settlements,
+        institutional_seats=institutional_seats,
+    )
+    # Refine all shared seams using the same measured terrain and crossings
+    # as formation.  Outlet IDs and coordinate waves are not border evidence.
+    protected_rows, protected_columns = np.nonzero(
+        settlement_anchor_protection & (expanded > 0)
+    )
+    expanded = refine_partition_boundaries(
+        expanded,
+        expanded > 0,
+        native_transitions * (1.0 - bridge_discounts),
+        {
+            (int(row), int(column)): int(expanded[row, column])
+            for row, column in zip(protected_rows, protected_columns, strict=True)
+        },
+        owner_field=cultures.civilization_id,
+        label_owner=state_civilization,
+        friction=np.maximum(friction, 0.25).astype(np.float32),
+        band_radius=8,
+    ).astype(np.int16)
+    expanded = repair_same_land_state_fragments(
+        expanded,
+        political_core_cells,
+        physical_land_components,
+        state_domain=state_civilization,
+        maritime_routes=transport.routes,
+        settlements=settlements,
+        institutional_seats=institutional_seats,
+    )
+    frontier = land & (expanded <= 0)
+
+    return expanded, frontier
+
+
 def derive_politics(
     grid: WorldGrid,
     thematic: ThematicLayers,
@@ -1316,53 +1715,12 @@ def derive_politics(
             for identifier in settlements_by_civilization
         },
     )
-    native_route_affinity = _coarse_route_affinity(
-        transport,
-        grid.shape,
-        step=1,
-    ).astype(np.float32)
-    native_transitions = _state_transition_penalties(
-        grid.elevation,
-        grid.river_order,
-        cultures.language_id,
-        native_route_affinity,
-        land_mask=grid.water == 0,
-    )
-    elevation = reduce_field(grid.elevation, step=step, mode="max")
-    potential = reduce_field(thematic.land_potential, step=step, mode="mean")
-    habitability = reduce_field(
-        thematic.habitability,
-        step=step,
-        mode="mean",
-    )
-    river = reduce_field(grid.river_order > 0, step=step, mode="max").astype(bool)
-    density_field = population_density(grid, population)
-    population_support = reduce_field(density_field, step=step, mode="max")
-    accessibility = reduce_field(transport.accessibility, step=step, mode="mean")
-    population_scale = population_support / max(
-        float(population_support.max(initial=0.0)),
-        1.0e-15,
-    )
-    friction = (
-        1.0
-        + 7.2 * np.square(np.clip(elevation, 0.0, 1.0))
-        + 18.0 * relative_land_slope(elevation, coarse_land)
-        + 1.9 * (1.0 - np.clip(potential, 0.0, 1.0))
-        + 2.6 * (1.0 - np.clip(habitability, 0.0, 1.0))
-        - 0.08 * river
-        - 0.22 * population_scale
-        - 0.68 * np.clip(accessibility, 0.0, 1.0)
-    )
-    bridge_discounts = bridge_transition_discounts(
-        grid.river_order,
-        transport.routes,
-        transport.bridges,
-    )
-    settlement_anchor_protection = _settlement_protection_mask(
-        settlements,
-        grid.shape,
-        radius=1,
-    )
+    fields = _state_formation_fields(grid, thematic, population, cultures, transport)
+    native_route_affinity = fields.route_affinity
+    native_transitions = fields.transitions
+    friction = fields.friction
+    density_field = fields.density
+    bridge_discounts = fields.bridge_discounts
     governance_seeds = tuple(
         TerritorySeed(
             row=settlement.row,
@@ -1447,51 +1805,15 @@ def derive_politics(
             )
     core_by_identifier: dict[int, Settlement] = {}
     civilization_by_identifier: dict[int, int] = {}
-    strength_by_identifier: dict[int, float] = {}
     next_identifier = 1
     for civilization_identifier in sorted(chosen_by_civilization):
-        civilization_cores = chosen_by_civilization[civilization_identifier]
-        values = np.asarray([core.score for core in civilization_cores], dtype=np.float64)
-        low = float(values.min())
-        span = max(float(values.max()) - low, 1.0e-12)
-        major_slots = max(1, int(round(len(civilization_cores) * 0.18)))
-        strengths = tuple(
-            float(
-                np.clip(
-                    0.72
-                    + 0.60 * ((core.score - low) / span)
-                    + 0.24 * float(transport.accessibility[core.row, core.column])
-                    + (0.35 if index < major_slots else 0.0)
-                    + (
-                        0.40
-                        if core.identifier
-                        == civilization_core_by_identifier[civilization_identifier]
-                        else 0.0
-                    ),
-                    0.68,
-                    1.75,
-                )
-            )
-            for index, core in enumerate(civilization_cores)
-        )
-        for core, strength in zip(civilization_cores, strengths, strict=True):
+        for core in chosen_by_civilization[civilization_identifier]:
             core_by_identifier[next_identifier] = core
             civilization_by_identifier[next_identifier] = civilization_identifier
-            strength_by_identifier[next_identifier] = strength
             next_identifier += 1
-    territory_simulation = TerritorySimulation(
-        valid=governed_land,
-        friction=friction.astype(np.float32),
-        transition_penalty=native_transitions,
-        road_access=native_route_affinity,
-        bridge_edges=bridge_discounts,
-        owner_constraint=coarse_civilization.astype(np.int32),
+    strength_by_identifier = _state_core_strengths(
+        core_by_identifier, civilization_by_identifier, cultures, transport,
     )
-
-    # Countries are not a direct Voronoi allocation from a handful of
-    # capitals.  First give every real urban settlement a connected daily
-    # hinterland.  States then form by absorbing these local control regions
-    # over several political rounds on their physical adjacency graph.
     control_settlements = tuple(
         settlement
         for civilization_identifier in sorted(settlements_by_civilization)
@@ -1500,220 +1822,21 @@ def derive_politics(
             key=lambda item: item.identifier,
         )
     )
-    control_seeds: list[TerritorySeed] = []
-    for control_identifier, settlement in enumerate(control_settlements, start=1):
-        civilization_identifier = int(
-            cultures.civilization_id[settlement.row, settlement.column]
-        )
-        control_seeds.append(
-            TerritorySeed(
-                row=settlement.row,
-                column=settlement.column,
-                owner=control_identifier,
-                strength=float(
-                    np.clip(
-                        0.92
-                        + 0.18 * settlement.score
-                        + 0.12
-                        * float(transport.accessibility[settlement.row, settlement.column]),
-                        0.82,
-                        1.35,
-                    )
-                ),
-                domain=civilization_identifier,
-            )
-        )
-    control_result = simulate_territories(
-        territory_simulation,
-        tuple(control_seeds),
-    )
-    control_labels = control_result.owner.astype(np.int32)
-    control_anchors = {
-        (seed.row, seed.column): identifier
-        for identifier, seed in enumerate(control_seeds, start=1)
-    }
-    control_domain = np.zeros(len(control_seeds) + 1, dtype=np.int32)
-    for identifier, seed in enumerate(control_seeds, start=1):
-        control_domain[identifier] = seed.domain
-
-    # A city hinterland is first snapped to the physical compartments cut by
-    # major river banks, drainage divides and ridges.  Only the narrow seam
-    # between neighbouring hinterlands is then regrown.  This makes the graph
-    # consumed by state formation geographic by construction: later politics
-    # can transfer whole local regions, but cannot redraw a capital-distance
-    # bisector across an available natural frontier.
-    control_labels = snap_partition_to_natural_regions(
-        control_labels,
-        governed_land,
-        native_transitions,
-        control_anchors,
-        owner_field=coarse_civilization.astype(np.int32),
-        label_owner=control_domain,
-        barrier_threshold=14.0,
-        anchored_support=0.42,
-        unanchored_majority=0.62,
-    )
-    control_labels = refine_partition_boundaries(
-        control_labels,
-        governed_land,
-        native_transitions,
-        control_anchors,
-        owner_field=coarse_civilization.astype(np.int32),
-        label_owner=control_domain,
-        friction=friction.astype(np.float32),
-        band_radius=12,
-    ).astype(np.int32)
-    effective_civilization = coarse_civilization.astype(np.int32, copy=True)
-    neutral_control = (effective_civilization <= 0) & (control_labels > 0)
-    effective_civilization[neutral_control] = control_domain[
-        control_labels[neutral_control]
-    ]
-    # A settlement hinterland may legitimately extend across a bridge or an
-    # unopposed river.  It must not, however, hide that natural seam from the
-    # later political graph.  Intersect each hinterland with the compartments
-    # cut by strong river banks, drainage divides and ridges.  The resulting
-    # micro-regions retain the same economic origin but may change political
-    # owner independently during state formation.
-    control_labels = natural_compartment_ids(
-        governed_land & (control_labels > 0),
-        native_transitions,
-        domain=control_labels,
-        barrier_threshold=14.0,
-    ).astype(np.int32)
-    population_normalized = density_field.astype(np.float64)
-    population_normalized /= max(
-        float(population_normalized.max(initial=0.0)),
-        1.0e-12,
-    )
-    local_resources = (
-        0.52 * population_normalized
-        + 0.28 * np.clip(thematic.land_potential, 0.0, 1.0)
-        + 0.20 * np.clip(transport.accessibility, 0.0, 1.0)
-    ).astype(np.float32)
-    control_graph = build_control_region_graph(
-        control_labels,
-        native_transitions,
-        native_route_affinity,
-        bridge_discounts,
-        effective_civilization,
-        local_resources,
+    control_graph, control_labels = _state_control_regions(
+        thematic, cultures, transport, fields,
+        governed_land=governed_land, control_settlements=control_settlements,
     )
     core_by_identifier = distribute_state_cores(
         control_graph, control_labels, core_by_identifier, control_settlements,
         protected_settlement_ids=frozenset(civilization_core_by_identifier.values()),
         routes=transport.routes,
     )
-    core_region_by_state = np.zeros(state_count + 1, dtype=np.int32)
-    state_strength = np.zeros(state_count + 1, dtype=np.float32)
-    for identifier in range(1, state_count + 1):
-        core = core_by_identifier[identifier]
-        core_region_by_state[identifier] = int(control_labels[core.row, core.column])
-        state_strength[identifier] = strength_by_identifier[identifier]
-    control_graph, edge_days, response_budgets = control_region_reach(
-        grid, control_graph, control_labels, core_region_by_state, state_strength,
-        provinces=False, routes=transport.routes,
+    expanded, frontier = _allocate_state_territories(
+        grid, cultures, transport, settlements, fields, control_graph, control_labels,
+        core_by_identifier=core_by_identifier,
+        civilization_by_identifier=civilization_by_identifier,
+        strength_by_identifier=strength_by_identifier,
     )
-    formation = simulate_state_formation(
-        control_graph,
-        core_region_by_state=core_region_by_state,
-        state_strength=state_strength,
-        travel_days_by_edge=edge_days,
-        maximum_response_days_by_state=response_budgets,
-    )
-    physical_land_components = connected_components(physical_land)[0]
-    region_owners = attach_maritime_control_regions(
-        control_graph, formation.region_owner, control_labels,
-        core_region_by_state, settlements, transport.routes,
-        travel_days_by_edge=edge_days,
-        maximum_response_days_by_state=response_budgets,
-        maritime_days_by_route=maritime_response_days(grid, transport.routes),
-    )
-    expanded = np.zeros(grid.shape, dtype=np.int16)
-    controlled = control_labels > 0
-    expanded[controlled] = region_owners[control_labels[controlled]].astype(
-        np.int16
-    )
-    expanded[~physical_land] = -1
-    expanded[physical_land & ~land] = 0
-    state_civilization = np.zeros(state_count + 1, dtype=np.int16)
-    for identifier, civilization_identifier in civilization_by_identifier.items():
-        state_civilization[identifier] = civilization_identifier
-    assigned = expanded > 0
-    cultural_mismatch = assigned & (
-        (cultures.civilization_id > 0)
-        & (
-            state_civilization[np.clip(expanded, 0, state_count)]
-            != cultures.civilization_id
-        )
-    )
-    if np.any(cultural_mismatch):
-        raise ValueError("territorial simulation crossed a civilization domain")
-    # The pastoral and tribal domain was reserved before the political graph
-    # was built.  States therefore stop at its physical edge instead of being
-    # generated across the whole continent and punctured afterwards.
-    frontier = frontier_reservation | (land & (expanded <= 0))
-    expanded = expanded.astype(np.int16)
-    # A political core is always the minimum protected control space.
-    for identifier, core in core_by_identifier.items():
-        expanded[core.row, core.column] = identifier
-        frontier[core.row, core.column] = False
-
-    # The graph simulation already guarantees that every acquisition touches
-    # existing state territory.  Pixel smoothing here would cut across the
-    # physical control-region seams we just paid to compute, so it is
-    # deliberately absent from the new path.
-    assigned = expanded > 0
-    expanded[
-        assigned
-        & (
-            state_civilization[np.clip(expanded, 0, state_count)]
-            != cultures.civilization_id
-        )
-    ] = 0
-    expanded = _attach_adjacent_frontier_settlements(
-        expanded,
-        cultures.civilization_id,
-        state_civilization,
-        settlements,
-    )
-    political_core_cells = np.zeros(grid.shape, dtype=bool)
-    for core in core_by_identifier.values():
-        political_core_cells[core.row, core.column] = True
-    expanded = repair_same_land_state_fragments(
-        expanded,
-        political_core_cells,
-        physical_land_components,
-        state_domain=state_civilization,
-        maritime_routes=transport.routes,
-        settlements=settlements,
-    )
-    # Refine all shared seams using the same measured terrain and crossings
-    # as formation.  Outlet IDs and coordinate waves are not border evidence.
-    protected_rows, protected_columns = np.nonzero(
-        settlement_anchor_protection & (expanded > 0)
-    )
-    expanded = refine_partition_boundaries(
-        expanded,
-        expanded > 0,
-        native_transitions * (1.0 - bridge_discounts),
-        {
-            (int(row), int(column)): int(expanded[row, column])
-            for row, column in zip(protected_rows, protected_columns, strict=True)
-        },
-        owner_field=cultures.civilization_id,
-        label_owner=state_civilization,
-        friction=np.maximum(friction, 0.25).astype(np.float32),
-        band_radius=8,
-    ).astype(np.int16)
-    expanded = repair_same_land_state_fragments(
-        expanded,
-        political_core_cells,
-        physical_land_components,
-        state_domain=state_civilization,
-        maritime_routes=transport.routes,
-        settlements=settlements,
-    )
-    frontier = land & (expanded <= 0)
 
     population_by_state: dict[int, float] = {}
     for identifier in range(1, state_count + 1):

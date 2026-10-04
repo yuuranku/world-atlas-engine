@@ -29,6 +29,23 @@ def content_files(folder):
             and not {'__pycache__', 'node_modules'}.intersection(p.parts)]
 
 
+def verify_wheel_modules(root: Path, wheel: Path) -> None:
+    """Reject build-cache modules absent from the source being published."""
+    source = root / 'src'
+    expected = {path.relative_to(source).as_posix(): hashlib.sha256(path.read_bytes()).digest()
+                for path in (source / 'world_atlas').rglob('*.py')}
+    with zipfile.ZipFile(wheel) as archive:
+        actual = {name: hashlib.sha256(archive.read(name)).digest()
+                  for name in archive.namelist()
+                  if name.startswith('world_atlas/') and name.endswith('.py')}
+    if actual != expected:
+        obsolete = sorted(actual.keys() - expected.keys())
+        missing = sorted(expected.keys() - actual.keys())
+        changed = sorted(name for name in actual.keys() & expected.keys()
+                         if actual[name] != expected[name])
+        raise ValueError(f'wheel/source module mismatch: {obsolete=}, {missing=}, {changed=}')
+
+
 def seal(root: Path) -> dict:
     root = root.resolve()
     skill = root / 'skills/generate-world-atlas'
@@ -38,6 +55,7 @@ def seal(root: Path) -> dict:
     wheel = dist / f'world_atlas_engine-{version}-py3-none-any.whl'
     if not wheel.is_file() or not (skill / 'SKILL.md').is_file():
         raise ValueError('build the engine wheel first')
+    verify_wheel_modules(root, wheel)
     for filename in ('terrain.json', 'world-settings.json', 'terrain-v38.json', 'terrain-v38.acceptance.json', 'terrain-v39.json'):
         (assets/filename).write_text((root/'examples'/filename).read_text(encoding='utf-8'), encoding='utf-8', newline='\n')
     (assets/'renderer').mkdir(exist_ok=True)

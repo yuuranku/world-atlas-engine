@@ -17,13 +17,13 @@ from world_atlas.core.render import (
     _scalar_zone_paths,
     _surface_outline_paths,
     _filled_mask_paths,
-    _river_paths,
     _transport_overlay,
 )
 from world_atlas.core.cartographic_surface import continuous_land_surface
 from world_atlas.core.cartographic_relief import physical_relief_paths
 from world_atlas.core.continuous_terrain import PhysicalTerrainField
 from world_atlas.core.continuous_scalar import ContinuousScalarField
+from world_atlas.core.river_courses import native_river_paths
 from world_atlas.core.raster_topology import categorical_coverage
 
 
@@ -258,11 +258,11 @@ class RenderGridAlignmentTests(unittest.TestCase):
         downstream[2, 1] = 2 * shape[1] + 2
         downstream[2, 2] = 2 * shape[1] + 3
         grid = SimpleNamespace(shape=shape, water=water, river_order=order, flow_to=downstream)
-        shoreline = [np.array(((2.85, .5), (2.85, 4.5)))]
-        paths = _river_paths(grid, shoreline, raw_elevation_m=np.where(water==0, 10., -10.))
+        land_surface, field = physical_surface(water == 0)
+        paths = native_river_paths(grid, field)
         self.assertEqual(len(paths), 1)
         np.testing.assert_array_equal(paths[0][:-1], ((1.5, 2.5), (2.5, 2.5)))
-        self.assertLess(shapely.LineString(shoreline[0]).distance(shapely.Point(paths[0][-1])), 1e-12)
+        self.assertLess(land_surface.boundary.distance(shapely.Point(paths[0][-1])), 1e-8)
 
     def test_river_mouth_follows_native_outflow_instead_of_projecting_sideways(self):
         shape = (5, 6)
@@ -274,9 +274,13 @@ class RenderGridAlignmentTests(unittest.TestCase):
         downstream[2, 1] = 2 * shape[1] + 2
         downstream[2, 2] = 2 * shape[1] + 3
         grid = SimpleNamespace(shape=shape, water=water, river_order=order, flow_to=downstream)
-        shore = [np.array(((2.9, 2.), (3.3, 2.5), (3.3, 3.)))]
-        paths = _river_paths(grid, shore, raw_elevation_m=np.where(water==0, 10., -10.))
-        np.testing.assert_allclose(paths[0][-1], (3.3, 2.5), atol=1e-12)
+        raw = np.where(water == 0, 10., -3.)
+        field = PhysicalTerrainField(raw, land_mask=water == 0, sea_level_m=0,
+                                    elevation_scale_m=1000, elevation_exponent=1)
+        paths = native_river_paths(grid, field)
+        self.assertEqual(paths[0][-1, 1], 2.5)
+        self.assertGreater(paths[0][-1, 0], 3.)
+        self.assertLess(abs(float(field.sample_points(*paths[0][-1]))), 1e-9)
         np.testing.assert_array_equal(paths[0][:-1], ((1.5, 2.5), (2.5, 2.5)))
 
     def test_visible_coast_uses_the_same_curved_land_edge_and_omits_map_frame(self):

@@ -12,7 +12,6 @@ from ..model import WorldGrid
 from ..thematic import ThematicLayers
 from .culture import align_culture_names, assign_culture_lineages, derive_cultures
 from .administrative_centres import derive_administrative_centres
-from .administrations import derive_administrations
 from .institutions import derive_state_formation_profiles
 from .model import (
     CultureLayers,
@@ -307,10 +306,6 @@ def derive_society_layers(
         politics=politics,
         provinces=provinces,
     )
-    # Institutions form on the control graph; final ownership is the common
-    # settlement arrival lower envelope, shared by provinces and countries.
-    progress.info("Society: shared administrative arrival front")
-    society, _ = derive_administrations(grid, thematic, society)
     from .urban_population import allocate_urban_population
     society = allocate_urban_population(grid, society)
     request = grid.metadata.get("societyGeneration", {})

@@ -2,9 +2,10 @@
 
 This adds plausible modelled relief, not recovered measurements.  A bounded
 coordinate deformation refines the *whole* ground, preserving continuous
-land/water topology.  Height detail preserves its sign and therefore cannot
-create detached lakes or islands.  Original ground samples and river anchors
-are fixed.  Coasts, elevation fills and contours must query this same field.
+land/water topology. Height detail preserves its sign and therefore cannot
+create detached lakes or islands. Saved samples remain fixed except inside
+the explicitly modeled river-bed corridor; the saved arrays stay immutable.
+Coasts, elevation fills, river courses and contours share this same field.
 """
 
 import math
@@ -46,7 +47,7 @@ class _DrainageRelief:
     control strength. No random height spectrum supplies unrelated pits.
     """
 
-    def __init__(self, base, flow_to, discharge, radius_km):
+    def __init__(self, base, flow_to, discharge, radius_km, *, channel_cells=None):
         self.height, self.width = base.height, base.width
         self.radius_km = radius_km
         flow, support = np.asarray(flow_to), np.asarray(discharge, dtype=float)
@@ -57,6 +58,10 @@ class _DrainageRelief:
             raise ValueError("terrain refinement requires the saved drainage graph and accumulation")
         ids = np.flatnonzero((flow.ravel() >= 0) & (support.ravel() >= 5)
                              & (base.native_m.ravel() > 0))
+        if channel_cells is not None:
+            # Visible rivers now own their actual continuous course and bed.
+            # Retaining the coarse D8 trough as well would duplicate valleys.
+            ids = ids[~np.asarray(channel_cells, dtype=bool).ravel()[ids]]
         target = flow.ravel()[ids]
         drop = base.native_m.ravel()[ids] - base.native_m.ravel()[target]
         keep = (drop > 0) & (base.native_m.ravel()[target] > 0)
@@ -245,8 +250,8 @@ class _CoastalLandforms:
 class RefinedTerrainField:
     """One finest continuous ground, independently sampled at any map scale.
 
-    The native-centre constraint is an exact anchoring operation. It never
-    modifies a saved array. Each local ground deformation has a Lipschitz
+    The native-centre constraint is exact outside modeled river beds. It
+    never modifies a saved array. Each local ground deformation has a Lipschitz
     bound below one, and disjoint support makes their union one-to-one. Its zero contour is
     the transported source coast. Positive vertical gain changes relief but
     cannot alter the land/water domain. Rasterised/vectorised output still
@@ -254,7 +259,8 @@ class RefinedTerrainField:
     """
 
     def __init__(self, base: PhysicalTerrainField, *, seed, radius_km,
-                 flow_to, discharge, river_segments, river_anchors):
+                 flow_to, discharge, river_segments, river_anchors,
+                 river_courses=None, river_bed=None, channel_cells=None):
         if not math.isfinite(radius_km) or radius_km <= 0:
             raise ValueError("terrain refinement requires a positive planet radius")
         segments = np.asarray(river_segments, dtype=float)
@@ -272,6 +278,11 @@ class RefinedTerrainField:
         self.elevation_scale_m = base.elevation_scale_m
         self.elevation_exponent = base.elevation_exponent
         self.seed, self.radius_km = int(seed), float(radius_km)
+        self._river_bed = river_bed
+        self.river_source_paths = river_courses.source_paths if river_courses is not None else ()
+        self.river_paths = river_courses.paths if river_courses is not None else ()
+        self.river_bed_profiles = river_courses.beds if river_courses is not None else ()
+        self.river_diagnostics = river_courses.diagnostics if river_courses is not None else {}
         permitted = np.ones(base.native_m.shape)
         # Deformation fixes the displayed latitude frame as well as longitude
         # periodicity, so it cannot move ground outside the source hemisphere.
@@ -280,7 +291,8 @@ class RefinedTerrainField:
         dy = (np.gradient(base.native_m, axis=0) if self.height > 1
               else np.zeros(base.native_m.shape))
         local_relief = np.hypot(dx, dy)
-        self._height = _DrainageRelief(base, flow_to, discharge, radius_km)
+        self._height = _DrainageRelief(base, flow_to, discharge, radius_km,
+                                     channel_cells=channel_cells)
         self._amplitude = permitted * (12 + .8*local_relief
                                       + 450*_smoothstep(np.maximum(base.native_m, 0)/3500))
         self._amplitude.flags.writeable = False
@@ -320,6 +332,10 @@ class RefinedTerrainField:
             "coordinateJacobianBound":_PATCH_FRACTION*_PATCH_DERIVATIVE,
             "maximumCoordinateDisplacementCells":self._landforms.maximum_displacement,
             "interpretation":"Procedural subgrid relief conditioned by saved model ground; no recovered measurements."}
+        if river_bed is not None:
+            self.diagnostics.update({"schema":"procedural-terrain-refinement-v2",
+                "nativeHeightContract":"exact-except-modeled-river-bed-corridors",
+                "riverBed":dict(self.river_diagnostics)})
 
     def palette_elevation(self, relative_m):
         return self.base.palette_elevation(relative_m)
@@ -413,7 +429,9 @@ class RefinedTerrainField:
         x = x % self.width
         native = (x - .5 == np.floor(x - .5)) & (y - .5 == np.floor(y - .5))
         if bool(native.all()):
-            return self.native_m[(y-.5).astype(int), (x-.5).astype(int)].copy()
+            ground = self.native_m[(y-.5).astype(int), (x-.5).astype(int)].copy()
+            return (ground if self._river_bed is None
+                    else self._river_bed.sample(x, y, ground))
         protection = self._anchor_weight(x, y)*self._river_weight(x, y)
         warped_x, warped_y = self.forward_ground_coordinates(x, y)
         ground = self.base.sample_points(warped_x, warped_y)
@@ -426,7 +444,8 @@ class RefinedTerrainField:
         if np.any(native):
             result = np.asarray(result).copy()
             result[native] = self.native_m[(y[native]-.5).astype(int), (x[native]-.5).astype(int)]
-        return result
+        return (result if self._river_bed is None
+                else self._river_bed.sample(x, y, result))
 
     def sample_rect(self, x, y):
         x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
@@ -436,7 +455,7 @@ class RefinedTerrainField:
         return self.sample_points(x[None, :], y[:, None])
 
 
-def terrain_from_source(grid, source):
+def terrain_from_source(grid, source, *, locked_river_points=()):
     """Build the one published ground and its protection anchors from inputs.
 
     Rendering and independent output checks must use this factory, so they
@@ -448,28 +467,23 @@ def terrain_from_source(grid, source):
         sea_level_m=diagnostics["seaLevelMeters"],
         elevation_scale_m=diagnostics["elevationScaleMeters"],
         elevation_exponent=diagnostics["elevationExponent"])
+    from .river_courses import solve_river_courses, RiverBedRelief
+    courses = solve_river_courses(grid, base, locked_points=locked_river_points)
+    channel_bed = RiverBedRelief(courses, grid,
+                               radius_km=grid.metadata["planet"]["radiusKm"])
     from .river_network import hydrologic_outlet_targets
 
     flow = grid.flow_to.ravel().copy()
     for terminal, target in hydrologic_outlet_targets(grid, source.relative_elevation_m).items():
         flow[terminal] = target
-    ids = np.flatnonzero((grid.water.ravel() == 0)
-                        & (grid.river_order.ravel() > 0) & (flow >= 0))
-    targets = flow[ids]
-    start = np.column_stack((ids % base.width+.5, ids // base.width+.5))
-    end = np.column_stack((targets % base.width+.5, targets // base.width+.5))
-    end[:, 0] = start[:, 0] + ((end[:, 0]-start[:, 0]+base.width/2) % base.width-base.width/2)
-    segments = np.stack((start, end), axis=1)
-    mouth = grid.water.ravel()[targets] != 0
-    first, last = start[mouth], end[mouth]
-    lower, upper = np.zeros(len(first)), np.ones(len(first))
-    for _ in range(36):
-        t = (lower+upper)/2
-        point = first+(last-first)*t[:, None]
-        dry = base.sample_points(point[:, 0], point[:, 1]) > 0
-        lower, upper = np.where(dry, t, lower), np.where(dry, upper, t)
-    anchors = first+(last-first)*((lower+upper)/2)[:, None]
+    endpoints = np.asarray([path[-1] for path in courses.source_paths]).reshape(-1, 2)
+    anchors = endpoints[np.abs(base.sample_points(endpoints[:, 0], endpoints[:, 1])) <= 1e-7]
+    segments = (np.concatenate([np.stack((path[:-1], path[1:]), axis=1)
+                               for path in courses.paths])
+                if courses.paths else np.empty((0, 2, 2)))
     return RefinedTerrainField(base, seed=diagnostics["seed"],
         radius_km=grid.metadata["planet"]["radiusKm"],
         flow_to=flow.reshape(grid.shape), discharge=grid.discharge,
-        river_segments=segments, river_anchors=anchors)
+        river_segments=segments, river_anchors=anchors,
+        river_courses=courses, river_bed=channel_bed,
+        channel_cells=grid.river_order > 0)

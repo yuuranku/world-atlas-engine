@@ -1,6 +1,7 @@
 """A resumed physical extraction must use exact, current, complete graphs."""
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -100,6 +101,22 @@ class PhysicalContourStageTests(unittest.TestCase):
                        side_effect=AssertionError("invalid source bytes must fail closed")):
                 with self.assertRaisesRegex(ValueError, "bytes changed"):
                     staged_height_curves(source, [133.25], root, source_identity={"seed": 1})
+
+    def test_river_bed_change_rejects_a_checkpoint_with_identical_native_heights(self):
+        base = field()
+        arguments = dict(seed=37, radius_km=60.,
+                         flow_to=np.full(base.native_m.shape, -1, dtype=np.int32),
+                         discharge=np.ones(base.native_m.shape),
+                         river_segments=np.empty((0, 2, 2)), river_anchors=np.empty((0, 2)))
+        source = RefinedTerrainField(base, **arguments)
+        source._river_bed = SimpleNamespace(
+            segments=np.array([[[2.5, .5], [2.5, 4.5]]]), owners=np.array([0]),
+            beds=np.array([[80., 40.]]), radii=np.array([[.2, .3]]))
+        with tempfile.TemporaryDirectory() as temporary:
+            staged_height_curves(source, [], temporary, source_identity={"same-native": True})
+            source._river_bed.beds[0, 1] = 30.
+            with self.assertRaisesRegex(ValueError, "obsolete physical contour stage"):
+                staged_height_curves(source, [], temporary, source_identity={"same-native": True})
 
     def test_failed_source_extraction_does_not_commit_header_or_erase_other_graph(self):
         with tempfile.TemporaryDirectory() as temporary:
